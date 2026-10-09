@@ -196,7 +196,11 @@ impl ToolSpec for LoadSkillTool {
                 skill.name
             )));
         }
-        ensure_reviewed_plugin_skill_is_current(skill, &context.workspace)?;
+        ensure_reviewed_plugin_skill_is_current_for(
+            skill,
+            &context.workspace,
+            context.plugin_registry.as_deref(),
+        )?;
         ensure_native_skill_file_present(skill)?;
         let body = format_skill_body(skill);
         let (skill_path, skill_source) = match &skill.source {
@@ -242,36 +246,23 @@ fn ensure_native_skill_file_present(skill: &Skill) -> Result<(), ToolError> {
     Err(ToolError::execution_failed(message))
 }
 
+#[cfg(test)]
 fn ensure_reviewed_plugin_skill_is_current(
     skill: &Skill,
     workspace: &std::path::Path,
 ) -> Result<(), ToolError> {
-    let SkillSource::Plugin {
-        plugin_name,
-        authority,
-        ..
-    } = &skill.source
-    else {
+    ensure_reviewed_plugin_skill_is_current_for(skill, workspace, None)
+}
+fn ensure_reviewed_plugin_skill_is_current_for(
+    skill: &Skill,
+    workspace: &std::path::Path,
+    plugins: Option<&crate::plugins::PluginRegistry>,
+) -> Result<(), ToolError> {
+    let Some(provenance) = skill.source.provenance() else {
         return Ok(());
     };
-
-    if authority.workspace != workspace {
-        return Err(ToolError::execution_failed(format!(
-            "Plugin skill `{}` belongs to a different workspace and was denied",
-            skill.name
-        )));
-    }
-
-    crate::plugins::registry::verify_plugin_component_authority(
-        authority,
-        crate::plugins::activation::PluginActivationCapability::Skills,
-    )
-    .map_err(|reason| {
-        ToolError::execution_failed(format!(
-            "Plugin skill `{}` was denied: {reason}. Run `/plugin reload`, inspect `/plugin show {plugin_name}`, then repeat the displayed trust command and enable it before retrying",
-            skill.name
-        ))
-    })
+    provenance.verify_for(workspace,plugins).map_err(|reason| ToolError::execution_failed(format!(
+        "Plugin skill `{}` was denied: {reason}. Reload and select the skill again before retrying", skill.name)))
 }
 
 /// Render the skill body the model will see. Includes the description
@@ -465,6 +456,7 @@ mod tests {
         plugin.source = SkillSource::Plugin {
             plugin_id: "workspace/1/demo".to_string(),
             plugin_name: "demo".to_string(),
+            native_registration: None,
             authority: Box::new(crate::plugins::types::PluginAuthority {
                 plugin_id: crate::plugins::types::PluginId("workspace/1/demo".to_string()),
                 plugin_name: "demo".to_string(),
@@ -499,6 +491,7 @@ mod tests {
             source: SkillSource::Plugin {
                 plugin_id: "workspace/123/demo".to_string(),
                 plugin_name: "demo".to_string(),
+                native_registration: None,
                 authority: Box::new(crate::plugins::types::PluginAuthority {
                     plugin_id: crate::plugins::types::PluginId("workspace/123/demo".to_string()),
                     plugin_name: "demo".to_string(),

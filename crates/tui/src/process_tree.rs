@@ -30,6 +30,13 @@ use windows::Win32::System::JobObjects::{
 #[cfg(windows)]
 use windows::core::PCWSTR;
 
+#[cfg(windows)]
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
+#[cfg(windows)]
+use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
 /// Owns the process tree rooted at one spawned child.
 pub(crate) struct ProcessTree {
     #[cfg(unix)]
@@ -76,6 +83,17 @@ impl ProcessTree {
         {
             Self::attach_parts(pid)
         }
+    }
+
+    /// Typed owned handle from a suspended Core-selected process. The caller
+    /// attaches/caps the Job before any process thread is resumed.
+    #[cfg(windows)]
+    pub(crate) fn attach_windows_handle(
+        pid: u32,
+        process: &std::os::windows::io::OwnedHandle,
+    ) -> std::io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        Self::attach_parts(pid, process.as_raw_handle())
     }
 
     #[cfg(windows)]
@@ -168,6 +186,88 @@ impl Drop for ProcessTree {
     }
 }
 
+/// Start a synchronous child inside the same process group / Job used by hooks.
+/// Windows starts suspended and resumes only after Job assignment. The caller
+/// still owns environment policy and bounded waits; this is lifetime containment.
+pub(crate) fn spawn_contained_std(
+    command: &mut std::process::Command,
+) -> std::io::Result<(std::process::Child, ProcessTree)> {
+    use wait_timeout::ChildExt;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0000_0004 | 0x0800_0000); // suspended, no window
+    }
+    let mut child = command.spawn()?;
+    let tree = match ProcessTree::attach(&child) {
+        Ok(tree) => tree,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait_timeout(std::time::Duration::from_millis(250));
+            return Err(error);
+        }
+    };
+    #[cfg(windows)]
+    if let Err(error) = resume_windows_process(&child) {
+        drop(tree);
+        let _ = child.kill();
+        let _ = child.wait_timeout(std::time::Duration::from_millis(250));
+        return Err(error);
+    }
+    Ok((child, tree))
+}
+
+#[cfg(windows)]
+fn resume_windows_process(child: &std::process::Child) -> std::io::Result<()> {
+    let snapshot =
+        // SAFETY: returned handle is owned here; closed before return.
+        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).map_err(windows_io_error)? };
+    let result = (|| {
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: `entry` is live with dwSize initialized above.
+        let mut next = unsafe { Thread32First(snapshot, &mut entry) };
+        let mut resumed = 0usize;
+        while next.is_ok() {
+            if entry.th32OwnerProcessID == child.id() {
+                // SAFETY: returned handle is owned here; closed below.
+                let thread = unsafe {
+                    OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID)
+                        .map_err(windows_io_error)?
+                };
+                // SAFETY: `thread` is a live owned handle.
+                let resume_result = unsafe { ResumeThread(thread) };
+                // SAFETY: `thread` is owned here and not used after.
+                let close_result = unsafe { CloseHandle(thread).map_err(windows_io_error) };
+                if resume_result == u32::MAX {
+                    return Err(std::io::Error::last_os_error());
+                }
+                close_result?;
+                resumed += 1;
+            }
+            // SAFETY: `entry` is live with dwSize initialized above.
+            next = unsafe { Thread32Next(snapshot, &mut entry) };
+        }
+        if resumed == 0 {
+            return Err(std::io::Error::other(
+                "suspended process had no resumable thread",
+            ));
+        }
+        Ok(())
+    })();
+    // SAFETY: `snapshot` is owned here and not used after.
+    let close_result = unsafe { CloseHandle(snapshot).map_err(windows_io_error) };
+    result?;
+    close_result
+}
+
 /// `Command::output()` for a child whose whole process tree dies with the
 /// returned future. Dropping it — a caller's `timeout` elapsing, or a
 /// cancelled tool call — kills the child and everything it started, where a
@@ -230,6 +330,34 @@ async fn contained_run(
     stop: impl std::future::Future<Output = ()>,
     attach: impl FnOnce(&tokio::process::Child) -> std::io::Result<ProcessTree>,
 ) -> std::io::Result<ContainedOutput> {
+    contained_run_with_limits(cmd, input, stop, attach, None).await
+}
+
+/// Strict capture bounds for the admitted script runner. Overflow refuses the result;
+/// it never presents a truncated ToolResult as success. Same containment driver.
+pub(crate) async fn contained_output_with_input_bounded(
+    cmd: &mut tokio::process::Command,
+    input: Vec<u8>,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    stop: impl std::future::Future<Output = ()>,
+) -> std::io::Result<ContainedOutput> {
+    contained_run_with_limits(
+        cmd,
+        Some(input),
+        stop,
+        ProcessTree::attach_tokio,
+        Some((stdout_limit, stderr_limit)),
+    )
+    .await
+}
+async fn contained_run_with_limits(
+    cmd: &mut tokio::process::Command,
+    input: Option<Vec<u8>>,
+    stop: impl std::future::Future<Output = ()>,
+    attach: impl FnOnce(&tokio::process::Child) -> std::io::Result<ProcessTree>,
+    limits: Option<(usize, usize)>,
+) -> std::io::Result<ContainedOutput> {
     use std::process::Stdio;
     cmd.stdin(if input.is_some() {
         Stdio::piped()
@@ -268,36 +396,83 @@ async fn contained_run(
             }
         };
         let run = async {
-            let (out, err, status, ()) = tokio::join!(
-                drain_pipe(stdout_pipe.as_mut(), &mut stdout),
-                drain_pipe(stderr_pipe.as_mut(), &mut stderr),
-                child.wait(),
-                feed,
+            let out = drain_pipe_with_limit(
+                stdout_pipe.as_mut(),
+                &mut stdout,
+                limits.map(|limits| limits.0),
             );
-            out?;
-            err?;
-            status
+            let err = drain_pipe_with_limit(
+                stderr_pipe.as_mut(),
+                &mut stderr,
+                limits.map(|limits| limits.1),
+            );
+            let wait = async {
+                let status = child.wait().await?;
+                if limits.is_some() {
+                    let _ = tree.kill();
+                }
+                Ok::<_, std::io::Error>(status)
+            };
+            if limits.is_some() {
+                let (_, _, status, ()) = tokio::try_join!(out, err, wait, async {
+                    feed.await;
+                    Ok::<(), std::io::Error>(())
+                })?;
+                Ok(status)
+            } else {
+                let (out, err, status, ()) = tokio::join!(out, err, wait, feed);
+                out?;
+                err?;
+                status
+            }
         };
         tokio::select! {
-            status = run => Some(status?),
+            status = run => match status {
+                Ok(status) => Some(status),
+                Err(error) => {
+                    let _ = tree.kill(); let _ = child.start_kill();
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+                    return Err(error);
+                }
+            },
             () = stop => None,
         }
     };
     let (status, stopped) = match exited {
         Some(status) => {
-            tree.release();
+            if limits.is_some() {
+                drop(tree);
+            } else {
+                tree.release();
+            }
             (status, false)
         }
         None => {
             drop(tree);
             let _ = child.start_kill();
-            let status = child.wait().await?;
+            let status = if limits.is_some() {
+                tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::other("execution child did not reap after cancellation")
+                    })??
+            } else {
+                child.wait().await?
+            };
             // Collect what is still buffered in the pipes. Bounded: a process
             // that escaped the tree may still hold one open.
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
                 let _ = tokio::join!(
-                    drain_pipe(stdout_pipe.as_mut(), &mut stdout),
-                    drain_pipe(stderr_pipe.as_mut(), &mut stderr),
+                    drain_pipe_with_limit(
+                        stdout_pipe.as_mut(),
+                        &mut stdout,
+                        limits.map(|limits| limits.0)
+                    ),
+                    drain_pipe_with_limit(
+                        stderr_pipe.as_mut(),
+                        &mut stderr,
+                        limits.map(|limits| limits.1)
+                    ),
                 );
             })
             .await;
@@ -314,11 +489,11 @@ async fn contained_run(
     })
 }
 
-/// Read `pipe` to EOF into `into`. Each chunk lands in `into` as soon as it is
-/// read, so a caller that stops polling keeps everything read so far.
-async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(
+/// Read each chunk under the selected capture bound; overflow is an error.
+async fn drain_pipe_with_limit<R: tokio::io::AsyncRead + Unpin>(
     pipe: Option<&mut R>,
     into: &mut Vec<u8>,
+    limit: Option<usize>,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncReadExt;
     let Some(pipe) = pipe else {
@@ -329,6 +504,11 @@ async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(
         let read = pipe.read(&mut chunk).await?;
         if read == 0 {
             return Ok(());
+        }
+        if limit.is_some_and(|limit| into.len().saturating_add(read) > limit) {
+            return Err(std::io::Error::other(
+                "execution output exceeded its capture limit",
+            ));
         }
         into.extend_from_slice(&chunk[..read]);
     }
@@ -707,5 +887,49 @@ mod tests {
                 .await
                 .expect("cleanup probe")
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod admitted_execution_tests {
+    use super::*;
+    #[tokio::test]
+    async fn bounded_script_driver_refuses_overflow_without_deadlock() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "while :; do printf 1234567890; done"]);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            contained_output_with_input_bounded(
+                &mut command,
+                Vec::new(),
+                64,
+                64,
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("overflow must not wait for execution deadline");
+        assert!(result.is_err());
+    }
+    #[tokio::test]
+    async fn bounded_script_driver_feeds_and_drains_concurrently() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "printf answer; cat >/dev/null"]);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            contained_output_with_input_bounded(
+                &mut command,
+                vec![b'x'; 256 * 1024],
+                64,
+                64,
+                std::future::pending(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!result.stopped);
+        assert!(result.output.status.success());
+        assert_eq!(result.output.stdout, b"answer");
     }
 }

@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "layers": [
+    {
+      "path": "b.json",
+      "sha256": "cadc7d706b7bf7d78e93b06bc2d8130ec5333d923fc402d093d5f6aa8589f6d7",
+      "source": "[{\"insert\":[{\"id\":\"mcp\",\"name\":\"@deepseek-ai/dsh-mcp-client\",\"config\":{\"serverName\":\"scoped\",\"transport\":\"stdio\",\"command\":\"node\",\"args\":[\"peer.mjs\",\"b\"],\"toolCallTimeoutMs\":5000}},{\"id\":\"skills\",\"name\":\"@deepseek-ai/dsh-skill-filesystem\",\"config\":{\"includeDefaultRoots\":false,\"watch\":false,\"customSkillDirs\":[\"skills\"]}},{\"id\":\"authored\",\"name\":\"./row.mjs\",\"config\":{\"tag\":\"b\"}}]}]"
+    }
+  ],
+  "modules": [
+    {
+      "name": "./row.mjs",
+      "path": "row.mjs",
+      "sha256": "adcbd8d762b23df550e1a4363b1ba9917e58a76b19cade03f70426b4aff22a3f"
+    }
+  ],
+  "files": {
+    "peer.mjs": "05fc5e71fece8b6ffd4c1ef5175a615b4157f679e3f7083b382e62cdaf27d53b",
+    "row.mjs": "adcbd8d762b23df550e1a4363b1ba9917e58a76b19cade03f70426b4aff22a3f",
+    "skills/mixed-check/SKILL.md": "22d9079acc36f216c60e4577de3df9247766f9fea7a6c1e002210048f5794e66"
+  }
+}

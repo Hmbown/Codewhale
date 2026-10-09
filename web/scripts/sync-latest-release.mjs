@@ -42,7 +42,7 @@ import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
-const REPO = "Hmbown/CodeWhale";
+const REPO = "codewhale-hq/CodeWhale";
 const here = dirname(fileURLToPath(import.meta.url));
 const target = resolve(here, "..", "data", "latest-published-release.json");
 const mirror = resolve(here, "..", "..", "docs", "public-surface-facts.json");

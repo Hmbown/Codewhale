@@ -175,6 +175,7 @@ impl InteractionTargetId {
     pub const DOCK_TAB_AGENTS: Self = Self("dock.tab.agents");
     pub const DOCK_TAB_TASKS: Self = Self("dock.tab.tasks");
     pub const DOCK_TAB_BACKGROUND: Self = Self("dock.tab.background");
+    pub const DOCK_TAB_TERMINAL: Self = Self("dock.tab.terminal");
     pub const DOCK_TAB_FILES: Self = Self("dock.tab.files");
     pub const DOCK_TAB_NOTEPAD: Self = Self("dock.tab.notepad");
     pub const DOCK_TAB_CONTEXT: Self = Self("dock.tab.context");
@@ -273,7 +274,7 @@ mod tests {
         InteractionRegistry, InteractionTarget, InteractionTargetId, SettingApplySemantics,
         SettingAuthority, SettingFact, UiSnapshot,
     };
-    use crate::config::ApiProvider;
+    use crate::config::ProviderKind;
     use ratatui::layout::Rect;
 
     fn target(area: Rect, used_tokens: u32) -> InteractionTarget {
@@ -315,13 +316,13 @@ mod tests {
     fn ui_snapshot_uses_active_route_without_claiming_saved_defaults() {
         let mut app =
             crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
-        app.pending_turn_route = Some((ApiProvider::Zai, "GLM-5.3".to_string(), false));
+        app.pending_turn_route = Some((ProviderKind::Zai, "GLM-5.3".to_string(), false));
 
         let snapshot = UiSnapshot::from_app(&app);
 
         assert_eq!(
             snapshot.provider.current.as_deref(),
-            Some(ApiProvider::Zai.display_name())
+            Some(ProviderKind::Zai.provider().display_name())
         );
         assert_eq!(snapshot.provider.current, snapshot.provider.effective);
         assert_eq!(snapshot.model.current.as_deref(), Some("GLM-5.3"));

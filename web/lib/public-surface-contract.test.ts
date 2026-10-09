@@ -17,6 +17,7 @@ import { INSTALL_GUIDE } from "./install-guide.generated";
 import { getChrome, getHome } from "./i18n/dictionaries";
 import { footerProjectLinks } from "./i18n/links";
 import { TERMINAL_SCREENSHOT } from "./media-manifest";
+import { PRODUCT_COPY } from "./content/product";
 
 const root = new URL("../../", import.meta.url);
 
@@ -264,7 +265,7 @@ describe("public surface contracts", () => {
     expect(installDoc).toContain("One Cargo package is required");
     expect(installDoc).toContain("`codewhale-cli` installs the `codewhale` command");
     expect(installDoc).toContain("Cargo does\nnot create that alias");
-    expect(installPage).toContain("INSTALL_GUIDE.chunks");
+    expect(installPage).toContain('from "@/lib/install-guide.generated"');
     expect(INSTALL_GUIDE.chunks.some((chunk) => chunk.kind === "code" && chunk.text.includes("cargo install --path crates/cli --locked"))).toBe(true);
     expect(installPage).not.toContain("codewhale-tui");
     expect(npmReadme).toContain("installs `codewhale` plus the `codew` convenience name");
@@ -403,8 +404,9 @@ done
     });
     for (const label of [...matrix.control.modes, ...matrix.control.permissionPostures]) {
       expect(modes).toContain(label);
-      expect(homepage).toContain(label);
     }
+    expect(PRODUCT_COPY.modes.map(({ title }) => title.en)).toEqual(matrix.control.modes);
+    expect(PRODUCT_COPY.permissions.map(({ title }) => title.en)).toEqual(matrix.control.permissionPostures);
     expect(modes).toContain("when the composer is empty");
     expect(keys).toContain("When the composer is empty, cycle TUI mode");
     expect(keys).toContain("`Shift+Tab`");
@@ -549,26 +551,25 @@ done
     // English and Chinese editions — same guarantee, one source.
     expect(footerProjectLinks("en", getChrome("en")).at(-1)).toEqual({
       label: "MIT license",
-      href: "https://github.com/Hmbown/CodeWhale/blob/main/LICENSE",
+      href: "https://github.com/codewhale-hq/CodeWhale/blob/main/LICENSE",
     });
     expect(footerProjectLinks("zh", getChrome("zh")).at(-1)).toEqual({
       label: "MIT 许可证",
-      href: "https://github.com/Hmbown/CodeWhale/blob/main/LICENSE",
+      href: "https://github.com/codewhale-hq/CodeWhale/blob/main/LICENSE",
     });
     expect(footer).toContain("href={REPO_RELEASES_URL}");
     expect(text("web/lib/i18n/links.ts")).toContain(
       'export const REPO_RELEASES_URL = `${REPO_URL}/releases`',
     );
     expect(text("web/lib/i18n/links.ts")).toContain(
-      'export const REPO_URL = "https://github.com/Hmbown/CodeWhale"',
+      'export const REPO_URL = "https://github.com/codewhale-hq/CodeWhale"',
     );
     expect(footer).toContain("GITEE_ENABLED &&");
   });
 
   it("keeps supplied terminal screenshots and website dimensions truthful", () => {
-    // Website and README share the same exact-build terminal-cell capture:
-    // the site renders its cells as live text, the README shows the same
-    // frame rasterized from them.
+    // The site and README use the same measured native capture. Demo route
+    // and development-source provenance remain explicit in capture metadata.
     const readmeImage = bytes(matrix.screenshot.readme);
     const websiteImage = bytes(matrix.screenshot.website);
 
@@ -579,28 +580,30 @@ done
     expect(matrix.screenshot.terminal).toContain("real PTY cell capture");
     // A development-build capture, never a release claim.
     expect(matrix.screenshot.capture).toContain("development build");
-    expect(matrix.screenshot.capture).toContain("not a default");
+    const capture = JSON.parse(text("web/lib/terminal-captures/manifest.json"));
+    expect(capture.baseCommit).toBe(matrix.screenshot.sourceCommit);
+    expect(capture.binarySha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(capture.sourceDiffSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(capture.sourceDirty).toBe(true);
+    expect(capture.conditions.provider).toContain("loopback");
+    expect(capture.conditions.model).toBe("website-demo");
+    expect(capture.conditions.submittedPrompts).toBeGreaterThan(0);
+    expect(capture.conditions.fixtureHistory).toBe(false);
 
     const readme = text("README.md");
-    const homepage = text("web/app/[locale]/page.tsx");
+    const productPage = text("web/app/[locale]/product/page.tsx");
     expect(readme).toContain(matrix.screenshot.readme);
     expect(`web/public${TERMINAL_SCREENSHOT.src}`).toBe(matrix.screenshot.website);
     expect(imageDimensions(websiteImage)).toEqual([TERMINAL_SCREENSHOT.width, TERMINAL_SCREENSHOT.height]);
-    expect(homepage).toContain('<TerminalCapture\n                    frame="home"');
+    expect(productPage).toContain("<NativeTerminalGallery");
     expect(TERMINAL_SCREENSHOT.capture).toBe("web/lib/terminal-captures/website-home-100x24.json");
     expect(matrix.screenshot.sources).toContain(TERMINAL_SCREENSHOT.capture);
     // Every locale describes the actual capture; build identity comes from
     // the media manifest instead of a stale version embedded in translations.
-    expect(homepage).toContain("label={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}");
-    expect(homepage).toContain("fill(d.shotBuild, { version: TERMINAL_SCREENSHOT.version })");
-    expect(getHome("en").shotBuild).toBe("v{version} pre-release build");
+    expect(productPage).toContain("label={fill(home.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}");
     for (const locale of ["en", "zh", "ja", "vi", "ko", "ru", "uk", "es", "pt-BR", "id", "fr", "de", "ca", "hi", "tr", "it", "pl", "ar"]) {
       const home = getHome(locale);
-      expect(home.shotBuild, `${locale} shotBuild`).toContain("{version}");
       expect(home.screenshotAlt, `${locale} alt`).toContain("{version}");
-      expect(home.screenshotAlt, `${locale} alt`).toContain("Ask");
-      expect(home.screenshotAlt, `${locale} alt`).toContain("Work");
-      expect(home.screenshotAlt, `${locale} alt`).not.toMatch(/171acee|0\.9\.12|Full Access/);
     }
   });
 

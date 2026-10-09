@@ -72,10 +72,9 @@ use previews::{
 pub use view::ApprovalOption;
 pub use view::ApprovalView;
 
-pub use policy::{
-    ApprovalStakes, RiskLevel, ToolCategory, classify_risk, classify_stakes,
-    get_tool_category_for_call,
-};
+pub use policy::{ApprovalStakes, ToolCategory, classify_stakes, get_tool_category_for_call};
+
+use crate::core::authority::{RiskLevel, classify_risk};
 
 /// User's decision for a pending approval
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +138,9 @@ pub struct ApprovalRequest {
     pub persistent_allow_rules: Vec<ToolAskRule>,
     /// The agent that raised this request, when it is a child's card.
     pub owner: Option<ApprovalOwner>,
+    /// This file write asks only because the folder has no git repository;
+    /// in one it would run without a card. The card says so in one line.
+    pub asks_without_git: bool,
 }
 
 /// Key approval details rendered prominently in the approval card.
@@ -242,6 +244,7 @@ impl ApprovalRequest {
             persistent_ask_rules,
             persistent_allow_rules,
             owner: None,
+            asks_without_git: false,
         }
     }
 

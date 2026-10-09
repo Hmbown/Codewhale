@@ -1,7 +1,7 @@
 //! Typed operation activity for the Engine owner contract.
 //!
 //! The Engine reports *what kind* of work a dispatched call is doing (reading,
-//! editing, desktop control, ...) without the tool name, arguments, command or
+//! editing, desktop control, ...) with a bounded canonical action identity, without arguments, command or
 //! result. Classification reuses the resolvers dispatch already trusts:
 //! [`canonical_action_alias`] for action families and the MCP pool's resolved
 //! server map for MCP tools. A call that neither resolves to a concrete
@@ -55,6 +55,16 @@ pub(crate) fn registry_activity_kind(tool_name: &str, input: &Value) -> Option<O
     Some(kind_for_operation(canonical_action_alias(tool_name, input)))
 }
 
+#[must_use]
+pub(crate) fn action_id(tool_name: &str, input: &Value) -> String {
+    let id = canonical_action_alias(tool_name, input);
+    if !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control) {
+        id.to_owned()
+    } else {
+        "tool".to_owned()
+    }
+}
+
 /// Classify an MCP call by the server the pool resolved it to, not by the
 /// model-facing name. Desktop-control servers report `Computer`; everything
 /// else is a generic `Tool`.
@@ -105,6 +115,12 @@ mod tests {
     fn primitives_and_action_families_resolve_through_the_canonical_alias() {
         let none = json!({});
         assert_eq!(registry_activity_kind("read", &none), Some(Kind::Reading));
+        assert_eq!(action_id("read", &none), "read_file");
+        assert_eq!(action_id("Git", &json!({"action": "diff"})), "git_diff");
+        assert_eq!(action_id("mcp_example_custom", &none), "mcp_example_custom");
+        for unsafe_id in ["", "bad\nname", &"鲸".repeat(86)] {
+            assert_eq!(action_id(unsafe_id, &none), "tool");
+        }
         assert_eq!(registry_activity_kind("write", &none), Some(Kind::Editing));
         assert_eq!(registry_activity_kind("edit", &none), Some(Kind::Editing));
         let cases = [

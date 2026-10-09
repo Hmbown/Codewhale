@@ -18,15 +18,12 @@
 //! * One test per property, with its cases in a table — not one test per case.
 //! * Never assert `a || b` where `b` is trivially true of any English string.
 
-use super::constants::{
-    TOOL_OUTPUT_HEAD_LINES, TOOL_OUTPUT_LINE_LIMIT, TOOL_OUTPUT_TAIL_LINES,
-    TOOL_SUCCESS_OUTPUT_PREVIEW_LINES,
-};
+use super::constants::{TOOL_OUTPUT_HEAD_LINES, TOOL_OUTPUT_LINE_LIMIT, TOOL_OUTPUT_TAIL_LINES};
 use super::thinking::cached_color_depth;
 use super::{
     ASSISTANT_GLYPH, ExecCell, ExecSource, GenericToolCell, HistoryCell, PlanUpdateCell,
-    REASONING_CURSOR, REASONING_OPENER, REASONING_RAIL, RenderMode, ThinkingFold, ToolCell,
-    ToolStatus, TranscriptRenderOptions, WebSearchCell, assistant_label_style_for,
+    REASONING_CURSOR, REASONING_OPENER, REASONING_RAIL, RenderMode, ToolCell, ToolStatus,
+    TranscriptFold, TranscriptRenderOptions, WebSearchCell, assistant_label_style_for,
     extract_reasoning_summary, render_spillover_annotation, render_thinking,
     render_thinking_with_analysis, running_status_label_with_elapsed,
 };
@@ -38,6 +35,25 @@ use crate::tui::ui_text::{
 use codewhale_models::{ContentBlock, Message, Role};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+#[test]
+fn extension_prompt_snapshots_and_withdrawal_show_the_complete_model_input() {
+    let instructions = format!("{}\nLast instruction.", "x".repeat(12_000));
+    for block in [Some(instructions.as_str()), None] {
+        let message = crate::runtime_handoff::extension_prompt_contributions_runtime_message(block);
+        let cells = super::history_cells_from_message(&message);
+        let [HistoryCell::System { content }] = cells.as_slice() else {
+            panic!("runtime instructions must be shown as a system receipt");
+        };
+        match block {
+            Some(text) => assert!(
+                content.contains(text),
+                "the full model-visible text stays auditable"
+            ),
+            None => assert!(content.contains("withdrawn")),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -96,6 +112,87 @@ fn calm_options() -> TranscriptRenderOptions {
     TranscriptRenderOptions {
         low_motion: true,
         ..TranscriptRenderOptions::default()
+    }
+}
+
+#[test]
+fn ordinary_cell_fold_preserves_body_metadata_and_full_exports() {
+    let content = format!(
+        "[reference](https://example.com/reference)\n\n{}",
+        (1..=12)
+            .map(|line| format!("paragraph {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    );
+    let mut tool = exec_tool("example", ToolStatus::Failed);
+    tool.output = Some(content.clone());
+    let cells = [
+        HistoryCell::User {
+            content: content.clone(),
+        },
+        HistoryCell::Assistant {
+            content: content.clone(),
+            streaming: false,
+        },
+        HistoryCell::Assistant {
+            content: content.clone(),
+            streaming: true,
+        },
+        HistoryCell::System {
+            content: content.clone(),
+        },
+        HistoryCell::Error {
+            message: content.clone(),
+            severity: crate::error_taxonomy::ErrorSeverity::Error,
+        },
+        HistoryCell::Tool(ToolCell::Exec(tool)),
+    ];
+    for cell in cells {
+        let options = calm_options();
+        let full = cell.lines_with_copy_metadata(80, options);
+        let (preview, action) =
+            cell.lines_with_copy_metadata_folded(80, options, Some(TranscriptFold::Collapsed));
+        assert!(
+            preview.len() < full.len(),
+            "a folded long body stays bounded"
+        );
+        assert_eq!(action, Some(super::CellFoldAction::Expand));
+        assert_eq!(preview[0].copy_prefix_width, preview[0].line.width());
+        assert!(preview[0].links.is_empty());
+        let body = &preview[1..];
+        for (index, line) in body.iter().enumerate() {
+            assert_eq!(line.line, full[index].line);
+            assert_eq!(line.links, full[index].links);
+            assert_eq!(line.copy_prefix_width, full[index].copy_prefix_width);
+            if index + 1 < body.len() {
+                assert_eq!(line.copy_separator_after, full[index].copy_separator_after);
+            }
+        }
+        assert_eq!(
+            body.last().unwrap().copy_separator_after,
+            crate::tui::ui_text::CopyLineSeparator::Newline
+        );
+        let (plain, plain_action) =
+            cell.lines_with_options_folded(80, options, Some(TranscriptFold::Collapsed));
+        assert_eq!(plain_action, action);
+        assert_eq!(
+            plain,
+            preview
+                .iter()
+                .map(|line| line.line.clone())
+                .collect::<Vec<_>>()
+        );
+        let (restored, action) =
+            cell.lines_with_copy_metadata_folded(80, options, Some(TranscriptFold::Expanded));
+        assert!(action.is_none());
+        assert_eq!(restored.len(), full.len());
+        for (restored, original) in restored.iter().zip(&full) {
+            assert_eq!(restored.line, original.line);
+            assert_eq!(restored.links, original.links);
+            assert_eq!(restored.copy_prefix_width, original.copy_prefix_width);
+            assert_eq!(restored.copy_separator_after, original.copy_separator_after);
+        }
+        assert!(lines_text(&cell.transcript_lines(80)).contains("paragraph 12"));
     }
 }
 
@@ -408,15 +505,27 @@ fn whatever_live_truncates_the_transcript_still_holds() {
         .filter(|i| live_text.contains(&format!("row {i:02} plain content")))
         .count();
     assert_eq!(
-        previewed, TOOL_SUCCESS_OUTPUT_PREVIEW_LINES,
-        "a successful exec previews exactly {TOOL_SUCCESS_OUTPUT_PREVIEW_LINES} \
-         rows: {live_text}"
+        previewed, 3,
+        "a successful exec previews only the opening and final result rows: {live_text}"
     );
     assert!(
         live_text.contains(first) && live_text.contains(&last),
         "the bounded preview retains context and the final result: {live_text}"
     );
+    let output_hint = crate::tui::key_shortcuts::tool_details_shortcut_action_hint("output");
+    assert!(
+        live_text.contains(&output_hint),
+        "a shortened success must point to its full output: {live_text}"
+    );
+    assert!(
+        !live_text.contains("row 15 plain content"),
+        "the live preview should leave routine middle output for details: {live_text}"
+    );
     assert!(transcript_text.contains(first) && transcript_text.contains(&last));
+    assert!(
+        transcript_text.contains("row 15 plain content"),
+        "the full transcript must retain output omitted from the live card: {transcript_text}"
+    );
 
     // Successful generic tool: output collapses entirely live, and does so
     // without spending a row telling the user it collapsed.
@@ -434,6 +543,102 @@ fn whatever_live_truncates_the_transcript_still_holds() {
     );
     assert!(transcript_text.contains(first));
     assert!(transcript_text.contains("row 23 plain content"));
+}
+
+/// A successful run shows three rows of output. They used to be the first two
+/// and the very last, so `npm test` showed a blank row, the script banner and
+/// a timing line, and hid whether the tests passed. The rows that say how the
+/// run went must be among the three, blank rows must not take a slot, and
+/// every hidden row must be announced, including rows after the last one shown.
+#[test]
+fn a_successful_run_preview_shows_how_the_run_ended() {
+    let node_test = "\n> trip-timer@1.0.0 test\n> node --test\n\n\
+                     ✔ formats minutes (0.5ms)\n\
+                     ✔ trips over an hour show remainder minutes (0.1ms)\n\
+                     ℹ tests 2\nℹ suites 0\nℹ pass 2\nℹ fail 0\nℹ cancelled 0\n\
+                     ℹ skipped 0\nℹ todo 0\nℹ duration_ms 57.924542";
+    let cargo_test = "   Compiling demo v0.1.0\n     Running unittests src/lib.rs\n\n\
+                      running 2 tests\ntest a ... ok\ntest b ... ok\n\n\
+                      test result: ok. 2 passed; 0 failed; finished in 0.00s\n\n";
+    let plain = numbered_output(30);
+
+    // (case, output, rows that must be shown, omission markers in order)
+    let cases: [(&str, &str, &[&str], &[&str]); 3] = [
+        (
+            "totals followed by other lines",
+            node_test,
+            &["> trip-timer@1.0.0 test", "ℹ pass 2", "ℹ fail 0"],
+            &["5 lines omitted", "4 lines omitted"],
+        ),
+        (
+            "result followed by blank lines",
+            cargo_test,
+            &[
+                "Compiling demo v0.1.0",
+                "test b ... ok",
+                "test result: ok. 2 passed; 0 failed",
+            ],
+            &["3 lines omitted"],
+        ),
+        (
+            "nothing states an outcome",
+            &plain,
+            &[
+                "row 00 plain content",
+                "row 28 plain content",
+                "row 29 plain content",
+            ],
+            &["27 lines omitted"],
+        ),
+    ];
+
+    for (case, output, shown, markers) in cases {
+        let cell = {
+            let mut exec = exec_tool("npm test", ToolStatus::Success);
+            exec.output = Some(output.to_string());
+            exec.duration_ms = Some(120);
+            HistoryCell::Tool(ToolCell::Exec(exec))
+        };
+        let live = cell.lines_with_options(80, calm_options());
+        let live_text = lines_text(&live);
+
+        for row in shown {
+            assert!(
+                live_text.contains(row),
+                "[{case}] `{row}` hidden: {live_text}"
+            );
+        }
+        let source_rows_shown = output
+            .lines()
+            .filter(|line| !line.trim().is_empty() && live_text.contains(line.trim()))
+            .count();
+        assert_eq!(
+            source_rows_shown,
+            shown.len(),
+            "[{case}] the preview keeps its three-row budget: {live_text}"
+        );
+        let announced: Vec<String> = live
+            .iter()
+            .map(line_text)
+            .filter(|line| line.contains("lines omitted"))
+            .collect();
+        assert_eq!(
+            announced.len(),
+            markers.len(),
+            "[{case}] every gap is announced once: {live_text}"
+        );
+        for (line, marker) in announced.iter().zip(markers) {
+            assert!(line.contains(marker), "[{case}] `{marker}`: {live_text}");
+        }
+
+        let transcript_text = lines_text(&cell.transcript_lines(80));
+        for line in output.lines() {
+            assert!(
+                transcript_text.contains(line.trim()),
+                "[{case}] the transcript keeps `{line}`: {transcript_text}"
+            );
+        }
+    }
 }
 
 /// Repro for #80: a `git diff --stat`-shaped result must keep its newlines on
@@ -507,12 +712,12 @@ fn reasoning_folds_in_live_and_the_fold_is_reversible() {
         // the intent is not re-read through the preference.
         let expanded = lines_text(
             &cell
-                .lines_with_options_folded(80, options, Some(ThinkingFold::Expanded))
+                .lines_with_options_folded(80, options, Some(TranscriptFold::Expanded))
                 .0,
         );
         let collapsed = lines_text(
             &cell
-                .lines_with_options_folded(80, options, Some(ThinkingFold::Collapsed))
+                .lines_with_options_folded(80, options, Some(TranscriptFold::Collapsed))
                 .0,
         );
 
@@ -565,15 +770,15 @@ fn explicit_thinking_fold_outranks_every_preference_baseline() {
         (None, true, false, true),
         (None, true, true, true),
         // An explicit expand renders expanded whatever the preferences say.
-        (Some(ThinkingFold::Expanded), false, false, true),
-        (Some(ThinkingFold::Expanded), false, true, true),
-        (Some(ThinkingFold::Expanded), true, false, true),
-        (Some(ThinkingFold::Expanded), true, true, true),
+        (Some(TranscriptFold::Expanded), false, false, true),
+        (Some(TranscriptFold::Expanded), false, true, true),
+        (Some(TranscriptFold::Expanded), true, false, true),
+        (Some(TranscriptFold::Expanded), true, true, true),
         // And an explicit collapse renders collapsed whatever they say.
-        (Some(ThinkingFold::Collapsed), false, false, false),
-        (Some(ThinkingFold::Collapsed), false, true, false),
-        (Some(ThinkingFold::Collapsed), true, false, false),
-        (Some(ThinkingFold::Collapsed), true, true, false),
+        (Some(TranscriptFold::Collapsed), false, false, false),
+        (Some(TranscriptFold::Collapsed), false, true, false),
+        (Some(TranscriptFold::Collapsed), true, false, false),
+        (Some(TranscriptFold::Collapsed), true, true, false),
     ] {
         let options = TranscriptRenderOptions {
             verbose,
@@ -661,7 +866,7 @@ fn streaming_reasoning_shows_its_newest_line_not_a_placeholder() {
 ///
 /// Replaces three tests.
 #[test]
-fn a_foreground_shell_wait_offers_the_escape_hatch_not_the_command_echo() {
+fn a_foreground_shell_wait_names_its_command_without_a_key_hint() {
     let command = "cargo test --workspace --all-features";
     let running = {
         let mut exec = exec_tool(command, ToolStatus::Running);
@@ -678,17 +883,16 @@ fn a_foreground_shell_wait_offers_the_escape_hatch_not_the_command_echo() {
         ),
     ] {
         assert!(
-            text.contains("Ctrl+B"),
-            "[{label}] the backgrounding chord is the point of the card: {text}"
+            text.contains(command),
+            "[{label}] the card names what is running: {text}"
+        );
+        assert!(
+            !text.contains("Ctrl+B"),
+            "[{label}] a long wait moves itself to the background: {text}"
         );
         assert!(
             !text.contains("running line 1"),
             "[{label}] the live tail belongs to the sidebar and /jobs: {text}"
-        );
-        assert!(
-            !text.contains(command),
-            "[{label}] the header already carries the summary; do not echo the \
-             command target: {text}"
         );
         assert!(!text.contains("command:"), "[{label}] {text}");
     }
@@ -3038,9 +3242,9 @@ fn calm1_settled_reasoning_is_one_localized_row_and_stays_expandable() {
             "{}",
             lines_text(&lines)
         );
-        assert_eq!(action, Some(super::ReasoningAction::Expand));
+        assert_eq!(action, Some(super::CellFoldAction::Expand));
         let expanded = cell
-            .lines_with_options_folded(80, options, Some(ThinkingFold::Expanded))
+            .lines_with_options_folded(80, options, Some(TranscriptFold::Expanded))
             .0;
         assert!(lines_text(&expanded).contains("private reasoning body"));
     }

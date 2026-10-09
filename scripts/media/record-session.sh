@@ -104,7 +104,7 @@ ffmpeg -loglevel error -y -i "${gif}" -frames:v 1 "${out_dir}/first-fleet-sessio
 cat > "${out_dir}/capture.json" <<JSON
 {
   "id": "first-fleet-session",
-  "issue": "https://github.com/Hmbown/CodeWhale/issues/4906",
+  "issue": "https://github.com/codewhale-hq/CodeWhale/issues/4906",
   "recorded_from_commit": "${head_sha}",
   "version_line": "${version_line}",
   "tape": "docs/evidence/v092-first-fleet-session.tape",

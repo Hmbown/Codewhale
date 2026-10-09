@@ -3,7 +3,7 @@
  * check-cloudflare-deploy-env.mjs - fail fast when the GitHub deploy job is
  * missing Cloudflare credentials.
  *
- * The actual deploy still belongs to Wrangler/OpenNext. This script only makes
+ * The actual deploy still belongs to cf/OpenNext. This script only makes
  * the common GitHub Actions failure mode obvious before the expensive build
  * starts.
  */
@@ -92,7 +92,7 @@ if (failures.length > 0) {
     console.log(
       `[check-cloudflare-deploy-env] ${failures.length} credential input(s) must be supplied by the protected manual deploy job.`,
     );
-    console.log("[check-cloudflare-deploy-env] Wrangler deploy was not started.");
+    console.log("[check-cloudflare-deploy-env] Cloudflare deploy was not started.");
     printReceipt("withheld");
     process.exit(0);
   }
@@ -107,7 +107,7 @@ if (failures.length > 0) {
     console.error(`  Hint: ${item.detail}.`);
   }
   console.error("");
-  console.error("Wrangler deploy was not started.");
+  console.error("Cloudflare deploy was not started.");
   printReceipt(failures.some((failure) => failure.kind === "invalid") ? "invalid" : "missing");
   process.exit(1);
 }

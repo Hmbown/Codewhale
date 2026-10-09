@@ -68,20 +68,20 @@ function buildFromSourceHint() {
   return [
     "You can still run codewhale by building from source with Cargo:",
     "",
-    "  # Requires Rust 1.88+ (https://rustup.rs)",
+    "  # Requires Rust 1.89+ (https://rustup.rs)",
     "  cargo install codewhale-cli --locked   # provides `codewhale`",
     "  bin=$(dirname \"$(command -v codewhale)\")",
     "  ln -sf \"$bin/codewhale\" \"$bin/codew\"   # optional short alias",
     "",
     "Or build from a checkout:",
     "",
-    "  git clone https://github.com/Hmbown/CodeWhale.git",
+    "  git clone https://github.com/codewhale-hq/CodeWhale.git",
     "  cd CodeWhale",
     "  cargo install --path crates/cli --locked",
     "  bin=$(dirname \"$(command -v codewhale)\")",
     "  ln -sf \"$bin/codewhale\" \"$bin/codew\"",
     "",
-    "See https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md",
+    "See https://github.com/codewhale-hq/CodeWhale/blob/main/docs/INSTALL.md",
   ].join("\n");
 }
 

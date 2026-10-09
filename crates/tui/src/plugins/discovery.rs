@@ -173,6 +173,23 @@ pub(crate) fn discover_with_context(
     )
 }
 
+// These exact operation-name shapes are reserved by stage::fresh_staging_dir
+// and place::finalize_install. Do not hide human paths such as demo.bak or
+// .staging-not-a-uuid, which can legitimately contain reviewed bundles.
+fn is_internal_publication_directory(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name.strip_prefix(".staging-").is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) || name.strip_prefix(".plugin-backup-").is_some_and(|suffix| {
+        suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
+}
+
 fn scan_root(
     root: &Path,
     scope: PluginScope,
@@ -244,6 +261,9 @@ fn scan_root(
     entries.sort_by_key(fs::DirEntry::file_name);
 
     for entry in entries {
+        if is_internal_publication_directory(&entry.file_name()) {
+            continue;
+        }
         let plugin_root = entry.path();
         let Ok(metadata) = fs::symlink_metadata(&plugin_root) else {
             continue;
@@ -383,68 +403,105 @@ fn load_plugin(
 fn parse_skill_snapshots(
     validated: &ValidatedManifest,
 ) -> Result<(Vec<PluginSkillSnapshot>, Vec<PluginDiagnostic>), String> {
+    parse_skill_snapshots_for_roots(validated, &validated.components.skills, false)
+}
+
+/// One parser for declared and programmable roots. Only the byte inventory
+/// that produced the reviewed bundle hash chooses files; discovery never
+/// parses a mutable/unreviewed file before its receipt has been checked.
+fn parse_skill_snapshots_for_roots(
+    validated: &ValidatedManifest,
+    roots: &[PathBuf],
+    bounded_native: bool,
+) -> Result<(Vec<PluginSkillSnapshot>, Vec<PluginDiagnostic>), String> {
     let mut diagnostics = Vec::new();
     let mut skill_snapshots = Vec::new();
-    for skills_dir in &validated.components.skills {
-        let registry = crate::skills::SkillRegistry::discover(skills_dir);
-        for warning in registry.warnings() {
-            diagnostics.push(PluginDiagnostic::warning(
-                "skill-invalid",
-                warning.clone(),
-                Some(skills_dir.clone()),
-            ));
-        }
-        for skill in registry.list() {
-            let relative = skill
-                .path
-                .strip_prefix(&validated.canonical_root)
-                .map_err(|_| {
-                    format!(
-                        "plugin `{}` Skill path escaped the reviewed bundle",
-                        validated.manifest.plugin.name
-                    )
-                })?;
-            let expected_hash = validated.file_hashes.get(relative).ok_or_else(|| {
-                format!(
-                    "plugin `{}` Skill was not present in the reviewed byte inventory",
-                    validated.manifest.plugin.name
-                )
-            })?;
-            let bytes = read_skill_bytes(&skill.path)?;
+    let mut parsed_files = 0usize;
+    let mut parsed_bytes = 0usize;
+    for root in roots {
+        let root_relative = root
+            .strip_prefix(&validated.canonical_root)
+            .map_err(|_| "Skill root escaped the reviewed bundle".to_string())?;
+        let mut candidates: Vec<_> = validated
+            .file_hashes
+            .iter()
+            .filter(|(path, _)| {
+                let Ok(relative) = path.strip_prefix(root_relative) else {
+                    return false;
+                };
+                let components: Vec<_> = relative.components().collect();
+                path.file_name().is_some_and(|name| name == "SKILL.md")
+                    && components.len() >= 2
+                    && components.len() - 2 <= crate::skills::SkillRegistry::MAX_DISCOVERY_DEPTH
+                    && components[..components.len() - 1].iter().all(|component| {
+                        !component
+                            .as_os_str()
+                            .to_str()
+                            .is_some_and(|name| name.starts_with('.'))
+                    })
+            })
+            .collect();
+        candidates.sort_by(|(a, _), (b, _)| {
+            a.components()
+                .count()
+                .cmp(&b.components().count())
+                .then_with(|| a.cmp(b))
+        });
+        let mut claimed = BTreeSet::<PathBuf>::new();
+        for (relative, expected_hash) in candidates {
+            let directory = relative.parent().expect("SKILL.md has a parent");
+            if claimed.iter().any(|parent| directory.starts_with(parent)) {
+                continue;
+            }
+            // Even an invalid parent Skill claims its package, so nested
+            // examples cannot become independent instructions.
+            claimed.insert(directory.to_path_buf());
+            if bounded_native && parsed_files >= crate::extension_host::skills::MAX_SKILLS_PER_OWNER
+            {
+                return Err("skill root exceeds the bounded candidate count".to_string());
+            }
+            parsed_files += 1;
+            let path = validated.canonical_root.join(relative);
+            let bytes = read_skill_bytes(&validated.canonical_root, &path)?;
+            parsed_bytes = parsed_bytes.saturating_add(bytes.len());
+            if bounded_native && parsed_bytes > crate::extension_host::skills::MAX_BYTES_PER_OWNER {
+                return Err("skill root exceeds the bounded instruction byte limit".to_string());
+            }
             let actual_hash = hash_skill_bytes(&bytes);
             if &actual_hash != expected_hash {
-                return Err(format!(
-                    "plugin `{}` Skill changed between review hashing and parsing",
-                    validated.manifest.plugin.name
-                ));
+                return Err("plugin Skill changed between review hashing and parsing".to_string());
             }
             let content = std::str::from_utf8(&bytes)
                 .map_err(|_| "plugin Skill must be valid UTF-8".to_string())?;
-            let (skill, parse_warnings) =
-                crate::skills::SkillRegistry::parse_verified_content(&skill.path, content)?;
-            for warning in parse_warnings {
-                if diagnostics
-                    .iter()
-                    .any(|diagnostic: &PluginDiagnostic| diagnostic.message.ends_with(&warning))
-                {
-                    continue;
-                }
+            let (skill, warnings) =
+                match crate::skills::SkillRegistry::parse_verified_content(&path, content) {
+                    Ok(parsed) => parsed,
+                    Err(reason) => {
+                        diagnostics.push(PluginDiagnostic::warning(
+                            "skill-invalid",
+                            reason,
+                            Some(path),
+                        ));
+                        continue;
+                    }
+                };
+            for warning in warnings {
                 diagnostics.push(PluginDiagnostic::warning(
                     "skill-invalid",
                     warning,
-                    Some(skill.path.clone()),
+                    Some(path.clone()),
                 ));
             }
             skill_snapshots.push(PluginSkillSnapshot {
-                name: skill.name.clone(),
-                legacy_activation_name: skill.legacy_activation_name.clone(),
-                description: skill.description.clone(),
-                localized_descriptions: skill.localized_descriptions.clone(),
+                name: skill.name,
+                legacy_activation_name: skill.legacy_activation_name,
+                description: skill.description,
+                localized_descriptions: skill.localized_descriptions,
                 invocation: skill.invocation,
-                aliases: skill.aliases.clone(),
-                argument_hint: skill.argument_hint.clone(),
-                body: skill.body.clone(),
-                path: skill.path.clone(),
+                aliases: skill.aliases,
+                argument_hint: skill.argument_hint,
+                body: skill.body,
+                path,
                 source_hash: actual_hash,
             });
         }
@@ -463,14 +520,12 @@ fn parse_skill_snapshots(
             ));
         }
     }
-
     Ok((skill_snapshots, diagnostics))
 }
 
-fn read_skill_bytes(path: &Path) -> Result<Vec<u8>, String> {
+fn read_skill_bytes(root: &Path, path: &Path) -> Result<Vec<u8>, String> {
     use std::io::Read as _;
-
-    let file = super::manifest::open_bundle_file(path)
+    let file = crate::fs_confined::open_read(root, path)
         .map_err(|e| format!("failed to open plugin Skill without following links: {e}"))?;
     let mut bytes = Vec::new();
     file.take(1024 * 1024 + 1)
@@ -498,6 +553,43 @@ pub(crate) fn load_staged_skill_snapshots(
     expected_content_hash: &str,
     expected_capability_hash: &str,
 ) -> Result<Vec<PluginSkillSnapshot>, String> {
+    load_staged_skill_snapshots_with_roots(
+        staged_root,
+        expected_content_hash,
+        expected_capability_hash,
+        None,
+    )
+}
+
+pub(crate) fn load_staged_skill_root_snapshots(
+    authority: &super::types::PluginAuthority,
+    relative: &Path,
+) -> Result<Vec<PluginSkillSnapshot>, String> {
+    let staged_root = super::agent_plugin::plugin_root_for_manifest(&authority.staged_manifest)
+        .ok_or_else(|| "reviewed plugin has no staged root".to_string())?;
+    let root = staged_root.join(relative);
+    crate::fleet::files::reject_linked_path(staged_root, &root).map_err(|e| e.to_string())?;
+    if !root.is_dir() {
+        return Err("skill root must be a directory inside the reviewed bundle".to_string());
+    }
+    let snapshots = load_staged_skill_snapshots_with_roots(
+        staged_root,
+        &authority.content_hash,
+        &authority.capability_hash,
+        Some(&[root]),
+    )?;
+    if snapshots.is_empty() {
+        return Err("skill root contains no valid reviewed Skills".to_string());
+    }
+    Ok(snapshots)
+}
+
+fn load_staged_skill_snapshots_with_roots(
+    staged_root: &Path,
+    expected_content_hash: &str,
+    expected_capability_hash: &str,
+    roots: Option<&[PathBuf]>,
+) -> Result<Vec<PluginSkillSnapshot>, String> {
     let staged_manifest = resolve_manifest_path(staged_root)
         .ok_or_else(|| "staged plugin has no plugin.json, .claude-plugin/plugin.json, kimi.plugin.json, or plugin.toml".to_string())?;
     let validated = PluginManifest::validate_from_path(&staged_manifest)?;
@@ -507,7 +599,10 @@ pub(crate) fn load_staged_skill_snapshots(
     {
         return Err("staged plugin Skill snapshot no longer matches reviewed content".to_string());
     }
-    let (snapshots, diagnostics) = parse_skill_snapshots(&validated)?;
+    let (snapshots, diagnostics) = match roots {
+        Some(roots) => parse_skill_snapshots_for_roots(&validated, roots, true)?,
+        None => parse_skill_snapshots(&validated)?,
+    };
     if let Some(diagnostic) = diagnostics.first() {
         return Err(format!(
             "staged plugin Skill snapshot is invalid: {}",
@@ -527,7 +622,18 @@ pub(crate) fn load_staged_skill_snapshots(
     Ok(snapshots)
 }
 
-fn plugin_id(scope: PluginScope, name: &str, canonical_root: &Path) -> PluginId {
+pub(super) fn plugin_id(scope: PluginScope, name: &str, canonical_root: &Path) -> PluginId {
+    PluginId(format!(
+        "{}/{}/{name}",
+        scope.as_str(),
+        plugin_root_hash(scope, canonical_root)
+    ))
+}
+
+/// The path-derived middle segment of a plugin id. It depends only on the
+/// scope and canonical root, never the manifest name, so a persisted record
+/// can be matched to a directory on disk even when its manifest no longer parses.
+pub(super) fn plugin_root_hash(scope: PluginScope, canonical_root: &Path) -> String {
     let mut hasher = Sha256::new();
     // v2 intentionally invalidates receipts produced by the former lossy
     // Unicode path identity.
@@ -536,11 +642,10 @@ fn plugin_id(scope: PluginScope, name: &str, canonical_root: &Path) -> PluginId 
     hasher.update(b"\0");
     super::path_identity::hash_os_path(&mut hasher, b"canonical-plugin-root", canonical_root);
     let digest = hasher.finalize();
-    let suffix = digest[..6]
+    digest[..6]
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    PluginId(format!("{}/{suffix}/{name}", scope.as_str()))
+        .collect::<String>()
 }
 
 #[cfg(test)]
@@ -752,3 +857,7 @@ mod tests {
         assert!(!home.join("plugins/state.json").exists());
     }
 }
+
+#[cfg(test)]
+#[path = "discovery_internal_paths_tests.rs"]
+mod internal_publication_tests;

@@ -31,8 +31,8 @@ noise; concrete ones become fixes with credit.
 2. **Check for duplicates / related work.** Search open issues and PRs before
    filing; if one exists, comment there instead, or cross-link as `Related: #N`.
    ```bash
-   gh issue list --repo Hmbown/CodeWhale --state all --search "keyword in:title,body" --limit 30
-   gh pr list --repo Hmbown/CodeWhale --state all --search "keyword" --limit 20
+   gh issue list --repo codewhale-hq/CodeWhale --state all --search "keyword in:title,body" --limit 30
+   gh pr list --repo codewhale-hq/CodeWhale --state all --search "keyword" --limit 20
    ```
 3. **Write a title that names the gap**, not the vibe. Match the house pattern
    `vX.Y.Z: <imperative gap>` with the live milestone version, e.g.
@@ -58,13 +58,13 @@ noise; concrete ones become fixes with credit.
    next release. Read the current target milestone from the live list below;
    never hard-code it.
    ```bash
-   gh label list --repo Hmbown/CodeWhale --limit 100
-   gh api repos/Hmbown/CodeWhale/milestones --jq '.[] | "\(.title)\topen:\(.open_issues)"'
+   gh label list --repo codewhale-hq/CodeWhale --limit 100
+   gh api repos/codewhale-hq/CodeWhale/milestones --jq '.[] | "\(.title)\topen:\(.open_issues)"'
    ```
 6. **Create the issue.** Pipe the body from stdin (this skill writes no files);
    `--milestone` and repeatable `--label` take live names verbatim:
    ```bash
-   gh issue create --repo Hmbown/CodeWhale \
+   gh issue create --repo codewhale-hq/CodeWhale \
      --title "vX.Y.Z: Isolate provider/model selection per TUI session" \
      --label bug --label tui --label reliability \
      --milestone "<live-milestone>" \

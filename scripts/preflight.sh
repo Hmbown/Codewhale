@@ -91,7 +91,8 @@ if [[ -n "${base}" ]]; then
     "add each feat commit's #issue to CHANGELOG.md in this branch" \
     ./scripts/release/check-feature-release-notes.sh "${base}" HEAD
 else
-  echo "== feature release-note receipts: skipped (no origin/main; pass --base REF)"
+  echo "== feature release-note receipts: no base to compare against (no origin/main; pass --base REF)" >&2
+  failed+=("feature release-note receipts: no base to compare against; pass --base REF")
 fi
 
 echo

@@ -52,7 +52,7 @@ use super::role::{
     NETWORK_DENIAL_SENTINEL, NETWORK_TOOL_DENYLIST, RAW_SHELL_SENTINEL, is_posture_denial,
     session_shell_ceiling,
 };
-use crate::config::{ApiProvider, Config};
+use crate::config::{Config, ProviderKind};
 use crate::llm_client::LlmClient;
 use crate::reasoning_preference::ReasoningEffort;
 use codewhale_models::Role;
@@ -251,12 +251,14 @@ fn freeze_saved_fleet(
                 .to_string(),
         ))
     };
-    let session_route = config.map(|config| {
-        (
-            config.provider_identity_for(config.api_provider()),
-            config.default_model(),
-        )
-    });
+    let session_route = config
+        .map(|config| {
+            config
+                .active_provider_identity()
+                .map(|identity| (identity.key.to_string(), config.default_model()))
+        })
+        .transpose()
+        .map_err(fail)?;
     let session_reasoning = || {
         let effort = config
             .and_then(Config::reasoning_effort)
@@ -363,7 +365,7 @@ fn freeze_saved_fleet(
 /// provider-native adaptive for a route whose body does not say so.
 #[must_use]
 pub(crate) fn reasoning_capability_for_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     wire_model: &str,
 ) -> ReasoningCapability {
@@ -467,7 +469,7 @@ fn tier_of(effort: ReasoningEffort) -> Option<ReasoningTier> {
 /// receipt describing each other.
 #[must_use]
 pub(crate) fn route_reasoning_setting(
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: &str,
     wire_model: &str,
     tier: ReasoningTier,
@@ -512,21 +514,27 @@ pub(crate) fn preflight_route(
     let wire_model = crate::config::requested_model_for_provider(identity.provider, model.trim())
         .ok_or_else(|| PreflightError::ModelUnresolved {
         member: member_id.to_string(),
-        provider: identity.key.clone(),
+        provider: identity.key.to_string(),
         model: model.to_string(),
         detail: "not a known model for this provider".to_string(),
     })?;
     crate::config::validate_route(identity.provider, &wire_model).map_err(|detail| {
         PreflightError::ModelUnresolved {
             member: member_id.to_string(),
-            provider: identity.key.clone(),
+            provider: identity.key.to_string(),
             model: wire_model.clone(),
             detail,
         }
     })?;
 
     let mut scoped = config.clone();
-    scoped.scope_to_provider_identity(&identity);
+    scoped
+        .scope_to_provider_identity(&identity)
+        .map_err(|detail| PreflightError::ProviderUnresolved {
+            member: member_id.to_string(),
+            provider: provider.to_string(),
+            detail,
+        })?;
     let base_url = scoped.active_route_base_url();
 
     // Locally decided. A concrete loopback/self-hosted route is keyless by
@@ -536,7 +544,7 @@ pub(crate) fn preflight_route(
     let credential =
         if crate::config::provider_route_is_keyless_self_hosted(identity.provider, &base_url) {
             CredentialReadiness::KeylessLocal
-        } else if crate::config::has_api_key_for(&scoped, identity.provider) {
+        } else if crate::config::has_api_key_for(&scoped, &identity) {
             CredentialReadiness::Configured
         } else {
             // The discriminant only. `Missing { detail }` names the provider table
@@ -550,11 +558,11 @@ pub(crate) fn preflight_route(
 
     Ok(PreflightedRoute {
         member_id: member_id.to_string(),
-        provider_id: identity.key.clone(),
+        provider_id: identity.key.to_string(),
         provider_config_id: identity
             .migrated_legacy_ollama_cloud_route
             .then(|| provider.trim().to_string()),
-        provider_kind: if identity.provider == ApiProvider::OllamaCloud {
+        provider_kind: if identity.provider == ProviderKind::OllamaCloud {
             identity.provider.as_str().to_string()
         } else {
             format!("{:?}", identity.provider).to_ascii_lowercase()
@@ -582,7 +590,7 @@ pub(crate) fn preflight_route(
 fn validate_route_client(route: &PreflightedRoute, config: &Config) -> Result<(), String> {
     let mut scoped = config.clone();
     let identity = config.resolve_provider_identity(route.provider_config_id())?;
-    scoped.scope_to_provider_identity(&identity);
+    scoped.scope_to_provider_identity(&identity)?;
     crate::client::CodewhaleClient::new(&scoped)
         .map(|_| ())
         .map_err(|error| {
@@ -618,7 +626,7 @@ pub(crate) struct LiveFleetRouter {
     /// reasoning value can be shaped by the *actual* configured route rather
     /// than by a generic tier label. Never serialized — the base URL can carry
     /// a credential and receipts are durable.
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: String,
     /// What the Router call is actually made at, plus the four-sided disclosure
     /// for the receipt. Configured by the operator (`off` or `low`), normalized
@@ -670,7 +678,9 @@ impl LiveFleetRouter {
                 ),
             })?;
         let mut scoped = config.clone();
-        scoped.scope_to_provider_identity(&identity);
+        scoped
+            .scope_to_provider_identity(&identity)
+            .map_err(|reason| RouterBindError { reason })?;
         let base_url = scoped.active_route_base_url();
         let client =
             crate::client::CodewhaleClient::new(&scoped).map_err(|error| RouterBindError {
@@ -997,6 +1007,7 @@ impl ExactMemberBinding {
     /// model (including compatibility-migrated provider identities).
     pub(crate) fn spawn_profile(&self) -> super::profile::AgentProfile {
         super::profile::AgentProfile {
+            native_preset: None,
             id: self.member_id.clone(),
             display_name: None,
             description: None,
@@ -2717,7 +2728,7 @@ permissions = "read_only"
     #[test]
     fn glm_routes_report_an_enabled_disabled_provider_control() {
         let capability = reasoning_capability_for_route(
-            ApiProvider::Zai,
+            ProviderKind::Zai,
             crate::config::DEFAULT_ZAI_BASE_URL,
             crate::config::ZAI_GLM_5_2_MODEL,
         );
@@ -2742,7 +2753,7 @@ permissions = "read_only"
     #[test]
     fn a_route_that_varies_its_wire_value_reports_distinct_tiers() {
         let capability = reasoning_capability_for_route(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             crate::config::DEFAULT_DEEPSEEK_BASE_URL,
             "deepseek-v4-pro",
         );
@@ -2757,7 +2768,7 @@ permissions = "read_only"
     #[test]
     fn a_deepseek_route_reports_low_as_low_and_medium_as_high() {
         let capability = reasoning_capability_for_route(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             crate::config::DEFAULT_DEEPSEEK_BASE_URL,
             "deepseek-v4-pro",
         );
@@ -2810,7 +2821,7 @@ permissions = "read_only"
     #[test]
     fn a_route_that_collapses_low_onto_high_says_so_instead_of_reporting_low() {
         let capability = reasoning_capability_for_route(
-            ApiProvider::Siliconflow,
+            ProviderKind::Siliconflow,
             crate::config::DEFAULT_SILICONFLOW_BASE_URL,
             "deepseek-ai/DeepSeek-V4-Pro",
         );
@@ -3034,7 +3045,7 @@ call_reasoning = "low"
             .expect("legacy Cloud Router binds its source table and secret");
         assert_eq!(live.route.provider_id, "ollama-cloud");
         assert_eq!(live.route.provider_config_id.as_deref(), Some("ollama"));
-        assert_eq!(live.client.api_provider(), ApiProvider::OllamaCloud);
+        assert_eq!(live.client.api_provider(), ProviderKind::OllamaCloud);
         assert_eq!(
             live.client.base_url(),
             codewhale_config::provider::OLLAMA_CLOUD_BASE_URL
@@ -3057,7 +3068,7 @@ call_reasoning = "low"
         ] {
             assert_eq!(
                 route_reasoning_setting(
-                    ApiProvider::Deepseek,
+                    ProviderKind::Deepseek,
                     crate::config::DEFAULT_DEEPSEEK_BASE_URL,
                     "deepseek-v4-pro",
                     tier,
@@ -3072,7 +3083,7 @@ call_reasoning = "low"
         // (`xhigh`, `max`, `ultra`) that the roster publishes per model.
         let codex = |tier| {
             route_reasoning_setting(
-                ApiProvider::OpenaiCodex,
+                ProviderKind::OpenaiCodex,
                 "https://chatgpt.com/backend-api/codex",
                 "gpt-5.6-codex",
                 tier,
@@ -3406,7 +3417,7 @@ mod saved_fleet_tests {
         let reviewer = exact.member("reviewer").expect("reviewer");
         assert_eq!(
             reviewer.provider,
-            config.provider_identity_for(config.api_provider())
+            config.active_provider_identity().unwrap().key.as_str()
         );
         assert_eq!(reviewer.model, config.default_model());
         assert_eq!(reviewer.reasoning.as_str(), "high");
@@ -3607,7 +3618,7 @@ mod saved_fleet_tests {
         assert_eq!(
             reviewer.route.wire_model,
             crate::config::requested_model_for_provider(
-                config.api_provider(),
+                config.active_provider_identity().unwrap().provider,
                 &config.default_model()
             )
             .expect("session model is a known route")

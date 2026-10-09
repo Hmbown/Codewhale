@@ -5,8 +5,15 @@
 //! keep their own backgrounds. It belongs to the `underwater` theme alone
 //! (`ThemeId::Underwater`); every other theme leaves the terminal's ground
 //! untouched. Motion inside the field remains governed separately by
-//! `low_motion`/`fancy_animations`.
+//! `low_motion`/`fancy_animations`. The native kit owns the complete ramp and
+//! column sampling kernel; host semantic finishing and backend capability/
+//! contrast policy remain separate until their differences are reconciled.
 
+use std::time::Duration;
+
+use codewhale_ratatui::{
+    MotionMode, OceanColumn as NativeColumn, OceanPhase, OceanRamp as NativeRamp,
+};
 use ratatui::{buffer::Buffer, layout::Rect, style::Color};
 
 use crate::tui::underwater::ShellPhase;
@@ -56,7 +63,7 @@ pub fn ambient_inks_for_activity(
 }
 
 /// Length of the completion breath (the column's settle flourish), ms.
-pub const COMPLETION_BREATH_MS: u128 = 800;
+pub const COMPLETION_BREATH_MS: u128 = NativeRamp::COMPLETION_BREATH.as_millis();
 
 /// Extra ms after the breath during which ambient life eases out of view.
 pub const SETTLE_MS: u128 = 600;
@@ -146,6 +153,7 @@ pub struct OceanColumn {
     /// Fixed-point (0..=1000) life presence; keeps `Eq` derivable.
     presence: u16,
     context_percent: u8,
+    paint_caps: Option<codewhale_ratatui::Caps>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,59 +245,42 @@ impl OceanColumn {
             animated,
             presence,
             context_percent: context_percent.min(100),
+            paint_caps: None,
         }
     }
 
     #[must_use]
     pub fn color_at_y(self, y: u16) -> Color {
-        let row = y.saturating_sub(self.top).min(self.height - 1);
-        if let Some(elapsed) = self
-            .completion_elapsed_ms
-            .filter(|elapsed| *elapsed < COMPLETION_BREATH_MS)
-        {
-            self.ramp
-                .color_at_completion_context(row, self.height, elapsed, self.context_percent)
-        } else {
-            // Attention states tint the water itself, independent of life
-            // presence: a session blocked on approval or ended in failure
-            // must stay legible from across the room even after ambient life
-            // has fully settled, and under reduced motion (where the tint is
-            // steady instead of breathing).
-            if matches!(
-                self.phase,
-                ShellPhase::Waiting | ShellPhase::Approval | ShellPhase::Failed
-            ) {
-                return self.ramp.color_at_attention_context(
-                    row,
-                    self.height,
-                    self.phase,
-                    self.context_percent,
-                );
-            }
-            // Ease between the static gradient and the phase treatment by
-            // life presence, so mood/activity changes blend instead of snap.
-            let static_color = self
-                .ramp
-                .color_at_context(row, self.height, self.context_percent);
-            if self.animated || self.presence > 0 {
-                let phase_color = self.ramp.color_at_phase_context(
-                    row,
-                    self.height,
-                    self.elapsed_ms,
-                    self.phase,
-                    self.context_percent,
-                );
-                mix_colors(static_color, phase_color, self.presence_f32())
-            } else {
-                static_color
-            }
-        }
+        let viewport = Rect::new(0, self.top, 0, self.height);
+        self.native()
+            .color_at_y_with_ramp(y, viewport, self.ramp.native())
     }
 
-    /// Life presence as a 0..=1 fraction of the fixed-point field.
-    #[must_use]
-    fn presence_f32(self) -> f32 {
-        (f32::from(self.presence) / 1000.0).clamp(0.0, 1.0)
+    fn native(self) -> NativeColumn {
+        // The host samples and gates these monotonic clocks once. The pure
+        // kit path owns the complete phase/context/presence/settle kernel;
+        // ColorCompatBackend remains the current terminal paint authority.
+        let motion = if self.animated || self.presence > 0 {
+            MotionMode::Full
+        } else {
+            MotionMode::Still
+        };
+        let mut column = NativeColumn::new(phase_duration(self.elapsed_ms), motion)
+            .phase(native_phase(self.phase))
+            .context_percent(self.context_percent)
+            .presence(self.presence);
+        if let Some(elapsed) = self.completion_elapsed_ms {
+            column = column.completion_elapsed(completion_duration(elapsed));
+        }
+        column
+    }
+
+    fn completion_active(self) -> bool {
+        self.phase == ShellPhase::Done
+            && (self.animated || self.presence > 0)
+            && self
+                .completion_elapsed_ms
+                .is_some_and(|elapsed| elapsed < COMPLETION_BREATH_MS)
     }
 
     /// Elapsed milliseconds of the completion breath, when active. Ambient
@@ -321,9 +312,7 @@ impl OceanColumn {
             height: self.height,
             phase_tag: self.phase_tag(),
             animated: self.animated,
-            completion_active: self
-                .completion_elapsed_ms
-                .is_some_and(|elapsed| elapsed < COMPLETION_BREATH_MS),
+            completion_active: self.completion_active(),
             presence: self.presence,
             context_percent: self.context_percent,
         }
@@ -344,18 +333,101 @@ impl OceanColumn {
         self
     }
 
-    /// Continue the shared column through a shell-owned surface without
-    /// flattening semantic highlights (selection, hover, error, code blocks).
-    pub fn paint_matching(self, area: Rect, buf: &mut Buffer, background: Color) {
-        for y in area.top()..area.bottom() {
-            let row_bg = self.color_at_y(y);
-            for x in area.left()..area.right() {
-                let cell = &mut buf[(x, y)];
-                if cell.bg == background {
-                    cell.set_bg(row_bg);
-                }
-            }
+    /// Borrowed backend facts for this render snapshot; no detector or store.
+    #[must_use]
+    pub fn with_paint_caps(mut self, caps: Option<codewhale_ratatui::Caps>) -> Self {
+        self.paint_caps = caps;
+        self
+    }
+
+    fn paint_theme(self, ground: Color) -> Option<codewhale_ratatui::Theme> {
+        let mut caps = self.paint_caps?;
+        // Equality-matched opaque ground is actual pane evidence. A terminal
+        // Reset/named ink supplies no RGB evidence; an OS hint cannot fill it.
+        caps.appearance = codewhale_ratatui::detect::appearance_for_background(ground)?;
+        Some(
+            codewhale_ratatui::Theme::new(caps)
+                .ground(codewhale_ratatui::Ground::Ocean)
+                .tui_palette(codewhale_ratatui::TuiPalette::Underwater),
+        )
+    }
+
+    /// Complete matching facade. The kit owns cell iteration and all guards;
+    /// the same backend adapter reports exact visible custom-theme ink.
+    pub fn paint_matching_native(
+        self,
+        area: Rect,
+        buf: &mut Buffer,
+        background: Color,
+        ui_theme: &UiTheme,
+        protected: &[Rect],
+    ) {
+        let facts = codewhale_ratatui::ocean::OceanPaintFacts {
+            protected,
+            ..codewhale_ratatui::ocean::OceanPaintFacts::new(background)
+        };
+        self.paint_native(area, buf, ui_theme, &facts);
+    }
+
+    pub(crate) fn paint_native(
+        self,
+        area: Rect,
+        buf: &mut Buffer,
+        ui_theme: &UiTheme,
+        facts: &codewhale_ratatui::ocean::OceanPaintFacts<'_>,
+    ) {
+        if ui_theme.name != codewhale_palette::UNDERWATER_UI_THEME.name {
+            return;
         }
+        let Some(theme) = self.paint_theme(facts.ground) else {
+            return;
+        };
+        let inks = codewhale_ratatui::ocean::OceanContrastInks {
+            border: Some(ui_theme.border),
+            border_strong: Some(ui_theme.text_hint),
+            dim: Some(ui_theme.text_dim),
+        };
+        self.native()
+            .ramp(self.ramp.native())
+            .viewport(Rect::new(0, self.top, 0, self.height))
+            .contrast_inks(inks)
+            .apply_native(area, buf, &theme, facts, |cell, water| {
+                crate::tui::color_compat::project_ocean_ink(cell, water, theme.depth(), ui_theme)
+            });
+    }
+
+    pub(crate) fn paint_caustics(
+        self,
+        area: Rect,
+        buf: &mut Buffer,
+        facts: &codewhale_ratatui::ocean::OceanCausticFacts<'_>,
+    ) {
+        let Some(theme) = self.paint_theme(facts.paint.ground) else {
+            return;
+        };
+        self.native()
+            .ramp(self.ramp.native())
+            .viewport(Rect::new(0, self.top, 0, self.height))
+            .apply_caustics(area, buf, &theme, facts);
+    }
+
+    // Existing pure fixture facade explicitly supplies a synthetic backend.
+    // Runtime callers all use the live fact-bearing native facade above.
+    #[cfg(test)]
+    fn paint_matching(self, area: Rect, buf: &mut Buffer, background: Color) {
+        let caps = crate::tui::color_compat::ColorCompatBackend::new(
+            std::io::sink(),
+            codewhale_palette::ColorDepth::TrueColor,
+            codewhale_palette::PaletteMode::Dark,
+        )
+        .native_ocean_caps();
+        self.with_paint_caps(Some(caps)).paint_matching_native(
+            area,
+            buf,
+            background,
+            &codewhale_palette::UNDERWATER_UI_THEME,
+            &[],
+        );
     }
 }
 
@@ -375,34 +447,33 @@ impl OceanRamp {
             // way to the floor. These restrained ocean shades sit between the
             // shell's ink surfaces and its ambient blue, so the field gains
             // depth without becoming a saturated blue panel.
-            surface: Color::Rgb(0x10, 0x2a, 0x45),
-            middle: Color::Rgb(0x0a, 0x1e, 0x33),
-            deep: Color::Rgb(0x06, 0x13, 0x20),
-            ambient: Color::Rgb(0x26, 0x48, 0x66),
+            surface: NativeRamp::SURFACE,
+            middle: NativeRamp::MIDDLE,
+            deep: NativeRamp::DEEP,
+            ambient: NativeRamp::AMBIENT,
             attention: theme.warning,
             failure: theme.error_fg,
         })
     }
 
-    /// Abyss Depth effect: wires context fullness (0..=100) into the water
-    /// column gradient calculation so that as context fills up, the dark
-    /// abyssal deep rises up to consume the sunlit surface gradient.
-    #[must_use]
-    pub fn color_at_context(self, row: u16, height: u16, context_percent: u8) -> Color {
-        if height <= 1 {
-            let abyss = f32::from(context_percent.min(100)) / 100.0;
-            return mix_colors(self.surface, self.deep, abyss);
-        }
-        let base_position = f32::from(row.min(height - 1)) / f32::from(height - 1);
-        let abyss_rise = f32::from(context_percent.min(100)) / 100.0;
-        let position = (base_position + abyss_rise).min(1.0);
-        // One continuous darkening curve (quadratic Bézier through
-        // surface → middle → deep, via de Casteljau).
-        let toward_middle = mix_colors(self.surface, self.middle, position);
-        let toward_deep = mix_colors(self.middle, self.deep, position);
-        mix_colors(toward_middle, toward_deep, position)
+    fn native(self) -> NativeRamp {
+        NativeRamp::new(
+            self.surface,
+            self.middle,
+            self.deep,
+            self.ambient,
+            self.attention,
+            self.failure,
+        )
     }
 
+    #[cfg(test)]
+    #[must_use]
+    pub fn color_at_context(self, row: u16, height: u16, context_percent: u8) -> Color {
+        self.native().color_at_context(row, height, context_percent)
+    }
+
+    #[cfg(test)]
     #[must_use]
     pub fn color_at_phase_context(
         self,
@@ -412,59 +483,16 @@ impl OceanRamp {
         phase: ShellPhase,
         context_percent: u8,
     ) -> Color {
-        let base = self.color_at_context(row, height, context_percent);
-        let depth = if height <= 1 {
-            0.0
-        } else {
-            let base_depth = f32::from(row.min(height - 1)) / f32::from(height - 1);
-            let abyss_rise = f32::from(context_percent.min(100)) / 100.0;
-            (base_depth + abyss_rise).min(1.0)
-        };
-        if matches!(
-            phase,
-            ShellPhase::Waiting | ShellPhase::Approval | ShellPhase::Failed
-        ) {
-            return self.color_at_attention_context(row, height, phase, context_percent);
-        }
-        let cycle = (elapsed_ms % 90_000) as f32 / 90_000.0;
-        let breath = (cycle * std::f32::consts::TAU).sin() * 0.5 + 0.5;
-        let (phase_bias, phase_depth) = match phase {
-            ShellPhase::Idle => (0.035, 1.0 - depth),
-            ShellPhase::Typing => (0.025, 1.0 - depth),
-            ShellPhase::Working => (0.045, 0.35 + depth * 0.65),
-            ShellPhase::Verifying => (0.055, 0.65 + (1.0 - depth) * 0.35),
-            ShellPhase::Done => (0.018, 1.0 - depth),
-            ShellPhase::Waiting | ShellPhase::Approval | ShellPhase::Failed => unreachable!(),
-        };
-        mix_colors(base, self.ambient, breath * phase_bias * phase_depth)
+        self.native().color_at_phase_context(
+            row,
+            height,
+            phase_duration(elapsed_ms),
+            native_phase(phase),
+            context_percent,
+        )
     }
 
-    /// Water tint for the states that need to read from across the room.
-    #[must_use]
-    pub fn color_at_attention_context(
-        self,
-        row: u16,
-        height: u16,
-        phase: ShellPhase,
-        context_percent: u8,
-    ) -> Color {
-        let base = self.color_at_context(row, height, context_percent);
-        let depth = if height <= 1 {
-            0.0
-        } else {
-            let base_depth = f32::from(row.min(height - 1)) / f32::from(height - 1);
-            let abyss_rise = f32::from(context_percent.min(100)) / 100.0;
-            (base_depth + abyss_rise).min(1.0)
-        };
-        match phase {
-            ShellPhase::Waiting | ShellPhase::Approval => {
-                mix_colors(base, self.attention, 0.10 * (0.6 + 0.4 * (1.0 - depth)))
-            }
-            ShellPhase::Failed => mix_colors(base, self.failure, 0.09),
-            _ => base,
-        }
-    }
-
+    #[cfg(test)]
     #[must_use]
     pub fn color_at_completion_context(
         self,
@@ -473,15 +501,34 @@ impl OceanRamp {
         elapsed_ms: u128,
         context_percent: u8,
     ) -> Color {
-        let base = self.color_at_context(row, height, context_percent);
-        let elapsed = elapsed_ms.min(800) as f32 / 800.0;
-        let brightness = if elapsed <= 0.4 {
-            0.88 + (1.12 - 0.88) * (elapsed / 0.4)
-        } else {
-            1.12 + (1.0 - 1.12) * ((elapsed - 0.4) / 0.6)
-        };
-        scale_color(base, brightness)
+        self.native().color_at_completion_context(
+            row,
+            height,
+            completion_duration(elapsed_ms),
+            context_percent,
+        )
     }
+}
+
+fn native_phase(phase: ShellPhase) -> OceanPhase {
+    match phase {
+        ShellPhase::Idle => OceanPhase::Idle,
+        ShellPhase::Typing => OceanPhase::Typing,
+        ShellPhase::Working => OceanPhase::Working,
+        ShellPhase::Verifying => OceanPhase::Verifying,
+        ShellPhase::Waiting => OceanPhase::Waiting,
+        ShellPhase::Approval => OceanPhase::Approval,
+        ShellPhase::Done => OceanPhase::Done,
+        ShellPhase::Failed => OceanPhase::Failed,
+    }
+}
+
+fn phase_duration(elapsed_ms: u128) -> Duration {
+    Duration::from_millis((elapsed_ms % 90_000) as u64)
+}
+
+fn completion_duration(elapsed_ms: u128) -> Duration {
+    Duration::from_millis(elapsed_ms.min(COMPLETION_BREATH_MS) as u64)
 }
 
 #[must_use]
@@ -535,3 +582,10 @@ fn mix(from: (u8, u8, u8), to: (u8, u8, u8), amount: f32) -> (u8, u8, u8) {
 #[cfg(test)]
 #[path = "ocean/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ocean/guarded_legacy.rs"]
+mod guarded_legacy;
+#[cfg(test)]
+#[path = "ocean/guarded_tests.rs"]
+mod guarded_tests;

@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import { describe, it } from "node:test";
-import { extractFilePath, isInsideRoot, projectItem, statusForEvent } from "../transcript";
+import { afterEach, beforeEach, describe, it } from "node:test";
+import {
+  extractFilePath,
+  isInsideRoot,
+  isRealPathInsideRoot,
+  projectItem,
+  statusForEvent,
+} from "../transcript";
 import type { ItemRecord } from "../api";
 
 const agent = (over: Partial<ItemRecord> = {}): ItemRecord => ({
@@ -112,6 +120,71 @@ describe("isInsideRoot", () => {
     assert.equal(isInsideRoot(root, path.resolve("/etc/passwd")), false);
     assert.equal(isInsideRoot(root, root), false);
     assert.equal(isInsideRoot("", "src/chat.ts"), false);
+  });
+});
+
+describe("isInsideRoot dot-prefixed names", () => {
+  it("accepts a file whose name merely starts with two dots", () => {
+    const root = path.resolve("/repo/project");
+    assert.equal(isInsideRoot(root, "..notes.md"), true);
+    assert.equal(isInsideRoot(root, "..hidden/file.ts"), true);
+    assert.equal(isInsideRoot(root, "../project-sibling/file.ts"), false);
+  });
+});
+
+describe("isRealPathInsideRoot", () => {
+  let tmp: string;
+  let root: string;
+  let outside: string;
+
+  beforeEach(() => {
+    // realpath: on macOS the temp dir itself sits behind /var -> /private/var.
+    tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cw-vscode-root-")));
+    root = path.join(tmp, "workspace");
+    outside = path.join(tmp, "outside");
+    fs.mkdirSync(path.join(root, "src"), { recursive: true });
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(root, "src", "inside.ts"), "x");
+    fs.writeFileSync(path.join(outside, "secret.env"), "x");
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("accepts real files, not-yet-existing files and a root reached through a link", async () => {
+    assert.equal(await isRealPathInsideRoot(root, "src/inside.ts"), true);
+    assert.equal(await isRealPathInsideRoot(root, "src/not-created-yet.ts"), true);
+    assert.equal(await isRealPathInsideRoot(root, path.join(root, "src", "inside.ts")), true);
+    const viaLink = path.join(tmp, "workspace-link");
+    fs.symlinkSync(root, viaLink);
+    assert.equal(await isRealPathInsideRoot(viaLink, "src/inside.ts"), true);
+  });
+
+  it("refuses a link inside the workspace that points outside it", async () => {
+    fs.symlinkSync(path.join(outside, "secret.env"), path.join(root, "src", "linked.env"));
+    fs.symlinkSync(outside, path.join(root, "linked-dir"));
+    // Lexically inside, really outside: the lexical check alone is fooled.
+    assert.equal(isInsideRoot(root, "src/linked.env"), true);
+    assert.equal(await isRealPathInsideRoot(root, "src/linked.env"), false);
+    assert.equal(await isRealPathInsideRoot(root, "linked-dir/secret.env"), false);
+    assert.equal(await isRealPathInsideRoot(root, path.join(root, "linked-dir", "secret.env")), false);
+    // A file that does not exist yet behind a linked directory is outside too.
+    assert.equal(await isRealPathInsideRoot(root, "linked-dir/new.ts"), false);
+  });
+
+  it("refuses a dangling link and a link that stays inside the workspace is fine", async () => {
+    fs.symlinkSync(path.join(outside, "missing"), path.join(root, "dangling"));
+    assert.equal(await isRealPathInsideRoot(root, "dangling"), false);
+    fs.symlinkSync(path.join(root, "src", "inside.ts"), path.join(root, "alias.ts"));
+    assert.equal(await isRealPathInsideRoot(root, "alias.ts"), true);
+  });
+
+  it("still refuses traversal, the root itself and an unresolvable root", async () => {
+    assert.equal(await isRealPathInsideRoot(root, "../outside/secret.env"), false);
+    assert.equal(await isRealPathInsideRoot(root, root), false);
+    assert.equal(await isRealPathInsideRoot(path.join(tmp, "no-such-root"), "a.ts"), false);
+    assert.equal(await isRealPathInsideRoot("", "a.ts"), false);
   });
 });
 

@@ -25,7 +25,7 @@ if [[ -z "${tag_sha}" ]]; then
 fi
 if [[ "${head_sha}" != "${tag_sha}" ]]; then
   echo "::error::Refusing registry publish from HEAD ${head_sha}; ${tag} is ${tag_sha}." >&2
-  echo "Create a clean detached worktree at ${tag} and publish from there." >&2
+  echo "Publication requires clean canonical main at the approved ${tag} commit; reconcile its state before retrying." >&2
   exit 1
 fi
 

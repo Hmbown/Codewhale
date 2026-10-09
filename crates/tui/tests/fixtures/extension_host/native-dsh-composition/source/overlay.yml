@@ -1,0 +1,4 @@
+- id: author-row
+  name: ./modules/author.mjs
+  config:
+    text: !!js '"hello" + " from upstream"'

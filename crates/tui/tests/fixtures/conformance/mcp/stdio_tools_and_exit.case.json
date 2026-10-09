@@ -1,0 +1,138 @@
+{
+  "description": "A stdio server (a real POSIX-shell child the dispatch spawns): catalog, a plain result, an isError result, a JSON-RPC error, then a server that dies after reading its call. Pins Rust McpConnection::call_method / McpPool::call_tool_with_decision: a call whose child exited mid-flight fails as outcome-unknown and is NOT replayed (the server saw it once), and the next call reconnects a fresh child.",
+  "transport": "stdio",
+  "server_name": "conformance",
+  "server": {
+    "initialize": {
+      "result": {
+        "protocolVersion": "2024-11-05",
+        "serverInfo": {
+          "name": "stdio-fixture",
+          "version": "1.0.0"
+        },
+        "capabilities": {
+          "tools": {}
+        }
+      }
+    },
+    "tools/list": {
+      "result": {
+        "tools": [
+          {
+            "name": "echo",
+            "description": "Echo the text argument.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "text": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          {
+            "name": "fails",
+            "description": "Always reports a tool-level error.",
+            "inputSchema": {
+              "type": "object"
+            }
+          },
+          {
+            "name": "rpc-error",
+            "inputSchema": {
+              "type": "object"
+            }
+          },
+          {
+            "name": "dies",
+            "description": "Exits after reading the call, without answering.",
+            "inputSchema": {
+              "type": "object"
+            }
+          }
+        ]
+      }
+    },
+    "tools/call": [
+      {
+        "match": {
+          "name": "echo"
+        },
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "echo from stdio"
+            }
+          ]
+        }
+      },
+      {
+        "match": {
+          "name": "fails"
+        },
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "the stdio fixture tool failed on purpose"
+            }
+          ],
+          "isError": true
+        }
+      },
+      {
+        "match": {
+          "name": "rpc-error"
+        },
+        "error": {
+          "code": -32602,
+          "message": "invalid params: stdio"
+        }
+      },
+      {
+        "match": {
+          "name": "dies"
+        },
+        "exit": true
+      }
+    ]
+  },
+  "steps": [
+    {
+      "op": "catalog"
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_echo",
+      "input": {
+        "text": "hi"
+      }
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_fails",
+      "input": {}
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_rpc-error",
+      "input": {}
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_dies",
+      "input": {}
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_echo",
+      "input": {
+        "text": "after the child died"
+      }
+    },
+    {
+      "op": "catalog"
+    }
+  ]
+}

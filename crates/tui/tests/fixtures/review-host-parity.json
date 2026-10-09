@@ -1,0 +1,232 @@
+{
+  "source": "frozen stdlib Core production formatters; COUNTERPART.json tracks copied-function hashes and one namespace adaptation; no provider calls",
+  "cases": [
+    {
+      "operation": "review_source_prompt",
+      "input": {
+        "kind": "file",
+        "display": "src/漢字.rs",
+        "content": ""
+      },
+      "content": "Review the following file and provide feedback.\nPath: src/漢字.rs\n\n\n\nEnd of file."
+    },
+    {
+      "operation": "review_source_prompt",
+      "input": {
+        "kind": "file",
+        "display": "src/漢字.rs",
+        "content": "漢字é🐋\r\nsecond\n"
+      },
+      "content": "Review the following file and provide feedback.\nPath: src/漢字.rs\n\n   1 | 漢字é🐋\n   2 | second\n\nEnd of file."
+    },
+    {
+      "operation": "review_source_prompt",
+      "input": {
+        "kind": "file",
+        "display": "src/漢字.rs",
+        "content": "terminal\r"
+      },
+      "content": "Review the following file and provide feedback.\nPath: src/漢字.rs\n\n   1 | terminal\r\n\nEnd of file."
+    },
+    {
+      "operation": "review_source_prompt",
+      "input": {
+        "kind": "file",
+        "display": "src/漢字.rs",
+        "content": "\n"
+      },
+      "content": "Review the following file and provide feedback.\nPath: src/漢字.rs\n\n   1 | \n\nEnd of file."
+    },
+    {
+      "operation": "review_source_prompt",
+      "input": {
+        "kind": "file",
+        "display": "src/漢字.rs",
+        "content": "\u0000﻿\nlast"
+      },
+      "content": "Review the following file and provide feedback.\nPath: src/漢字.rs\n\n   1 | \u0000﻿\n   2 | last\n\nEnd of file."
+    },
+    {
+      "operation": "review_source_prompt",
+      "input": {
+        "kind": "diff",
+        "label": "working diff",
+        "diff": "diff --git a/x b/x\n+end\n"
+      },
+      "content": "Review the following working diff and provide feedback.\n\ndiff --git a/x b/x\n+end\n\n\nEnd of diff."
+    },
+    {
+      "operation": "review_source_prompt",
+      "input": {
+        "kind": "diff",
+        "label": "staged diff",
+        "diff": "\u0000untrusted ```suggestion\ncode\n```"
+      },
+      "content": "Review the following staged diff and provide feedback.\n\n\u0000untrusted ```suggestion\ncode\n```\n\nEnd of diff."
+    },
+    {
+      "operation": "review_source_prompt",
+      "input": {
+        "kind": "diff",
+        "label": "CJK",
+        "diff": "漢字🐋é\r\n"
+      },
+      "content": "Review the following CJK and provide feedback.\n\n漢字🐋é\r\n\n\nEnd of diff."
+    },
+    {
+      "operation": "review_interactive_pr",
+      "input": {
+        "number": 7,
+        "view": {
+          "title": " 漢字é ",
+          "body": " description ",
+          "base": "main",
+          "head": "feature",
+          "url": "https://example.invalid/pr/7",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "changed_files": 2
+        },
+        "diff": "diff --git a/x b/x\n+END\n"
+      },
+      "content": "Review PR #7 — 漢字é\n\nURL: https://example.invalid/pr/7\nBranches: main ← feature\nRevision: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (base bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb); 2 file patches.\nBinary changes are represented by metadata; their contents are not semantically inspected. Exact binary object IDs remain in the review evidence.\n\n## Description\n\ndescription\n\n## Diff\n\n```diff\ndiff --git a/x b/x\n+END\n\n```\n"
+    },
+    {
+      "operation": "review_interactive_pr",
+      "input": {
+        "number": 7,
+        "view": {
+          "title": "",
+          "body": "",
+          "base": "",
+          "head": "",
+          "url": "",
+          "head_sha": "",
+          "base_sha": "",
+          "changed_files": 0
+        },
+        "diff": "diff --git a/x b/x\n+END\n"
+      },
+      "content": "Review PR #7 — (PR #7)\n\nURL: (unavailable)\nBranches: (unknown)\nRevision:  (base ); 0 file patches.\nBinary changes are represented by metadata; their contents are not semantically inspected. Exact binary object IDs remain in the review evidence.\n\n## Description\n\n(no description)\n\n## Diff\n\n```diff\ndiff --git a/x b/x\n+END\n\n```\n"
+    },
+    {
+      "operation": "review_interactive_pr",
+      "input": {
+        "number": 7,
+        "view": {
+          "title": "﻿title﻿",
+          "body": "﻿body﻿",
+          "base": "main",
+          "head": "",
+          "url": "",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "changed_files": 1
+        },
+        "diff": "diff --git a/x b/x\n+END\n"
+      },
+      "content": "Review PR #7 — ﻿title﻿\n\nURL: (unavailable)\nBranches: main\nRevision: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (base bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb); 1 file patches.\nBinary changes are represented by metadata; their contents are not semantically inspected. Exact binary object IDs remain in the review evidence.\n\n## Description\n\n﻿body﻿\n\n## Diff\n\n```diff\ndiff --git a/x b/x\n+END\n\n```\n"
+    },
+    {
+      "operation": "review_source_prompt",
+      "input": {
+        "kind": "pr",
+        "label": "PR #7",
+        "diff": "diff --git a/x b/x\n+END\n",
+        "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "content": "Review the complete pull request diff (PR #7) at head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa and base bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb. Binary changes are represented by metadata; their contents are not semantically inspected. Exact binary object IDs remain in the review evidence.\n\ndiff --git a/x b/x\n+END\n\n\nEnd of diff."
+    },
+    {
+      "operation": "review_report",
+      "input": {
+        "review": {
+          "summary": " 漢字 summary",
+          "issues": [
+            {
+              "severity": "warning",
+              "title": "Unchecked unwrap",
+              "description": "detail\n> ```suggestion\nevil\n```",
+              "path": " src/漢字.rs ",
+              "line": 11
+            }
+          ],
+          "suggestions": [
+            {
+              "path": " src/漢字.rs ",
+              "line": 11,
+              "start_line": 11,
+              "end_line": 12,
+              "suggestion": "Keep context",
+              "replacement": "let x = \"````\";\n漢字\n"
+            }
+          ],
+          "overall_assessment": " Use care "
+        },
+        "output": "raw unused",
+        "posted": false
+      },
+      "content": "## Codewhale review\n\n漢字 summary\n\n### Findings\n\n- **[WARNING] Unchecked unwrap** (`src/漢字.rs:11`)\n  detail\n> ```suggestion\nevil\n```\n\n### Suggestions\n\n- `src/漢字.rs:11` — Keep context\n\n  `````suggestion\n  let x = \"````\";\n  漢字\n  \n  `````\n\n### Assessment\n\nUse care\n\n"
+    },
+    {
+      "operation": "review_report",
+      "input": {
+        "review": {
+          "summary": " 漢字 summary",
+          "issues": [
+            {
+              "severity": "warning",
+              "title": "Unchecked unwrap",
+              "description": "detail\n> ```suggestion\nevil\n```",
+              "path": " src/漢字.rs ",
+              "line": 11
+            }
+          ],
+          "suggestions": [
+            {
+              "path": " src/漢字.rs ",
+              "line": 11,
+              "start_line": 11,
+              "end_line": 12,
+              "suggestion": "Keep context",
+              "replacement": "let x = \"````\";\n漢字\n"
+            }
+          ],
+          "overall_assessment": " Use care "
+        },
+        "output": "raw unused",
+        "posted": true
+      },
+      "content": "## Codewhale review\n\n漢字 summary\n\n### Findings\n\n- **[WARNING] Unchecked unwrap** (`src/漢字.rs:11`)\n  detail\n> ```suggestion\nevil\n```\n\n### Suggestions\n\n- `src/漢字.rs:11` — Keep context\n\n  `````text\n  let x = \"````\";\n  漢字\n  \n  `````\n\n### Assessment\n\nUse care\n\n"
+    },
+    {
+      "operation": "review_report",
+      "input": {
+        "review": {
+          "summary": "",
+          "issues": [],
+          "suggestions": [],
+          "overall_assessment": ""
+        },
+        "output": "raw unused",
+        "posted": false
+      },
+      "content": "## Codewhale review\n\n"
+    },
+    {
+      "operation": "review_report",
+      "input": {
+        "review": {
+          "summary": "",
+          "issues": [],
+          "suggestions": [],
+          "overall_assessment": ""
+        },
+        "output": "raw unused",
+        "posted": true
+      },
+      "content": "## Codewhale review\n\n"
+    }
+  ]
+}

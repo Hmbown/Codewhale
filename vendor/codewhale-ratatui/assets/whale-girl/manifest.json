@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "columns": 2,
+  "rows": 2,
+  "tile": 672,
+  "terminalTile": 96,
+  "frames": 36,
+  "acts": [
+    "rest",
+    "listen",
+    "think",
+    "busy",
+    "read",
+    "search",
+    "write",
+    "run",
+    "browse",
+    "talk",
+    "pod",
+    "needs",
+    "done",
+    "hmm",
+    "computer",
+    "connect",
+    "sleep"
+  ],
+  "views": {
+    "side": 34,
+    "back": 35
+  },
+  "pages": [
+    {
+      "file": "page-00.png",
+      "sha256": "68f1e41507f3e0c18ea4f22449249530128945d261da7f27ecdd7926dd44b5ea",
+      "sourceSha256": "d72a5c0e92e128ec5ca0003dde89cdfb6a027620af998eb1696b39917771bfee"
+    },
+    {
+      "file": "page-01.png",
+      "sha256": "0319f7d31e424aa5b9578d88c9be372f8e825ff3c32362cb77c37ed72e6baee0",
+      "sourceSha256": "c16256cd36afb01b9fd01fb8410133d240200903770a59fdb1ab721627ed41ec"
+    },
+    {
+      "file": "page-02.png",
+      "sha256": "591adaa8ef84ffe3037d9687e59aff932061433ae01042540421702a357c5ee5",
+      "sourceSha256": "861905631fb9aeca6feb1ea7ca04ae02d17c1c247e9c4ac4d24253d172ce8a60"
+    },
+    {
+      "file": "page-03.png",
+      "sha256": "673a8d0482d1c5cd8ff1d6e7aa2014469a4b42a82d51bd3ea29f70428871d828",
+      "sourceSha256": "89469d6fd93552e9a95f2e1647b00e4572295f10e699f288b08b69ece6cd20a4"
+    },
+    {
+      "file": "page-04.png",
+      "sha256": "9ee00959e2948826544d215157597860661b99bfc1b1b18c8a98ef7ca59f4912",
+      "sourceSha256": "d43fdfa76bc4b8327864d657b257140a842553821dd1b479746c99893ffc5ba8"
+    },
+    {
+      "file": "page-05.png",
+      "sha256": "f29f95593947fde25c77616bd907d609bc9448b98975ff191b5eafc48c0371e0",
+      "sourceSha256": "e815bf672c741ce127c329486de0b7681cc337c471b2d1fe0ea455f313bc7b58"
+    },
+    {
+      "file": "page-06.png",
+      "sha256": "b9eaa5f00a1b3f3e35501ef7c35b5c27ecad68c802dbd4f5f50567d64be3e2ea",
+      "sourceSha256": "1a1474561b6ac3b1d21332cba23fb34db17d931748b6feae4987b65d805b84f3"
+    },
+    {
+      "file": "page-07.png",
+      "sha256": "72f7a0d394c0985818e3034dca1583b8f3c3681efbe02eb217f88b68ca898fba",
+      "sourceSha256": "80ebbe716338268b7ac83ddfa89507559a5724481656ae7bff589c7466008d0f"
+    },
+    {
+      "file": "page-08.png",
+      "sha256": "0cc4a1a44a13c9bcbfe3ae51a071c5e4d95fc20ead27b3d3e2cb2c53b86c68a0",
+      "sourceSha256": "235baa9fb9ec9803de48cb2457b5063a138f80178e909f002465c5392d3803a6"
+    }
+  ],
+  "terminalSha256": "850c496a7a88d5bf9bf732725d4a33bd2f5f82ff355af4e994ede8692f99002c",
+  "reference": "Codewhale loyalty-pledge merch mascot (October 4, 2026)",
+  "generator": "Built-in image generation; exact prompts in sources/*.prompt.txt",
+  "resolution": "Authored 627px source cells; padded to 672px without enlargement (old source cells were 209px)."
+}

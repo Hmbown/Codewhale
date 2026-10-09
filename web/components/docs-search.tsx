@@ -261,7 +261,7 @@ export function DocsSearch({ locale }: { locale: string }) {
           body={t.emptyBody}
           action={
             <a
-              href="https://github.com/Hmbown/CodeWhale/tree/main/docs"
+              href="https://github.com/codewhale-hq/CodeWhale/tree/main/docs"
               target="_blank"
               rel="noreferrer"
               className="portal-button portal-button-secondary"

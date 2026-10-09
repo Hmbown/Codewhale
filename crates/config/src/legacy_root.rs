@@ -320,6 +320,11 @@ pub fn legacy_root_owner(base_url: &str) -> Option<ProviderKind> {
         return None;
     }
     let lower = trimmed.to_ascii_lowercase();
+    if crate::device_code::url_scheme_and_host(trimmed).is_ok_and(|(scheme, host, credentials)| {
+        scheme == "https" && host == "chatgpt.com" && !credentials
+    }) {
+        return Some(ProviderKind::OpenaiCodex);
+    }
     if lower.contains("integrate.api.nvidia.com") {
         return Some(ProviderKind::NvidiaNim);
     }

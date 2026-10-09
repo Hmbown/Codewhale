@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -228,9 +228,9 @@ impl FleetMember {
 /// endpoints before the configured route binder can resolve them.
 pub(crate) fn provider_ids_match(saved: &str, requested: &str) -> bool {
     saved.trim() == requested.trim()
-        || ApiProvider::parse(saved)
-            .filter(|provider| *provider != ApiProvider::Custom)
-            .is_some_and(|provider| Some(provider) == ApiProvider::parse(requested))
+        || ProviderKind::parse(saved)
+            .filter(|provider| *provider != ProviderKind::Custom)
+            .is_some_and(|provider| Some(provider) == ProviderKind::parse(requested))
 }
 
 /// The member pins exactly `provider`/`model`.
@@ -612,11 +612,29 @@ fn ensure_fleets_dir(scope: FleetScope, workspace: &Path) -> Result<PathBuf, Fle
         FleetScope::Personal => personal_fleets_dir()?,
         FleetScope::Workspace => workspace_fleets_dir(workspace),
     };
+    reject_linked_workspace_dir(scope, workspace, &dir)?;
     fs::create_dir_all(&dir).map_err(|e| FleetStoreError::Io {
         path: dir.display().to_string(),
         message: e.to_string(),
     })?;
     Ok(dir)
+}
+
+/// A workspace's `.codewhale/fleets` is repository content: refuse it when it,
+/// or `.codewhale`, is a link, so saving, selecting or deleting a Fleet cannot
+/// reach outside the workspace. The personal directory is the user's own.
+fn reject_linked_workspace_dir(
+    scope: FleetScope,
+    workspace: &Path,
+    dir: &Path,
+) -> Result<(), FleetStoreError> {
+    if scope != FleetScope::Workspace {
+        return Ok(());
+    }
+    super::files::reject_linked_path(workspace, dir).map_err(|e| FleetStoreError::Io {
+        path: dir.display().to_string(),
+        message: e.to_string(),
+    })
 }
 
 /// List every named Fleet across both scopes, personal first. A file that is
@@ -861,7 +879,7 @@ pub fn save_fleet(
         }
     }
     let rendered = fleet.render_toml()?;
-    atomic_write(&path, rendered.as_bytes())?;
+    write_scoped(scope, workspace, &path, rendered.as_bytes())?;
     Ok(path)
 }
 
@@ -875,6 +893,7 @@ pub fn delete_fleet(
         FleetScope::Personal => personal_fleets_dir()?,
         FleetScope::Workspace => workspace_fleets_dir(workspace),
     };
+    reject_linked_workspace_dir(scope, workspace, &dir)?;
     let path = dir.join(format!("{}.toml", slugify(name)));
     if !path.is_file() {
         return Err(FleetStoreError::NotFound(name.to_string()));
@@ -1006,7 +1025,7 @@ pub fn set_selected(
         )));
     }
     let selected = dir.join(SELECTED_FILE);
-    atomic_write(&selected, name.as_bytes())?;
+    write_scoped(scope, workspace, &selected, name.as_bytes())?;
     Ok(selected)
 }
 
@@ -1016,10 +1035,41 @@ fn clear_selection_if_matching(scope: FleetScope, workspace: &Path, name: &str) 
         FleetScope::Workspace => Some(workspace_fleets_dir(workspace)),
     };
     let Some(dir) = dir else { return };
+    if reject_linked_workspace_dir(scope, workspace, &dir).is_err() {
+        return;
+    }
     let selected = dir.join(SELECTED_FILE);
     if read_selection(&dir).as_deref() == Some(name.trim()) {
         let _ = fs::remove_file(selected);
     }
+}
+
+/// Write a Fleet or selection file for `scope`. A workspace file goes through
+/// the pinned no-follow writer (parents created without following a link, the
+/// final name replaced, never written through); the personal scope is the
+/// user's own directory and keeps the plain atomic write.
+fn write_scoped(
+    scope: FleetScope,
+    workspace: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), FleetStoreError> {
+    if scope != FleetScope::Workspace {
+        return atomic_write(path, bytes);
+    }
+    let io_error = |e: std::io::Error| FleetStoreError::Io {
+        path: path.display().to_string(),
+        message: e.to_string(),
+    };
+    let relative = path
+        .strip_prefix(workspace)
+        .map_err(|_| FleetStoreError::Io {
+            path: path.display().to_string(),
+            message: "a workspace Fleet file must stay within the workspace".to_string(),
+        })?;
+    super::files::WorkspaceFile::open_shared(workspace, relative, true)
+        .and_then(|file| file.replace(bytes))
+        .map_err(io_error)
 }
 
 /// Atomic write: temp file in the same directory, then rename. A failed write
@@ -1175,6 +1225,50 @@ mod tests {
     /// `lock_test_env`.
     fn set_sealed_home() -> crate::test_support::EnvVarGuard {
         crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", sealed_home())
+    }
+
+    /// A workspace's `.codewhale/fleets` is repository content. Saving,
+    /// selecting and deleting refuse it when it is a link, and a link at the
+    /// Fleet's own file name is replaced rather than written through.
+    #[cfg(unix)]
+    #[test]
+    fn workspace_fleet_writes_never_follow_links_out_of_the_workspace() {
+        use std::os::unix::fs::symlink;
+        let _lock = crate::test_support::lock_test_env();
+        let _home = set_sealed_home();
+        let outside = tempfile::tempdir().unwrap();
+
+        // `.codewhale/fleets` linked: save, select and delete are all refused.
+        let linked = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(linked.path().join(".codewhale")).unwrap();
+        symlink(
+            outside.path(),
+            linked.path().join(".codewhale").join(FLEET_DIR),
+        )
+        .unwrap();
+        let fleet = sample_fleet();
+        assert!(save_fleet(&fleet, FleetScope::Workspace, linked.path()).is_err());
+        assert!(set_selected("DeepSeek Flash", FleetScope::Workspace, linked.path()).is_err());
+        assert!(delete_fleet("DeepSeek Flash", FleetScope::Workspace, linked.path()).is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+
+        // A link at the Fleet's file name is replaced, never written through.
+        let plain = tempfile::tempdir().unwrap();
+        let dir = plain.path().join(".codewhale").join(FLEET_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = outside.path().join("victim.toml");
+        std::fs::write(&victim, "keep me").unwrap();
+        symlink(&victim, dir.join(format!("{}.toml", fleet.file_slug()))).unwrap();
+        let saved = save_fleet(&fleet, FleetScope::Workspace, plain.path());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        if let Ok(path) = saved {
+            assert!(
+                !std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
     }
 
     #[test]

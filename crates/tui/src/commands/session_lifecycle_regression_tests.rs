@@ -12,7 +12,7 @@ use crate::commands::CommandResult;
 use crate::config::Config;
 use crate::reasoning_preference::ReasoningEffort;
 use crate::session_manager::create_saved_session_with_id_and_mode;
-use crate::test_support::EnvVarGuard;
+use crate::test_support::SealedHome;
 use crate::tui::app::{App, AppAction, TuiOptions, TurnCacheRecord};
 use crate::tui::history::HistoryCell;
 use codewhale_config::AppMode;
@@ -64,6 +64,7 @@ fn create_test_app_with_tmpdir(tmpdir: &TempDir) -> App {
 #[test]
 fn test_save_creates_file_and_sets_session_id() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     let save_path = tmpdir.path().join("test_session.json");
 
@@ -79,6 +80,7 @@ fn test_save_creates_file_and_sets_session_id() {
 #[test]
 fn save_preserves_artifact_registry() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     let save_path = tmpdir.path().join("artifact_session.json");
     app.session_artifacts
@@ -105,6 +107,7 @@ fn save_preserves_artifact_registry() {
 #[test]
 fn save_preserves_latest_auto_route_receipt() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     let save_path = tmpdir.path().join("auto_route_session.json");
     let receipt = crate::model_routing::AutoRouteReceipt {
@@ -122,7 +125,7 @@ fn save_preserves_latest_auto_route_receipt() {
         router_failure: None,
     };
     app.set_model_selection("auto".to_string());
-    app.last_effective_provider = Some(crate::config::ApiProvider::Zai);
+    app.last_effective_provider = Some(crate::config::ProviderKind::Zai);
     app.last_effective_provider_identity = Some("zai".to_string());
     app.last_effective_model = Some(crate::config::ZAI_GLM_5_TURBO_MODEL.to_string());
     app.last_auto_route_receipt = Some(receipt.clone());
@@ -135,7 +138,7 @@ fn save_preserves_latest_auto_route_receipt() {
     let saved: crate::session_manager::SavedSession =
         serde_json::from_str(&std::fs::read_to_string(save_path).unwrap()).unwrap();
     let route = saved.last_auto_route.expect("latest Auto route");
-    assert_eq!(route.provider, crate::config::ApiProvider::Zai);
+    assert_eq!(route.provider, crate::config::ProviderKind::Zai);
     assert_eq!(route.provider_identity, "zai");
     assert_eq!(route.model, crate::config::ZAI_GLM_5_TURBO_MODEL);
     assert_eq!(route.receipt, receipt);
@@ -148,13 +151,9 @@ fn save_preserves_latest_auto_route_receipt() {
 #[test]
 fn fork_saves_parent_and_switches_to_child_session() {
     let tmpdir = TempDir::new().unwrap();
-    let _lock = crate::test_support::lock_test_env();
-    let home = tmpdir.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
-    let home_guard = EnvVarGuard::set("HOME", &home);
-    let previous_home = home_guard.previous();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
-    app.set_provider_identity(crate::config::ApiProvider::Custom, "lm-studio");
+    app.set_provider_identity(crate::config::ProviderKind::Custom, "lm-studio");
     app.current_session_id = Some("parent-session".to_string());
     let mut cached_parent = create_saved_session_with_id_and_mode(
         "parent-session".to_string(),
@@ -251,13 +250,12 @@ fn fork_saves_parent_and_switches_to_child_session() {
         app.session_title.as_deref(),
         Some(child.metadata.title.as_str())
     );
-    drop(home_guard);
-    assert_eq!(std::env::var_os("HOME"), previous_home);
 }
 
 #[test]
 fn fork_rejects_active_runtime_without_switching_sessions() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     app.current_session_id = Some("parent-session".to_string());
     app.api_messages_mut().push(codewhale_models::Message {
@@ -280,6 +278,7 @@ fn fork_rejects_active_runtime_without_switching_sessions() {
 #[test]
 fn new_session_from_resumed_state_creates_distinct_empty_session() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     app.current_session_id = Some("old-session".to_string());
     app.session_title = Some("Old Session".to_string());
@@ -346,6 +345,7 @@ fn conversation_reset_forgets_approvals(command: &str) {
     // UX-8: a Deny used to outlive `/new` for the whole process ("Restart
     // Codewhale to reconsider it"); a fresh conversation starts clean.
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     app.current_session_id = Some("old-session".to_string());
     app.approval_session_denied
@@ -401,6 +401,7 @@ fn conversation_reset_forgets_approvals(command: &str) {
 #[test]
 fn new_session_blocks_unsent_input_without_force() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     app.current_session_id = Some("old-session".to_string());
     app.input = "draft text".to_string();
@@ -423,6 +424,7 @@ fn new_session_blocks_unsent_input_without_force() {
 #[test]
 fn new_session_force_discards_unsent_input() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     app.current_session_id = Some("old-session".to_string());
     app.input = "draft text".to_string();
@@ -438,6 +440,7 @@ fn new_session_force_discards_unsent_input() {
 #[test]
 fn new_session_blocks_in_flight_turn_without_force() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     app.current_session_id = Some("old-session".to_string());
     app.is_loading = true;
@@ -452,6 +455,7 @@ fn new_session_blocks_in_flight_turn_without_force() {
 #[test]
 fn new_session_force_cannot_detach_an_in_flight_turn() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     app.current_session_id = Some("old-session".to_string());
     app.api_messages_mut().push(codewhale_models::Message {
@@ -478,6 +482,7 @@ fn new_session_force_cannot_detach_an_in_flight_turn() {
 #[test]
 fn load_rejects_an_active_runtime_before_reading_or_mutating() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     app.current_session_id = Some("old-session".to_string());
     app.api_messages_mut().push(codewhale_models::Message {
@@ -517,15 +522,11 @@ fn load_rejects_an_active_runtime_before_reading_or_mutating() {
 #[test]
 fn test_save_with_default_path_uses_managed_sessions_dir() {
     let tmpdir = TempDir::new().unwrap();
-    let _lock = crate::test_support::lock_test_env();
-    // Set CODEWHALE_HOME so the managed sessions directory lands inside the
-    // temp dir rather than the real user home. Pre-create the directory so
-    // resolve_state_dir picks it up instead of falling back to legacy.
-    let home = tmpdir.path().join("home");
-    let sessions_dir = home.join("sessions");
+    // The seal points the managed sessions directory inside its own temp dir
+    // rather than the real user home.
+    let home = SealedHome::new();
+    let sessions_dir = home.codewhale_home().join("sessions");
     std::fs::create_dir_all(&sessions_dir).unwrap();
-    let codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", &home);
-    let previous_codewhale_home = codewhale_home.previous();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     let result = save(&mut app, None);
     assert!(result.message.is_some());
@@ -541,7 +542,6 @@ fn test_save_with_default_path_uses_managed_sessions_dir() {
     } else {
         Vec::new()
     };
-    drop(codewhale_home);
     // Session should be saved to the managed dir, not the workspace root.
     assert!(
         !entries.is_empty(),
@@ -552,12 +552,12 @@ fn test_save_with_default_path_uses_managed_sessions_dir() {
         .as_deref()
         .expect("current session id");
     assert!(sessions_dir.join(format!("{session_id}.json")).exists());
-    assert_eq!(std::env::var_os("CODEWHALE_HOME"), previous_codewhale_home);
 }
 
 #[test]
 fn test_save_serialization_error() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     // This should work normally since SavedSession is serializable
     // Testing error path would require mocking, which is complex
@@ -569,6 +569,7 @@ fn test_save_serialization_error() {
 #[test]
 fn test_load_without_path_returns_error() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     let result = load(&mut app, None);
     assert!(result.message.is_some());
@@ -578,6 +579,7 @@ fn test_load_without_path_returns_error() {
 #[test]
 fn test_load_nonexistent_file_returns_error() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     let result = load(&mut app, Some("nonexistent.json"));
     assert!(result.message.is_some());
@@ -587,6 +589,7 @@ fn test_load_nonexistent_file_returns_error() {
 #[test]
 fn test_load_invalid_json_returns_error() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     let bad_file = tmpdir.path().join("bad.json");
     std::fs::write(&bad_file, "not valid json").unwrap();
@@ -598,6 +601,7 @@ fn test_load_invalid_json_returns_error() {
 #[test]
 fn test_load_valid_session_defers_state_restore_to_event_loop() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app1 = create_test_app_with_tmpdir(&tmpdir);
     // Set up some state to save
     app1.api_messages_mut().push(codewhale_models::Message {
@@ -647,6 +651,7 @@ fn test_load_valid_session_defers_state_restore_to_event_loop() {
 #[test]
 fn explicit_save_persists_work_state_and_load_defers_application() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut saved_app = create_test_app_with_tmpdir(&tmpdir);
     {
         let mut todos = saved_app.todos.try_lock().expect("todos lock");
@@ -684,6 +689,7 @@ fn explicit_save_persists_work_state_and_load_defers_application() {
 #[test]
 fn new_session_is_all_or_nothing_when_work_state_is_busy() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     app.api_messages_mut().push(codewhale_models::Message {
         role: Role::User,
@@ -704,6 +710,7 @@ fn new_session_is_all_or_nothing_when_work_state_is_busy() {
 #[test]
 fn load_auto_model_session_defers_model_restore_to_event_loop() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut saved_app = create_test_app_with_tmpdir(&tmpdir);
     saved_app.set_model_selection("auto".to_string());
     saved_app.last_effective_model = Some("deepseek-v4-flash".to_string());
@@ -731,6 +738,7 @@ fn load_auto_model_session_defers_model_restore_to_event_loop() {
 #[test]
 fn load_defers_artifact_registry_restore_to_event_loop() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut saved_app = create_test_app_with_tmpdir(&tmpdir);
     saved_app
         .session_artifacts
@@ -776,6 +784,7 @@ fn load_defers_artifact_registry_restore_to_event_loop() {
 #[test]
 fn load_defers_telemetry_reset_to_event_loop() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut saved_app = create_test_app_with_tmpdir(&tmpdir);
     saved_app
         .api_messages_mut()
@@ -841,6 +850,7 @@ fn load_defers_telemetry_reset_to_event_loop() {
 #[test]
 fn test_compact_toggles_state() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
 
     let result = compact(&mut app, None);
@@ -856,6 +866,7 @@ fn test_compact_toggles_state() {
 #[test]
 fn compact_command_forwards_a_trimmed_focus_argument() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
 
     let result = compact(&mut app, Some("  the auth refactor  "));
@@ -882,6 +893,7 @@ fn compact_command_forwards_a_trimmed_focus_argument() {
 #[test]
 fn test_sessions_pushes_picker_view() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     let initial_kind = app.view_stack.top_kind();
 
@@ -898,6 +910,7 @@ fn test_sessions_show_subcommand_pushes_picker_view() {
     // for the no-arg picker form. Verify they don't fall through
     // to the prune branch.
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     let initial_kind = app.view_stack.top_kind();
     let result = sessions(&mut app, Some("show"));
@@ -908,6 +921,7 @@ fn test_sessions_show_subcommand_pushes_picker_view() {
 #[test]
 fn test_sessions_prune_requires_days_argument() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     let result = sessions(&mut app, Some("prune"));
     assert!(result.is_error);
@@ -921,6 +935,7 @@ fn test_sessions_prune_requires_days_argument() {
 #[test]
 fn test_sessions_prune_rejects_non_positive_days() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     for bad in ["0", "-3", "abc", "3.14"] {
         let result = sessions(&mut app, Some(&format!("prune {bad}")));
@@ -931,6 +946,7 @@ fn test_sessions_prune_rejects_non_positive_days() {
 #[test]
 fn test_sessions_unknown_subcommand_errors() {
     let tmpdir = TempDir::new().unwrap();
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&tmpdir);
     let result = sessions(&mut app, Some("teleport"));
     assert!(result.is_error);
@@ -947,9 +963,8 @@ fn test_sessions_unknown_subcommand_errors() {
 
 #[test]
 fn branch_snapshot_roundtrip_preserves_siblings_ids_stamps_and_engine_projection() {
-    let _guard = crate::test_support::lock_test_env();
     let root = TempDir::new().unwrap();
-    let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path().join("home"));
+    let _home = SealedHome::new();
     let mut app = create_test_app_with_tmpdir(&root);
     let message = |text: &str| codewhale_models::Message {
         role: Role::User,

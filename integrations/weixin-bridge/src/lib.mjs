@@ -47,17 +47,15 @@ export async function processUpdateBatch({ messages, nextCursor, store, keyOf, h
   for (const msg of messages || []) {
     const key = keyOf(msg);
     if (!key) continue;
-    const claim = await store.claimMessage(key);
+    const claim = store.data.inflight?.[key] ? "interrupted" : await store.claimMessage(key);
     if (claim === "done") continue;
     if (claim === "interrupted") {
       await interrupted(msg);
+      await store.completeMessage(key);
       continue;
     }
-    try {
-      await handle(msg);
-    } finally {
-      await store.completeMessage(key);
-    }
+    await handle(msg);
+    await store.completeMessage(key);
   }
   if (nextCursor) await commitCursor(nextCursor);
 }
@@ -151,11 +149,13 @@ function authHeaders({ token } = {}) {
  * 通用 POST 到 iLink API。
  */
 export async function apiPost({ baseUrl, endpoint, body, token, timeoutMs, signal }) {
+  signal?.throwIfAborted();
   const url = `${baseUrl.replace(/\/+$/, "")}/${endpoint}`;
   const ms = timeoutMs || DEFAULT_API_TIMEOUT_MS;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
-  signal?.addEventListener("abort", () => controller.abort(), { once: true });
+  const onAbort = () => controller.abort(signal.reason);
+  signal?.addEventListener("abort", onAbort, { once: true });
 
   try {
     const response = await fetch(url, {
@@ -167,12 +167,13 @@ export async function apiPost({ baseUrl, endpoint, body, token, timeoutMs, signa
     const text = await response.text();
     if (!response.ok) {
       throw new Error(
-        `iLink API ${endpoint} failed: HTTP ${response.status} — ${text.slice(0, 200)}`
+        `iLink API ${endpoint} failed: HTTP ${response.status}`
       );
     }
     return text;
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -299,19 +300,48 @@ export async function getUpdates({ baseUrl, token, get_updates_buf = "", timeout
 }
 
 /**
- * 发送消息。
+ * Send a message and return the parsed API acceptance response, not a recipient
+ * delivery receipt. Tencent's reference allows omitted status fields; explicit
+ * statuses must be numeric zero. Ambiguous failures must not be retried as if
+ * the provider had rejected the message.
  */
 export async function sendMessage({ baseUrl, token, body, timeoutMs }) {
-  await apiPost({
-    baseUrl,
-    endpoint: "ilink/bot/sendmessage",
-    body: JSON.stringify({
-      ...body,
-      base_info: { bot_agent: "CodeWhale/1.0" },
-    }),
-    token,
-    timeoutMs,
-  });
+  let raw;
+  try {
+    raw = await apiPost({
+      baseUrl,
+      endpoint: "ilink/bot/sendmessage",
+      body: JSON.stringify({
+        ...body,
+        base_info: { bot_agent: "CodeWhale/1.0" },
+      }),
+      token,
+      timeoutMs,
+    });
+  } catch (error) {
+    const failure = error instanceof Error ? error : new Error("iLink sendMessage transport failed");
+    failure.deliveryStatus = "uncertain";
+    throw failure;
+  }
+
+  let response;
+  try {
+    response = JSON.parse(raw);
+  } catch {
+    throw Object.assign(new Error("iLink sendMessage returned invalid JSON"), { deliveryStatus: "uncertain" });
+  }
+  if (!response || typeof response !== "object" || Array.isArray(response)) {
+    throw Object.assign(new Error("iLink sendMessage returned a non-object response"), { deliveryStatus: "uncertain" });
+  }
+  const statusFields = ["ret", "errcode"].filter((field) => Object.hasOwn(response, field));
+  if (statusFields.some((field) => !Number.isFinite(response[field]))) {
+    throw Object.assign(new Error("iLink sendMessage returned an invalid status"), { deliveryStatus: "uncertain" });
+  }
+  const failure = statusFields.find((field) => response[field] !== 0);
+  if (failure) {
+    throw Object.assign(new Error(`iLink sendMessage rejected: ${failure}=${response[failure]}`), { deliveryStatus: "rejected" });
+  }
+  return response;
 }
 
 /**

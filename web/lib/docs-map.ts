@@ -370,4 +370,4 @@ export function docTopicIsExternal(topic: DocTopic): boolean {
 }
 
 /** Repo source base URL for generating direct links. */
-export const REPO_DOCS_BASE = "https://github.com/Hmbown/CodeWhale/blob/main";
+export const REPO_DOCS_BASE = "https://github.com/codewhale-hq/CodeWhale/blob/main";

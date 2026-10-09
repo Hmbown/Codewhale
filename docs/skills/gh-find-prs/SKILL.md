@@ -19,7 +19,7 @@ This is read-and-recommend. You do NOT merge, close, tag, or publish. You surfac
 
 1. **Inventory the queue.** One call, structured:
    ```
-   gh pr list --repo Hmbown/CodeWhale --state open \
+   gh pr list --repo codewhale-hq/CodeWhale --state open \
      --json number,title,author,headRefName,baseRefName,isDraft,mergeStateStatus,statusCheckRollup
    ```
    Note `mergeStateStatus` (CLEAN / BLOCKED / DIRTY / UNKNOWN) but treat it as a hint only — it is computed against `main`, and the real landing target is usually a different branch.
@@ -33,9 +33,9 @@ This is read-and-recommend. You do NOT merge, close, tag, or publish. You surfac
 
 3. **Read each candidate from code, not title.** For every non-trivial PR:
    ```
-   gh pr view <N> --repo Hmbown/CodeWhale \
+   gh pr view <N> --repo codewhale-hq/CodeWhale \
      --json files,additions,deletions,statusCheckRollup,body,comments
-   gh pr diff <N> --repo Hmbown/CodeWhale
+   gh pr diff <N> --repo codewhale-hq/CodeWhale
    ```
    Read the diff. A "fix(exec): ..." can be a no-op or a regression; a "chore" can be the real fix. Judge the change, the tests it adds, and any review comments.
 

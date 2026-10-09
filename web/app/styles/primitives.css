@@ -389,57 +389,6 @@ a.tile:hover { background: var(--hover); border-color: var(--line-strong); }
   .page-title-aside { background: none; -webkit-text-fill-color: currentColor; }
 }
 
-/* ---------- strata: the water, drawn ---------- */
-/* components/strata.tsx reads its inks from here, so it re-inks with the
-   appearance. Static and decorative; hidden under forced colours. */
-.strata { display: block; width: 100%; height: 100%; pointer-events: none; }
-.home-strata {
-  --strata-haze: rgb(30 143 216 / 0.08);
-  --strata-1: rgb(30 143 216 / 0.12);
-  --strata-2: rgb(30 143 216 / 0.16);
-  --strata-3: rgb(11 72 187 / 0.14);
-  --strata-4: #cfe2f6;
-  --strata-line: #1e8fd8;
-  --strata-thread: #0b48bb;
-}
-/* A waterline band always descends into deep water, in both appearances:
-   its floor is the colour the sea below starts with. */
-.waterline {
-  --strata-1: rgb(30 143 216 / 0.26);
-  --strata-2: rgb(24 119 201 / 0.5);
-  --strata-3: rgb(11 72 187 / 0.8);
-  --strata-4: var(--brand-deep);
-  --strata-line: #90b9ff;
-  --strata-thread: #1e8fd8;
-  position: relative;
-  height: clamp(4.5rem, 9vw, 8rem);
-  pointer-events: none;
-}
-.waterline-deep { --strata-4: var(--ocean-floor); }
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .home-strata {
-    --strata-haze: rgb(30 143 216 / 0.16);
-    --strata-1: rgb(30 143 216 / 0.16);
-    --strata-2: rgb(11 72 187 / 0.34);
-    --strata-3: rgb(11 72 187 / 0.55);
-    --strata-4: #0b48bb;
-    --strata-line: #90b9ff;
-    --strata-thread: #1e8fd8;
-  }
-}
-:root[data-theme="dark"] .home-strata {
-  --strata-haze: rgb(30 143 216 / 0.16);
-  --strata-1: rgb(30 143 216 / 0.16);
-  --strata-2: rgb(11 72 187 / 0.34);
-  --strata-3: rgb(11 72 187 / 0.55);
-  --strata-4: #0b48bb;
-  --strata-line: #90b9ff;
-  --strata-thread: #1e8fd8;
-}
-@media (forced-colors: active) {
-  .strata { display: none; }
-}
-
 /* ---------- definition rows ---------- */
 .def-rows {
   border: 1px solid var(--line);
@@ -659,20 +608,24 @@ a.dir-row:hover .dir-action { color: var(--text); }
 /* components/terminal-capture.tsx: real PTY cells as text. 100 columns stay
    100 columns; a narrow screen scrolls the frame, never shrinks it past
    legibility. */
+/* The capture scales to its frame: the whole terminal is always visible,
+   sized from the frame's width and the grid's column count (--cols, set by
+   components/terminal-capture.tsx). 0.61em is a monospace advance with a
+   little room for the fallback fonts. #0a1e33 and #f6f2e8 are the captured
+   terminal's own defaults, not site colours. */
 .term-capture-scroll {
-  overflow-x: auto;
-  overscroll-behavior-x: contain;
+  container-type: inline-size;
+  overflow: hidden;
   background: #0a1e33;
 }
 .term-capture {
   display: block;
-  width: max-content;
-  min-width: 100%;
+  width: 100%;
   margin: 0;
-  padding: 1rem 1.125rem;
+  padding: 1.6em 1.8em;
   color: #f6f2e8;
   font-family: var(--font-mono);
-  font-size: clamp(0.75rem, 0.3rem + 0.95vw, 0.9375rem);
+  font-size: calc(100cqi / (var(--cols, 100) * 0.61 + 3.6));
   line-height: 1.25;
   white-space: pre;
   font-variant-ligatures: none;
@@ -895,33 +848,26 @@ html[lang="ko"] .prose { line-height: 1.8; letter-spacing: 0; }
 .gs-steps {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0 var(--space-6);
   margin: 0;
   padding: 0;
   list-style: none;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-surface);
-  background: color-mix(in srgb, var(--panel) 72%, transparent);
-  overflow: hidden;
 }
+/* A sequence on paper: a rule above each step and its numeral, no box. */
 .gs-steps li {
   display: grid;
   align-content: start;
   gap: var(--space-2);
   min-width: 0;
-  padding: var(--space-5);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--line-strong);
 }
-.gs-steps li + li { border-inline-start: 1px solid var(--line); }
 .gs-step-index {
-  display: inline-grid;
-  place-items: center;
-  width: 1.75rem;
-  height: 1.75rem;
   color: var(--accent);
-  font-size: var(--text-caption);
+  font-size: var(--text-title);
   font-weight: 600;
+  line-height: 1;
   font-variant-numeric: tabular-nums;
-  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
-  border-radius: var(--radius-pill);
 }
 .gs-steps .gs-step-title { margin-top: var(--space-2); font-size: var(--text-heading); }
 .gs-steps p { color: var(--muted); font-size: var(--text-ui); line-height: 1.6; }
@@ -937,16 +883,13 @@ pre.gs-step-commands { margin-top: var(--space-1); font-size: var(--text-caption
 }
 .gs-step-link:hover { text-decoration: underline; text-underline-offset: 0.2em; }
 .docs-content .gs-steps { grid-template-columns: minmax(0, 1fr); }
-.docs-content .gs-steps li + li { border-inline-start: 0; border-top: 1px solid var(--line); }
+.docs-content .gs-steps { gap: var(--space-5); }
 
 @media (max-width: 760px) {
-  .gs-steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .gs-steps li:nth-child(odd) { border-inline-start: 0; }
-  .gs-steps li:nth-child(n + 3) { border-top: 1px solid var(--line); }
+  .gs-steps { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-6); }
 }
 @media (max-width: 520px) {
-  .gs-steps { grid-template-columns: 1fr; }
-  .gs-steps li + li { border-inline-start: 0; border-top: 1px solid var(--line); }
+  .gs-steps { grid-template-columns: 1fr; gap: var(--space-5); }
 }
 
 /* Any other numbered list of steps: as many columns as fit, divided by
@@ -999,28 +942,13 @@ pre.gs-step-commands { margin-top: var(--space-1); font-size: var(--text-caption
 .horizon {
   position: relative;
   height: 1px;
-  background: var(--horizon-glow);
-  box-shadow: 0 0 18px 2px rgb(30 143 216 / 0.55);
+  background: var(--horizon-light);
 }
 
 .sea { background: var(--sea), var(--ocean-abyss); }
 
-/* A patient water texture (Celmins): fine static rules that fade with depth.
-   Static SVG, never animated, hidden from assistive technology. */
-.sea-texture {
-  position: absolute;
-  inset: 0 0 auto;
-  height: min(22rem, 100%);
-  pointer-events: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='210' height='18'%3E%3Cg stroke='%2390b9ff' stroke-width='1' stroke-linecap='round'%3E%3Cpath d='M4 5h30M60 5h14M112 5h40M170 5h8' stroke-opacity='.12'/%3E%3Cpath d='M30 14h22M88 14h36M140 14h10M186 14h20' stroke-opacity='.08'/%3E%3C/g%3E%3C/svg%3E");
-  background-size: 210px 18px;
-  -webkit-mask-image: linear-gradient(180deg, #000, transparent);
-  mask-image: linear-gradient(180deg, #000, transparent);
-}
-
 @media (forced-colors: active) {
-  .horizon { background: CanvasText; box-shadow: none; }
-  .sea-texture { display: none; }
+  .horizon { background: CanvasText; }
 }
 
 /* ---------- search field ---------- */

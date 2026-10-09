@@ -142,10 +142,9 @@ These stay hand-maintained or release-lane work until a scheduled PR lands:
 | Surface | Why it drifts |
 |---|---|
 | `models_dev.bundled.json` | Offline seed, generated from a reviewed spec and a pinned lock (see below); refreshed by PR, not at runtime |
-| `model_catalog.bundled.json` | Compact TUI seed |
-| `provider_defaults.rs` / default model IDs | Product choice, not pure catalog dump |
-| Static tables in `models.rs` | Fallback heuristics when catalog misses a row |
-| Hand-curated `pricing.rs` rows | Vendor billing quirks; not always in Models.dev |
+| `provider_descriptors.json` default model IDs | Product choice, not pure catalog dump; constant projections are generated |
+| `catalog_corrections.json` `reviewed` | Intrinsic/selector/transport compatibility facts with exact source receipts; generated into the same seed |
+| Rust pricing policy | Vendor billing windows, CNY conversion, withheld/tiered behavior; pure reference observations live in the reviewed supplement |
 | New `ProviderKind` / wire dialect | Needs code, not only JSON |
 
 Runtime live refresh **does not** rewrite those files. Users on a recent
@@ -189,7 +188,8 @@ hand: CI runs `seed render --check` and fails on any difference.
 | `scripts/catalog/models_dev_seed.toml` | Which upstream rows to carry, their Codewhale provider id, wire id, default, canonical join, and the few curated rows upstream does not list | Hand, reviewed |
 | `scripts/catalog/models_dev_seed.lock.json` | The referenced upstream rows, allowlisted, plus the source URL, fetch time and sha256 | `seed lock` only |
 | `crates/config/assets/catalog_corrections.json` | Deliberate holds: withheld prices, clamped limits, reasoning controls | Hand, reviewed; applies online too |
-| `crates/config/assets/models_dev.bundled.json` | The rendered seed | `seed render` only |
+| `crates/config/assets/catalog_corrections.json` `reviewed` | Source-preserved intrinsic facts, scoped aliases, completion references, public labels/source-support dates, pure route facts and reference prices | Hand, reviewed; source receipts retained |
+| `crates/config/assets/models_dev.bundled.json` | The rendered seed including the reviewed supplement | `seed render` only |
 
 The spec selects and maps; it cannot state a value that disagrees with
 upstream (unknown keys are refused). If an upstream value is wrong for a
@@ -308,3 +308,21 @@ subscription OAuth or Claude Code identity headers.
 - Catalog automation script (validate / dry-run): #4117
 - Generated offline seed and runtime corrections: #6396
 - Deeper metadata inventory and drift list: the `codewhale-ops` repo
+
+### Retired unscoped metadata reader
+
+The former models crate cache reader and its separate bundled asset, and the
+TUI-only model registry, are retired. Existing installed legacy cache files are
+preserved and are never imported as provider or public-label authority.
+`config::catalog` owns the immutable compiled intrinsic projection; Engine's
+existing provider lake and scoped catalog cache still own live/account/config
+facts. Identical wire names at different endpoints do not create a canonical
+join, a public label, or an unscoped price. The bundled freshness clock uses the
+actual seed lock fetch timestamp and rechecks the current clock on each query.
+
+Compatibility completion lists reference the provider descriptor defaults and
+catalog groups rather than repeating their values. Kimi's generation default
+remains distinct from direct/membership route limits. Unknown capabilities and
+name-suffix budgets remain explicitly unverified. Website model dates describe
+source support, with the prior proven dates retained in the same reviewed owner;
+they do not assert a provider release date or current API availability.

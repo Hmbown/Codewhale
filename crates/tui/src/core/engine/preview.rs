@@ -476,7 +476,9 @@ impl Engine {
         });
 
         let prepared = match route.client.prepare_outbound_request(request, true) {
-            Ok(prepared) => prepared.with_route_id(route.identity.exact_id.clone()),
+            Ok(prepared) => {
+                prepared.with_route_id(route.identity.persisted_id().map(str::to_string))
+            }
             Err(error) => {
                 let detail = super::turn_loop::preview_request_error_user_message(
                     &self.config.locale_tag,
@@ -547,7 +549,7 @@ impl Engine {
             context_limit_source: route.context_window.source,
             route_input_limit_tokens: limits.and_then(|limits| limits.input_tokens),
             route_output_limit_tokens: limits.and_then(|limits| limits.output_tokens),
-            billing: preview_billing_facts(&route.config, provider, &base_url),
+            billing: preview_billing_facts(&route.config, &route.identity, &base_url),
             routing_source: routing_source.label().to_string(),
             auto_route_source: auto_route_source.as_deref().map(SafeLabel::phrase),
         };
@@ -606,6 +608,20 @@ impl Engine {
         compaction: &crate::compaction::CompactionConfig,
     ) -> Vec<&'static str> {
         let mut reasons = Vec::new();
+        if crate::profile_constitution::account_is_present(
+            self.api_config.account_profile.as_deref(),
+        )
+        .unwrap_or(true)
+            || self
+                .constitution_block
+                .as_deref()
+                .is_some_and(|block| block.starts_with("Account profile constitution,"))
+        {
+            reasons.push("the account constitution is resolved at next-turn admission; preview its guidance in account settings");
+        } else if crate::prompts::load_user_constitution_block() != self.constitution_block {
+            reasons
+                .push("the local constitution changed and will be recorded at next-turn admission");
+        }
 
         if !self.pending_lsp_blocks.is_empty() {
             reasons.push("pending LSP diagnostics would be injected as a synthetic message");
@@ -685,8 +701,7 @@ impl Engine {
         model: &str,
     ) -> PromptProvenance {
         let base = crate::prompts::effective_base_prompt_text();
-        let configured =
-            crate::prompts::compose_default_static_layers(crate::prompts::Personality::Calm, model);
+        let configured = crate::prompts::compose_default_static_layers(model);
 
         let assembly = if effective.trim().is_empty() {
             SystemPromptAssembly::None
@@ -713,13 +728,15 @@ impl Engine {
 /// and sidebar read. Every label is a compile-time constant.
 fn preview_billing_facts(
     config: &crate::config::Config,
-    provider: crate::config::ApiProvider,
+    identity: &crate::config::ProviderIdentity,
     base_url: &str,
 ) -> BillingFacts {
-    if let Some(surface) = crate::pricing::billing_surface_for_route(provider, Some(base_url)) {
+    if let Some(surface) =
+        crate::pricing::billing_surface_for_route(identity.provider, Some(base_url))
+    {
         return BillingFacts::Surface { surface };
     }
-    match crate::route_billing::for_route(config, provider) {
+    match crate::route_billing::for_route(config, identity) {
         crate::route_billing::BillingPresentation::Metered => BillingFacts::Metered,
         crate::route_billing::BillingPresentation::Subscription(plan) => {
             BillingFacts::Subscription { plan }

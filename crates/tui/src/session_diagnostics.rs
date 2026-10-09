@@ -279,6 +279,14 @@ fn classify_session_failure(value: &Value, message: &str) -> SessionFailureClass
         ErrorCategory::Authorization => SessionFailureClass::SandboxApproval,
         ErrorCategory::Authentication => SessionFailureClass::Model,
         ErrorCategory::State => SessionFailureClass::MissingDependency,
+        // A bare placeholder ("error") says nothing about a schema fault; the
+        // classifier files it under Parse only so provider turns can say
+        // "unreadable" (#6843).
+        ErrorCategory::Parse
+            if crate::error_taxonomy::unreadable_error_notice(message).is_some() =>
+        {
+            SessionFailureClass::Unknown
+        }
         ErrorCategory::InvalidInput | ErrorCategory::Parse => SessionFailureClass::ToolSchema,
         ErrorCategory::Tool => SessionFailureClass::CommandExit,
         ErrorCategory::Internal if lower.contains("model") => SessionFailureClass::Model,
@@ -464,6 +472,17 @@ fn bool_field_any_at(value: &Value, keys: &[&str], depth: usize) -> Option<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_error_placeholder_is_not_a_schema_failure() {
+        // The taxonomy files a bare "error" under Parse so provider turns can
+        // call it unreadable; a tool that printed only that is not a schema bug.
+        let value = serde_json::json!({});
+        assert_eq!(
+            classify_session_failure(&value, "ERROR"),
+            SessionFailureClass::Unknown
+        );
+    }
 
     #[test]
     fn synthetic_jsonl_classifies_environment_and_tool_failures() {

@@ -2264,7 +2264,7 @@ mod tests {
             Some(Forge::Cnb)
         );
         assert_eq!(
-            classify_remote("origin", "https://github.com/Hmbown/CodeWhale.git"),
+            classify_remote("origin", "https://github.com/codewhale-hq/CodeWhale.git"),
             Some(Forge::Github)
         );
         assert_eq!(
@@ -2280,7 +2280,7 @@ mod tests {
     #[test]
     fn ambiguous_github_and_cnb_require_an_explicit_remote() {
         let rows = remotes(&[
-            ("github", "https://github.com/Hmbown/CodeWhale.git"),
+            ("github", "https://github.com/codewhale-hq/CodeWhale.git"),
             ("origin", "https://cnb.cool/codewhale.net/codewhale.git"),
         ]);
         assert_eq!(
@@ -3014,8 +3014,8 @@ mod tests {
     #[test]
     fn parse_git_remote_listing_prefers_first_url_per_name() {
         let parsed = parse_remote_listing(
-            "github\thttps://github.com/Hmbown/CodeWhale.git (fetch)\n\
-             github\thttps://github.com/Hmbown/CodeWhale.git (push)\n\
+            "github\thttps://github.com/codewhale-hq/CodeWhale.git (fetch)\n\
+             github\thttps://github.com/codewhale-hq/CodeWhale.git (push)\n\
              origin\thttps://cnb.cool/codewhale.net/codewhale.git (fetch)\n",
         );
         assert_eq!(parsed.len(), 2);

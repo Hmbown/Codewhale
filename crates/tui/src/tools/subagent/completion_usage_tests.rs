@@ -332,7 +332,13 @@ async fn completion_usage_counts_real_manifest_only_root_fork() {
     // Exercise real registration without allowing any provider request.
     runtime.cancel_token.cancel();
     let mut guard = manager.write().await;
+    let (canonical, directory) = crate::runtime_api::open_workspace_directory(dir.path()).unwrap();
+    guard
+        .admit_coordination_workspace(dir.path().to_path_buf(), canonical, Arc::new(directory))
+        .unwrap();
     let source = child(&mut guard, "source", None, Some(1));
+    let completed = terminal_result(&guard, &source);
+    assert!(guard.finish_terminal_result(&source, completed, true, false));
     let fork = guard
         .spawn_background_with_assignment_options(
             Arc::clone(&manager),
@@ -512,4 +518,103 @@ async fn completion_usage_dozen_child_status_measures_bytes_and_keeps_descendant
     eprintln!(
         "DOZEN_CHILD_STATUS_MEASUREMENT children=12 pages={pages} serialized_bytes={bytes}; token_count=unmeasured"
     );
+}
+
+#[test]
+fn worker_unknown_usage_promotes_exact_route_once_and_survives_serialization() {
+    let dir = tempdir().unwrap();
+    let mut manager = SubAgentManager::new(dir.path().to_path_buf(), 4);
+    let id = child(&mut manager, "late-exact", None, None);
+    let route = crate::cost_status::EffectiveRouteEnvelope::capture(
+        None,
+        crate::config::ProviderKind::Deepseek,
+        "deepseek",
+        "deepseek-v4-flash",
+        Some("https://api.deepseek.com/v1"),
+        chrono::Utc::now(),
+    );
+    manager.record_worker_missing_usage(
+        &id,
+        "late-response",
+        crate::cost_status::MissingUsageCoverage::for_route(
+            &route,
+            crate::cost_status::RuntimeUsageMissingReason::RequestOutcomeUnknown,
+        ),
+    );
+    let encoded = serde_json::to_vec(manager.worker_records.get(&id).unwrap()).unwrap();
+    let restored: AgentWorkerRecord = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(restored.missing_usage_sources.len(), 1);
+    assert!(restored.has_unreported_usage);
+    manager.worker_records.insert(id.clone(), restored);
+    let usage = Usage {
+        input_tokens: 17,
+        output_tokens: 3,
+        ..Default::default()
+    };
+    let mut changed = route.clone();
+    changed.model = "different-model".into();
+    manager.record_worker_routed_usage(&id, "late-response", &changed, &usage, Some(20));
+    assert!(manager.worker_records[&id].usage.total_tokens.is_none());
+    for _ in 0..2 {
+        manager.record_worker_routed_usage(&id, "late-response", &route, &usage, Some(20));
+    }
+    let record = &manager.worker_records[&id];
+    assert_eq!(record.usage.total_tokens, Some(20));
+    assert_eq!(record.usage.cost_microusd, Some(20));
+    assert!(record.missing_usage_sources.is_empty());
+    assert!(!record.has_unreported_usage);
+    assert_eq!(record.usage_source_fingerprints.len(), 1);
+}
+
+#[test]
+fn worker_missing_overflow_and_legacy_gap_remain_after_exact_promotions() {
+    let dir = tempdir().unwrap();
+    let mut manager = SubAgentManager::new(dir.path().to_path_buf(), 4);
+    let id = child(&mut manager, "bounded-unknown", None, None);
+    manager.mark_worker_unreported_usage(&id);
+    let route = crate::cost_status::EffectiveRouteEnvelope::capture(
+        None,
+        crate::config::ProviderKind::Deepseek,
+        "deepseek",
+        "deepseek-v4-flash",
+        Some("https://api.deepseek.com/v1"),
+        chrono::Utc::now(),
+    );
+    for index in 0..65 {
+        manager.record_worker_missing_usage(
+            &id,
+            &format!("request-{index}"),
+            crate::cost_status::MissingUsageCoverage::for_route(
+                &route,
+                crate::cost_status::RuntimeUsageMissingReason::RequestOutcomeUnknown,
+            ),
+        );
+    }
+    assert_eq!(manager.worker_records[&id].missing_usage_sources.len(), 64);
+    let encoded = serde_json::to_vec(&manager.worker_records[&id]).unwrap();
+    let restored: AgentWorkerRecord = serde_json::from_slice(&encoded).unwrap();
+    assert!(restored.missing_usage_overflowed);
+    assert!(restored.legacy_unreported_usage);
+    manager.worker_records.insert(id.clone(), restored);
+    let usage = Usage {
+        input_tokens: 1,
+        output_tokens: 1,
+        ..Default::default()
+    };
+    for index in 0..65 {
+        for _ in 0..2 {
+            manager.record_worker_routed_usage(
+                &id,
+                &format!("request-{index}"),
+                &route,
+                &usage,
+                None,
+            );
+        }
+    }
+    let record = &manager.worker_records[&id];
+    assert_eq!(record.usage.total_tokens, Some(130));
+    assert!(record.missing_usage_sources.is_empty());
+    assert!(record.has_unreported_usage);
+    assert!(record.missing_usage_overflowed && record.legacy_unreported_usage);
 }

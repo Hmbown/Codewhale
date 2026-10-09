@@ -29,7 +29,14 @@ impl CommandDebugDiagnosticsContext for DebugDiagnosticsAdapter<'_> {
     fn balance_projection(&self) -> DebugBalanceProjection {
         let app = self.host.app.borrow();
         DebugBalanceProjection {
-            provider_display_name: app.api_provider.display_name().to_string(),
+            provider_display_name: app
+                .admitted_provider_identity()
+                .map_or("unavailable", |identity| {
+                    identity
+                        .compatibility()
+                        .map_or(identity.key.as_str(), |row| row.label)
+                })
+                .to_string(),
             supports_balance_api: provider_has_balance_api(app.api_provider),
         }
     }

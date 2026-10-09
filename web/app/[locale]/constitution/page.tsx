@@ -112,7 +112,7 @@ export default async function ConstitutionPage({ params }: { params: Promise<{ l
               {t.install}
             </Link>
             <Link
-              href="https://github.com/Hmbown/CodeWhale/blob/main/docs/CONFIGURATION.md#constitution-project-instructions-and-repo-authority"
+              href="https://github.com/codewhale-hq/CodeWhale/blob/main/docs/CONFIGURATION.md#constitution-project-instructions-and-repo-authority"
               className="btn btn-ghost btn-lg"
             >
               {t.configuration}

@@ -1,6 +1,6 @@
 //! Model-backed Auto-Review guardian tier (v0.9.8).
 //!
-//! The deterministic policy engine (see [`crate::tui::auto_review`]) decides
+//! The deterministic policy engine (see [`crate::core::authority::auto_review`]) decides
 //! first: configured block rules and the built-in safety floor are hard
 //! blocks that never reach a model. Only deterministic *fallback holds* — the
 //! `AskUser` outcomes Auto posture would otherwise turn into bare permission
@@ -12,12 +12,12 @@
 
 use std::time::Duration;
 
-use crate::core::model_client::ModelClient;
-use crate::tools::spec::ToolError;
-use crate::tui::auto_review::{
+use crate::core::authority::auto_review::{
     AutoReviewAction, DEFAULT_GUARDIAN_POLICY, ReviewerRiskLevel, ReviewerVerdict,
     parse_reviewer_verdict,
 };
+use crate::core::model_client::ModelClient;
+use crate::tools::spec::ToolError;
 use codewhale_models::Role;
 use codewhale_models::{
     ContentBlock, Message, MessageRequest, MessageResponse, SystemPrompt, Usage,

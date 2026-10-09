@@ -12,6 +12,20 @@ const {
   checksummedReleaseAssetNames,
 } = require("../../npm/codewhale/scripts/artifacts");
 
+const compiledHosts = require("../../npm/codewhale/scripts/compiled-hosts");
+
+async function readHostCatalog(directory) {
+  const file = path.join(directory, compiledHosts.HOST_CATALOG);
+  try {
+    const metadata = await fs.lstat(file);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("compiled host catalog is not a regular file");
+    return compiledHosts.parseCatalog(await fs.readFile(file, "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
 const WINDOWS_LAUNCHER = "codewhale.bat";
 
 function usage() {
@@ -87,10 +101,12 @@ async function verifyAssetDirectory(directory) {
     );
   }
 
-  const expected = allReleaseAssetNames();
+  const catalog = await readHostCatalog(directory);
+  const expected = allReleaseAssetNames(catalog);
   assertExactNames(entries.map((entry) => entry.name), expected, "Release asset directory");
-  await assertManifest(directory, CHECKSUM_MANIFEST, checksummedReleaseAssetNames());
+  await assertManifest(directory, CHECKSUM_MANIFEST, checksummedReleaseAssetNames(catalog));
   await assertManifest(directory, BUNDLE_CHECKSUM_MANIFEST, BUNDLE_ASSET_NAMES);
+  if (catalog) compiledHosts.verifyDirectory(directory, catalog);
   console.log(`Verified ${expected.length} release assets in ${directory}`);
 }
 
@@ -108,7 +124,8 @@ function windowsLauncherContents() {
   ].join("\r\n");
 }
 
-function intermediateArtifactPath(inputDirectory, name) {
+function intermediateArtifactPath(inputDirectory, name, catalog) {
+  if (compiledHosts.assets(catalog).includes(name)) return path.join(inputDirectory, "codewhale-compiled-hosts", name);
   if (name === BUNDLE_CHECKSUM_MANIFEST || BUNDLE_ASSET_NAMES.includes(name)) {
     return path.join(inputDirectory, "codewhale-bundles", name);
   }
@@ -116,12 +133,13 @@ function intermediateArtifactPath(inputDirectory, name) {
 }
 
 async function assemble(inputDirectory, outputDirectory) {
-  const expected = allReleaseAssetNames();
+  const catalog = await readHostCatalog(path.join(inputDirectory, "codewhale-compiled-hosts"));
+  const expected = allReleaseAssetNames(catalog);
   const generated = new Set([WINDOWS_LAUNCHER, CHECKSUM_MANIFEST]);
   const copiedNames = expected.filter((name) => !generated.has(name));
   const sources = new Map();
   for (const name of copiedNames) {
-    const source = intermediateArtifactPath(inputDirectory, name);
+    const source = intermediateArtifactPath(inputDirectory, name, catalog);
     let sourceStat;
     try {
       sourceStat = await fs.lstat(source);
@@ -153,7 +171,7 @@ async function assemble(inputDirectory, outputDirectory) {
   );
 
   const checksumRows = [];
-  for (const name of [...checksummedReleaseAssetNames()].sort()) {
+  for (const name of [...checksummedReleaseAssetNames(catalog)].sort()) {
     checksumRows.push(`${await sha256(path.join(outputDirectory, name))}  ${name}`);
   }
   await fs.writeFile(

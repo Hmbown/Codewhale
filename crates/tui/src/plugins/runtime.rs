@@ -24,11 +24,12 @@ fn component_paths(plugin: &LoadedPlugin, capability: PluginActivationCapability
         PluginActivationCapability::Commands => &plugin.components.commands,
         PluginActivationCapability::Agents => &plugin.components.agents,
         PluginActivationCapability::Hooks => &plugin.components.hooks,
-        // Extension-host entry modules; only active under the v4 policy.
+        // Extension-host entry modules; only active under the v6 policy.
         PluginActivationCapability::Native => &plugin.components.native,
         PluginActivationCapability::Skills
         | PluginActivationCapability::McpStdio
         | PluginActivationCapability::McpRemote
+        | PluginActivationCapability::Providers
         | PluginActivationCapability::Lsp
         | PluginActivationCapability::FilesystemRoots
         | PluginActivationCapability::LifecycleMutation => &[],
@@ -128,7 +129,7 @@ pub fn active_component_sources(
     (sources, errors)
 }
 
-fn staged_component_path(
+pub(super) fn staged_component_path(
     canonical_root: &Path,
     staged_root: &Path,
     source_path: &Path,

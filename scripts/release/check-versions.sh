@@ -25,6 +25,8 @@
 #  12. Issue-linked feature commits have a durable changelog receipt.
 #  13. `Cargo.lock` is in sync with the manifests (`cargo metadata --locked`
 #      fails if not).
+#  14. Version-stamped contract fixtures (`providers-export.golden.json` and
+#      the config-policy status baseline) match the workspace version.
 set -euo pipefail
 
 require_dated_release=0
@@ -130,6 +132,7 @@ fi
 # 4) Internal path dependency pins.
 internal_dep_drift="$(
   grep -nE 'codewhale-[a-z-]+[[:space:]]*=[[:space:]]*\{[^}]*version[[:space:]]*=[[:space:]]*"' crates/*/Cargo.toml \
+    | grep -vF 'codewhale-ratatui = { path = "../../vendor/codewhale-ratatui", version = "0.1.0" }' \
     | grep -v "version[[:space:]]*=[[:space:]]*\"${workspace_version}\"" || true
 )"
 if [[ -n "${internal_dep_drift}" ]]; then
@@ -183,7 +186,7 @@ if [[ -z "${compare_line}" ]]; then
   echo "::error::CHANGELOG.md must include a compare link for ${workspace_version}." >&2
   fail=1
 elif [[ "${require_dated_release}" == "1" ]] &&
-  ! grep -qE "^\\[${workspace_version}\\]: https://github.com/Hmbown/CodeWhale/compare/v[0-9]+\\.[0-9]+\\.[0-9]+\\.\\.\\.v${workspace_version}$" <<<"${compare_line}"; then
+  ! grep -qE "^\\[${workspace_version}\\]: https://github.com/codewhale-hq/CodeWhale/compare/v[0-9]+\\.[0-9]+\\.[0-9]+\\.\\.\\.v${workspace_version}$" <<<"${compare_line}"; then
   echo "::error::Publication requires the ${workspace_version} compare link to end at v${workspace_version}." >&2
   fail=1
 fi
@@ -344,6 +347,33 @@ fi
 # 13) Cargo.lock in sync.
 if ! cargo metadata --locked --format-version 1 --no-deps >/dev/null 2>&1; then
   echo "::error::Cargo.lock is out of sync with the manifests. Run 'cargo update -p codewhale-tui' or 'cargo build' and commit the result." >&2
+  fail=1
+fi
+
+# 14) Version-stamped contract fixtures match the workspace version. The
+# 0.10.2 bump left providers-export.golden.json and the config-policy status
+# baseline stamped 0.10.1; the test job caught both in CI while this gate said
+# OK, at the cost of a full CI round. Two reads and a compare instead.
+golden_fixture="crates/config/src/route/providers-export.golden.json"
+if [[ -f "${golden_fixture}" ]]; then
+  golden_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("runtimeVersion",""))' "${golden_fixture}" 2>/dev/null || true)"
+  if [[ "${golden_version}" != "${workspace_version}" ]]; then
+    echo "::error::${golden_fixture} is stamped '${golden_version:-<missing>}', want '${workspace_version}'. Regenerate with: WRITE_GOLDEN=1 cargo test -p codewhale-config --lib -- --ignored write_golden_providers_export_when_requested" >&2
+    fail=1
+  fi
+else
+  echo "::error::${golden_fixture} is missing, so its version stamp cannot be checked against '${workspace_version}'." >&2
+  fail=1
+fi
+status_fixture="crates/tui/src/commands/contract/fixtures/config_policy/status.json"
+if [[ -f "${status_fixture}" ]]; then
+  status_fixture_line="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["message"].splitlines()[0])' "${status_fixture}" 2>/dev/null || true)"
+  if [[ "${status_fixture_line}" != "codewhale ${workspace_version}" ]]; then
+    echo "::error::${status_fixture} first line is '${status_fixture_line:-<missing>}', want 'codewhale ${workspace_version}'." >&2
+    fail=1
+  fi
+else
+  echo "::error::${status_fixture} is missing, so its version stamp cannot be checked against '${workspace_version}'." >&2
   fail=1
 fi
 

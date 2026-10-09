@@ -14,6 +14,12 @@ test('Windows desktop: observe, set Unicode value, invoke and independently veri
   skip: process.platform !== 'win32' || process.env.CU_WINDOWS_DESKTOP_TESTS !== '1', timeout: 90_000,
 }, async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cu-win-desktop-'));
+  const previousRecordings = process.env.CODEWHALE_CU_RECORDINGS_DIR;
+  process.env.CODEWHALE_CU_RECORDINGS_DIR = dir;
+  t.after(() => {
+    if (previousRecordings === undefined) delete process.env.CODEWHALE_CU_RECORDINGS_DIR;
+    else process.env.CODEWHALE_CU_RECORDINGS_DIR = previousRecordings;
+  });
   const title = `CU fixture ${crypto.randomUUID()}`;
   const receipt = path.join(dir, 'state.json');
   const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', fileURLToPath(new URL('./fixtures/windows-desktop.ps1', import.meta.url)), title, receipt], { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: false });

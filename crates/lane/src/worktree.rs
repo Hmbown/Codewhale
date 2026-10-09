@@ -27,6 +27,33 @@ pub struct ProvisionedWorktree {
     pub branch: String,
 }
 
+/// Refuse `path` when an existing component between `root` and `path` is a
+/// link. A path outside `root` (an explicit `--worktree-path`) is the caller's
+/// own choice and is not checked.
+fn reject_linked_below(root: &Path, path: &Path) -> Result<()> {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return Ok(());
+    };
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!(
+                    "refusing to create a lane worktree through the link {}",
+                    current.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Create a git worktree + branch for a lane.
 pub fn provision_worktree(spec: &WorktreeProvision) -> Result<ProvisionedWorktree> {
     if spec.branch.trim().is_empty() {
@@ -41,6 +68,9 @@ pub fn provision_worktree(spec: &WorktreeProvision) -> Result<ProvisionedWorktre
         bail!("worktree branch and base ref must not start with '-'");
     }
     if let Some(parent) = spec.path.parent() {
+        // The default location is `<repo>/.codewhale/lanes/<id>`: a link on
+        // the way down from the repository would send the checkout elsewhere.
+        reject_linked_below(&spec.repo_root, parent)?;
         fs::create_dir_all(parent)
             .with_context(|| format!("create worktree parent {}", parent.display()))?;
     }
@@ -351,6 +381,28 @@ pub(crate) mod tests {
             !wt_path.exists(),
             "TTL 0 should remove worktree immediately"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provision_refuses_a_linked_lanes_directory_under_the_repo() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".codewhale")).unwrap();
+        init_repo(&repo);
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join(".codewhale").join("lanes")).unwrap();
+
+        let error = provision_worktree(&WorktreeProvision {
+            repo_root: repo.clone(),
+            branch: "codex/lane-linked".into(),
+            path: repo.join(".codewhale").join("lanes").join("lane-1"),
+            base_ref: Some("main".into()),
+        })
+        .expect_err("a linked lanes directory must be refused");
+        assert!(format!("{error:#}").contains("link"), "{error:#}");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
     }
 
     #[test]

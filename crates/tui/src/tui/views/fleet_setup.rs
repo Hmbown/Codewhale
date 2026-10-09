@@ -331,39 +331,62 @@ impl FleetSetupSnapshot {
                 })
             })
             .collect();
-        let active_route_readiness = crate::provider_readiness::resolve_for_model(
-            config,
-            app.api_provider,
-            if app.auto_model { "auto" } else { &app.model },
-            &app.provider_health,
-        );
+        let identity = app
+            .provider_identity
+            .as_ref()
+            .filter(|identity| config.verify_provider_identity(identity).is_ok());
+        let provider_ready = identity.is_some_and(|identity| {
+            crate::provider_readiness::resolve_for_model(
+                config,
+                identity,
+                if app.auto_model { "auto" } else { &app.model },
+                &app.provider_health,
+            )
+            .can_attempt()
+        });
 
         Self {
             workspace: app.workspace.clone(),
             locale: app.ui_locale,
-            provider_ready: active_route_readiness.can_attempt(),
+            provider_ready,
             provider,
             model,
             reasoning: app.reasoning_effort_display_label(),
-            subagents_enabled: config.subagents_enabled_for_provider(app.api_provider),
-            max_subagents: config.max_subagents_for_provider(app.api_provider),
-            launch_concurrency: config.launch_concurrency_for_provider(app.api_provider),
-            max_admitted: config.max_admitted_subagents_for_provider(app.api_provider),
-            subagent_spawn_depth: config.subagent_max_spawn_depth_for_provider(app.api_provider),
+            subagents_enabled: identity.map_or_else(
+                || config.subagents_enabled(),
+                |identity| config.subagents_enabled_for_provider(identity),
+            ),
+            max_subagents: identity.map_or_else(
+                || config.max_subagents(),
+                |identity| config.max_subagents_for_provider(identity),
+            ),
+            launch_concurrency: identity.map_or_else(
+                || config.launch_concurrency(),
+                |identity| config.launch_concurrency_for_provider(identity),
+            ),
+            max_admitted: identity.map_or_else(
+                || config.max_admitted_subagents(),
+                |identity| config.max_admitted_subagents_for_provider(identity),
+            ),
+            subagent_spawn_depth: identity.map_or_else(
+                || config.subagent_max_spawn_depth(),
+                |identity| config.subagent_max_spawn_depth_for_provider(identity),
+            ),
             fleet_spawn_depth,
-            api_timeout_secs: config.subagent_api_timeout_secs_for_provider(app.api_provider),
-            heartbeat_timeout_secs: config
-                .subagent_heartbeat_timeout_secs_for_provider(app.api_provider),
+            api_timeout_secs: identity.map_or_else(
+                || config.subagent_api_timeout_secs(),
+                |identity| config.subagent_api_timeout_secs_for_provider(identity),
+            ),
+            heartbeat_timeout_secs: identity.map_or_else(
+                || config.subagent_heartbeat_timeout_secs(),
+                |identity| config.subagent_heartbeat_timeout_secs_for_provider(identity),
+            ),
             roster_members,
             roster_details,
             project_profiles_enabled: crate::fleet::roster::project_agent_profiles_enabled(),
             personal_profile_dir: crate::fleet::profile::personal_agent_profile_dir()
                 .map_err(|err| format!("{err:#}")),
-            available_models: cross_provider_model_routes(
-                config,
-                app.api_provider,
-                &app.provider_health,
-            ),
+            available_models: cross_provider_model_routes(config, identity, &app.provider_health),
         }
     }
 }
@@ -380,60 +403,25 @@ impl FleetSetupSnapshot {
 /// Callers derive a human-readable label from it for UI text.
 pub(crate) fn cross_provider_model_routes(
     config: &Config,
-    active: crate::config::ApiProvider,
+    active: Option<&crate::config::ProviderIdentity>,
     health: &crate::provider_readiness::ProviderReadinessSnapshot,
 ) -> Vec<(
     String,
     String,
     crate::provider_readiness::ResolvedProviderReadiness,
 )> {
+    let Some(active) = active.filter(|identity| config.verify_provider_identity(identity).is_ok())
+    else {
+        return Vec::new();
+    };
     let mut routes = Vec::new();
-    let configured = crate::provider_lake::configured_providers(config, active);
-    let legacy_custom_configured = configured.contains(&crate::config::ApiProvider::Custom);
-    for provider in configured
-        .into_iter()
-        .filter(|provider| *provider != crate::config::ApiProvider::Custom)
-    {
-        append_provider_model_routes(
-            &mut routes,
-            config,
-            active,
-            provider,
-            provider.as_str(),
-            health,
-        );
-    }
-
-    // `ApiProvider::Custom` is an enum class, not a route identity. Enumerate
-    // every named custom table so a Fleet on custom A can still pin a worker
-    // to custom B and persist B's exact client route.
-    let mut custom_names = config
-        .providers
-        .as_ref()
-        .map(|providers| providers.custom.keys().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
-    custom_names.sort();
-    if custom_names.is_empty() && legacy_custom_configured {
-        append_provider_model_routes(
-            &mut routes,
-            config,
-            active,
-            crate::config::ApiProvider::Custom,
-            crate::config::ApiProvider::Custom.as_str(),
-            health,
-        );
-    }
-    for name in custom_names {
-        let mut named_config = config.clone();
-        named_config.provider = Some(name.clone());
-        append_provider_model_routes(
-            &mut routes,
-            &named_config,
-            active,
-            crate::config::ApiProvider::Custom,
-            &name,
-            health,
-        );
+    for identity in config.provider_identities() {
+        if identity.provider == crate::config::ProviderKind::Antigravity
+            || !crate::config::provider_is_configured_for_active(config, &identity, active)
+        {
+            continue;
+        }
+        append_provider_model_routes(&mut routes, config, active, &identity, health);
     }
     routes
 }
@@ -445,44 +433,36 @@ fn append_provider_model_routes(
         crate::provider_readiness::ResolvedProviderReadiness,
     )>,
     config: &Config,
-    active: crate::config::ApiProvider,
-    provider: crate::config::ApiProvider,
-    provider_id: &str,
+    active: &crate::config::ProviderIdentity,
+    identity: &crate::config::ProviderIdentity,
     health: &crate::provider_readiness::ProviderReadinessSnapshot,
 ) {
-    // The bundled lake is only the baseline. A user may pin a valid
-    // provider-specific preview or private deployment outside that catalog.
     let mut models = Vec::new();
     if let Some(model) = config
-        .provider_config_for(provider)
+        .provider_config_for(identity)
         .and_then(|entry| entry.model.as_deref())
     {
         push_unique_model(&mut models, model);
     }
-    if provider == active {
-        let active_model = config.default_model();
-        if !active_model.trim().eq_ignore_ascii_case("auto") {
-            push_unique_model(&mut models, &active_model);
+    if identity == active {
+        let model = config.default_model();
+        if !model.trim().eq_ignore_ascii_case("auto") {
+            push_unique_model(&mut models, &model);
         }
     }
-    for model in crate::provider_lake::models_for_provider(config, active, provider) {
+    for model in crate::provider_lake::models_for_provider(config, identity) {
         push_unique_model(&mut models, &model);
     }
-
     for model in models {
         let readiness =
-            crate::provider_readiness::resolve_for_model(config, provider, &model, health);
-        routes.push((provider_id.to_string(), model, readiness));
+            crate::provider_readiness::resolve_for_model(config, identity, &model, health);
+        routes.push((identity.key.to_string(), model, readiness));
     }
 }
 
 fn push_unique_model(models: &mut Vec<String>, model: &str) {
     let model = model.trim();
-    if !model.is_empty()
-        && !models
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(model))
-    {
+    if !model.is_empty() && !models.iter().any(|existing| existing == model) {
         models.push(model.to_string());
     }
 }
@@ -516,9 +496,9 @@ pub(super) fn route_matches_query(
 }
 
 pub(super) fn provider_display_label(provider_id: &str) -> String {
-    crate::config::ApiProvider::parse(provider_id)
+    crate::config::ProviderKind::parse(provider_id)
         .filter(|provider| provider.as_str() == provider_id)
-        .map(|provider| provider.display_name().to_string())
+        .map(|provider| provider.provider().display_name().to_string())
         .unwrap_or_else(|| provider_id.to_string())
 }
 
@@ -1776,7 +1756,7 @@ impl FleetSetupView {
                         // only this exact provider/model. Hand off to the host
                         // so rendering stays I/O-free.
                         if let Some((provider_id, model)) = self.model_routes.get(idx)
-                            && let Some(provider) = crate::config::ApiProvider::parse(provider_id)
+                            && let Some(provider) = crate::config::ProviderKind::parse(provider_id)
                             && crate::tui::provider_picker::external_consent_target_for_provider(
                                 provider,
                             )
@@ -4626,7 +4606,7 @@ approval_required = true
 
         let routes = cross_provider_model_routes(
             &config,
-            crate::config::ApiProvider::Openrouter,
+            Some(&(config).test_identity_for_kind(crate::config::ProviderKind::Openrouter)),
             &crate::provider_readiness::ProviderReadinessSnapshot::default(),
         );
 
@@ -4673,7 +4653,7 @@ approval_required = true
         };
         let routes = cross_provider_model_routes(
             &config,
-            crate::config::ApiProvider::Custom,
+            Some(&(config).test_identity_for_kind(crate::config::ProviderKind::Custom)),
             &crate::provider_readiness::ProviderReadinessSnapshot::default(),
         );
         assert!(
@@ -4725,7 +4705,7 @@ approval_required = true
 
         let routes = cross_provider_model_routes(
             &config,
-            crate::config::ApiProvider::Custom,
+            Some(&(config).test_identity_for_kind(crate::config::ProviderKind::Custom)),
             &crate::provider_readiness::ProviderReadinessSnapshot::default(),
         );
 
@@ -5114,41 +5094,24 @@ approval_required = true
     #[test]
     fn fleet_setup_includes_openai_codex_account_roster_with_dormant_consent() {
         let _env = crate::test_support::lock_test_env();
-        let codex_home = tempfile::tempdir().expect("Codex home");
-        let _home = crate::test_support::EnvVarGuard::set("CODEX_HOME", codex_home.path());
-        std::fs::write(
-            codex_home.path().join("models_cache.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "fetched_at": chrono::Utc::now(),
-                "models": [
-                    { "slug": "gpt-5.6-sol", "priority": 1 },
-                    { "slug": "gpt-5.6-terra", "priority": 2 },
-                    { "slug": "gpt-5.6-luna", "priority": 3 }
-                ]
-            }))
-            .expect("serialize cache"),
-        )
-        .expect("write cache");
-
+        let home = tempfile::tempdir().expect("owned ChatGPT home");
+        let canonical_home = home
+            .path()
+            .canonicalize()
+            .expect("canonical private fixture home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &canonical_home);
         let mut config = crate::config::Config::default();
-        config.providers = Some(crate::config::ProvidersConfig {
-            openai_codex: crate::config::ProviderConfig {
-                auth_mode: Some("oauth".to_string()),
-                external_credentials: Some(
-                    codewhale_config::ExternalCredentialConsentToml::read_only(
-                        codewhale_config::ProviderKind::OpenaiCodex,
-                        codewhale_config::ExternalCredentialSource::CodexCli,
-                        codex_home.path().join("auth.json"),
-                    ),
-                ),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
+        crate::oauth::install_test_chatgpt_registration(&mut config)
+            .expect("owned ChatGPT registration");
+        crate::codex_model_cache::install_test_chatgpt_roster(
+            &config,
+            &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+        )
+        .expect("account-scoped roster");
 
         let routes = cross_provider_model_routes(
             &config,
-            crate::config::ApiProvider::Moonshot,
+            Some(&(config).test_identity_for_kind(crate::config::ProviderKind::Moonshot)),
             &crate::provider_readiness::ProviderReadinessSnapshot::default(),
         );
 
@@ -5159,10 +5122,10 @@ approval_required = true
                         && m == model
                         && matches!(
                             readiness,
-                            crate::provider_readiness::ResolvedProviderReadiness::ExternalConsentPendingSelection
+                            crate::provider_readiness::ResolvedProviderReadiness::SavedUnchecked
                         )
                 }),
-                "missing dormant-consent Codex route for {model}: {routes:?}"
+                "missing unchecked owned ChatGPT route for {model}: {routes:?}"
             );
         }
     }
@@ -5189,7 +5152,7 @@ approval_required = true
 
         let routes = cross_provider_model_routes(
             &config,
-            crate::config::ApiProvider::Moonshot,
+            Some(&(config).test_identity_for_kind(crate::config::ProviderKind::Moonshot)),
             &crate::provider_readiness::ProviderReadinessSnapshot::default(),
         );
 

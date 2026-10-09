@@ -46,8 +46,8 @@
 //! `request_subagent_model_response_with_retries(…)` and the RLM loop calls
 //! `client.create_message_boxed(…)` and runs its code rounds through
 //! `repl.run(…)`. CI said "exactly one turn loop" while three existed. The
-//! markers above now cover both spellings, and both loops are named interim
-//! exceptions below instead of invisible ones.
+//! markers cover both spellings. Both the child and RLM producer/code loops
+//! now enter the canonical Engine; neither has a migration exception.
 //!
 //! # Known limitations
 //!
@@ -62,7 +62,7 @@
 //! - It reports one loop per (file, enclosing function). A function with two
 //!   turn loops in it is one finding, not two.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// A loop that is permitted to drive model/tool rounds, and the reason.
@@ -79,44 +79,12 @@ struct AllowedTurnLoop {
     why: &'static str,
 }
 
-const ALLOWED_TURN_LOOPS: &[AllowedTurnLoop] = &[
-    AllowedTurnLoop {
-        path: "crates/tui/src/core/engine/turn_loop.rs",
-        owner: "run_turn",
-        why: "THE turn loop. `Engine::run_turn` is the single agent loop; \
+const ALLOWED_TURN_LOOPS: &[AllowedTurnLoop] = &[AllowedTurnLoop {
+    path: "crates/tui/src/core/engine/turn_loop.rs",
+    owner: "run_turn",
+    why: "THE turn loop. `Engine::run_turn` is the single agent loop; \
               docs/ARCHITECTURE.md and AGENTS.md both name it as the owner.",
-    },
-    AllowedTurnLoop {
-        path: "crates/tui/src/acp_server.rs",
-        owner: "run_agentic_prompt_turn",
-        why: "INTERIM EXCEPTION (#6088). ACP IDE sessions do not run on the \
-              full thread/turn runtime yet, so `run_agentic_prompt_turn` \
-              drives its own bounded tool-round loop. #5835 (IDE stage 2) \
-              converges them onto `Engine::run_turn`; when it lands, delete \
-              the loop and this entry together.",
-    },
-    AllowedTurnLoop {
-        path: "crates/tui/src/tools/subagent/mod.rs",
-        owner: "run_subagent",
-        why: "INTERIM EXCEPTION (#6504). Sub-agents drive their own model/tool \
-              rounds through `request_subagent_model_response_with_retries` \
-              instead of `Engine::run_turn`. It was invisible to this guard \
-              until #6511 widened the model-call marker; #6504 converges the \
-              child onto the Engine. Delete the loop and this entry together.",
-    },
-    AllowedTurnLoop {
-        path: "crates/tui/src/rlm/turn.rs",
-        owner: "run_rlm_turn_impl",
-        why: "INTERIM EXCEPTION (#6511). The recursive sub-RLM (`rlm_query` \
-              from the Python REPL, `rlm/bridge.rs::dispatch_rlm`) runs \
-              paper Algorithm 1: root model writes code, the REPL runs it, \
-              the result is appended to its own history. It is bounded by \
-              MAX_RLM_ITERATIONS, forwards its events to the parent stream, \
-              keeps its whole history, and never returns an empty answer \
-              silently; converging it onto `Engine::run_turn` is the \
-              remaining work. Delete the loop and this entry together.",
-    },
-];
+}];
 
 // ---------------------------------------------------------------------------
 // Detection
@@ -275,8 +243,8 @@ fn sanitize(src: &str) -> String {
 /// Strip `#[cfg(test)]`-gated items. A test harness that drives rounds is not
 /// a shipped turn loop.
 fn strip_cfg_test(src: &str) -> String {
-    let chars: Vec<char> = src.chars().collect();
-    let mut out = chars.clone();
+    let chars: Vec<char> = sanitize(src).chars().collect();
+    let mut out: Vec<char> = src.chars().collect();
     let mut search_from = 0usize;
     let needle = "cfg(test)";
     while let Some(rel) = src[search_from..].find(needle) {
@@ -292,10 +260,36 @@ fn strip_cfg_test(src: &str) -> String {
         }
         let hash_ci = src[..hash].chars().count();
         let mut i = src[..search_from].chars().count();
-        while i < chars.len() && chars[i] != '{' && chars[i] != ';' {
+        // Skip the cfg attribute's close, then find this item's boundary.
+        // Commas end gated struct fields/initializers, while commas inside a
+        // function signature or generic type do not. Braces in strings and
+        // comments were already blanked by the same existing sanitizer.
+        while i < chars.len() && chars[i] != ']' {
             i += 1;
         }
-        if i >= chars.len() || chars[i] == ';' {
+        i += 1;
+        let mut nesting = 0usize;
+        let mut angles = 0usize;
+        while i < chars.len() {
+            match chars[i] {
+                '(' | '[' => nesting += 1,
+                ')' | ']' => nesting = nesting.saturating_sub(1),
+                '<' if nesting == 0 => angles += 1,
+                '>' if nesting == 0 => angles = angles.saturating_sub(1),
+                '{' | ';' | ',' if nesting == 0 && angles == 0 => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        if i >= chars.len() {
+            continue;
+        }
+        if matches!(chars[i], ';' | ',') {
+            for slot in out.iter_mut().take(i + 1).skip(hash_ci) {
+                if *slot != '\n' {
+                    *slot = ' ';
+                }
+            }
             continue;
         }
         let mut depth = 0usize;
@@ -495,26 +489,292 @@ fn enclosing_fn(chars: &[char], at: usize) -> String {
     best.unwrap_or_else(|| "<unknown>".to_string())
 }
 
-/// Find every turn loop in one Rust source, by shape.
-fn detect_turn_loops(src: &str, rel_path: &str) -> Vec<TurnLoopSite> {
+/// A resolved local method, including the syntactic impl receiver. Matching
+/// `self.phase()` by its spelling alone would join unrelated impls.
+#[derive(Clone)]
+struct LocalMethod {
+    receiver: String,
+    name: String,
+    body: String,
+    open: usize,
+    close: usize,
+}
+
+fn matching_brace(chars: &[char], open: usize) -> usize {
+    let mut depth = 0usize;
+    for (at, ch) in chars.iter().enumerate().skip(open) {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return at;
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced source block at {open}");
+}
+
+/// Reuse the sanitized, balanced source rather than phase names or markers.
+/// Only inherent impls with literal receiver names are resolved. Unknown or
+/// ambiguous calls are refused when needed, rather than guessed across types.
+fn local_methods(prepared: &str) -> Vec<LocalMethod> {
+    let chars: Vec<char> = prepared.chars().collect();
+    let mut methods = Vec::new();
+    for (byte, _) in prepared.match_indices("impl ") {
+        if byte > 0 && is_ident_char(prepared[..byte].chars().next_back().unwrap()) {
+            continue;
+        }
+        let start = prepared[..byte].chars().count();
+        let Some(open_rel) = chars[start..].iter().position(|c| *c == '{') else {
+            continue;
+        };
+        let open = start + open_rel;
+        let header: String = chars[start + 5..open].iter().collect();
+        // Trait impls and generic/path receivers require more resolution than
+        // this literal local graph provides; direct shape detection remains.
+        let receiver = header.trim();
+        if receiver.is_empty() || !receiver.chars().all(is_ident_char) {
+            continue;
+        }
+        let close = matching_brace(&chars, open);
+        let impl_body: String = chars[open + 1..close].iter().collect();
+        for (fn_byte, _) in impl_body.match_indices("fn ") {
+            if fn_byte > 0 && is_ident_char(impl_body[..fn_byte].chars().next_back().unwrap()) {
+                continue;
+            }
+            let rest = &impl_body[fn_byte + 3..];
+            let name_end = rest.find(|c: char| !is_ident_char(c)).unwrap_or(rest.len());
+            if name_end == 0 {
+                continue;
+            }
+            let fn_start = open + 1 + impl_body[..fn_byte].chars().count();
+            let Some(body_rel) = chars[fn_start..close].iter().position(|c| *c == '{') else {
+                continue;
+            };
+            let body_open = fn_start + body_rel;
+            let signature: String = chars[fn_start..body_open].iter().collect();
+            if signature.contains(';')
+                || !signature
+                    .split(|c: char| !is_ident_char(c))
+                    .any(|v| v == "self")
+            {
+                continue;
+            }
+            let body_close = matching_brace(&chars, body_open);
+            methods.push(LocalMethod {
+                receiver: receiver.to_string(),
+                name: rest[..name_end].to_string(),
+                body: chars[body_open..=body_close].iter().collect(),
+                open: body_open,
+                close: body_close,
+            });
+        }
+    }
+    methods
+}
+
+type MethodGraph = BTreeMap<(String, String), Vec<String>>;
+
+fn method_graph(sources: &[String]) -> MethodGraph {
+    let mut graph = MethodGraph::new();
+    for (index, source) in sources.iter().enumerate() {
+        let prepared = sanitize(&strip_cfg_test(source));
+        let compact: String = prepared.chars().filter(|c| !c.is_whitespace()).collect();
+        let tokens: Vec<&str> = prepared
+            .split(|c: char| !is_ident_char(c))
+            .filter(|s| !s.is_empty())
+            .collect();
+        for method in local_methods(&prepared) {
+            if index + 1 != sources.len() {
+                // A child contributes to its parent's inherent impl only
+                // through a literal parent binding, with no local same-named
+                // type. Unrelated imports/local types are scanned at their
+                // own file but cannot impersonate the parent's phase owner.
+                let parent_binding = compact.contains("usesuper::*;")
+                    || compact.contains(&format!("usesuper::{};", method.receiver));
+                let local_type = tokens.windows(2).any(|pair| {
+                    matches!(pair[0], "struct" | "enum" | "type" | "union")
+                        && pair[1] == method.receiver
+                });
+                if !parent_binding || local_type {
+                    continue;
+                }
+            }
+            graph
+                .entry((method.receiver, method.name))
+                .or_default()
+                .push(method.body);
+        }
+    }
+    graph
+}
+
+/// A helper's own loops are independently scanned at their lexical owner.
+/// Do not transfer a delegated loop's effects into its caller and thereby
+/// conceal a second owner. Ordinary blocks/async expressions stay intact.
+fn without_owned_loops(body: &str) -> String {
+    let mut chars: Vec<char> = body.chars().collect();
+    for (_, open, close) in loop_bodies(&chars) {
+        for ch in &mut chars[open..=close] {
+            if *ch != '\n' {
+                *ch = ' ';
+            }
+        }
+    }
+    chars.into_iter().collect()
+}
+
+/// Once a `self` call resolves locally, its method name is not evidence of a
+/// provider call: inspect its real body. For example an actual snapshot
+/// `*_before_complete` helper must not turn a human-operation dispatcher into
+/// a model loop merely because it has the old broad suffix. Unresolved calls
+/// keep the original conservative marker rule.
+fn without_resolved_model_names(body: &str, receiver: &str, graph: &MethodGraph) -> String {
+    let mut edits = Vec::new();
+    for (at, _) in body.match_indices('(') {
+        let before = body[..at].trim_end();
+        let start = before
+            .rfind(|c: char| !is_ident_char(c))
+            .map_or(0, |i| i + 1);
+        let name = &before[start..];
+        if is_model_call(name)
+            && method_receiver(body, start) == Some("self")
+            && graph.contains_key(&(receiver.to_string(), name.to_string()))
+        {
+            edits.push((start, start + name.len()));
+        }
+    }
+    let mut result = body.as_bytes().to_vec();
+    for (start, end) in edits {
+        result[start..end].fill(b' ');
+    }
+    String::from_utf8(result).unwrap()
+}
+
+fn resolved_loop_body(
+    body: &str,
+    receiver: &str,
+    graph: &MethodGraph,
+    delegates: &BTreeSet<(String, String)>,
+) -> (String, Vec<String>) {
+    let mut resolved = without_resolved_model_names(body, receiver, graph);
+    let mut pending = vec![body.to_string()];
+    let mut visited = BTreeSet::new();
+    let mut ambiguous = Vec::new();
+    while let Some(current) = pending.pop() {
+        for (at, _) in current.match_indices('(') {
+            let before = current[..at].trim_end();
+            let name_start = before
+                .rfind(|c: char| !is_ident_char(c))
+                .map_or(0, |i| i + 1);
+            let name = &before[name_start..];
+            if method_receiver(&current, name_start) != Some("self")
+                || !visited.insert(name.to_string())
+            {
+                continue;
+            }
+            let key = (receiver.to_string(), name.to_string());
+            if delegates.contains(&key) {
+                continue;
+            }
+            let Some(bodies) = graph.get(&key) else {
+                continue; // external/parent methods cannot be invented here
+            };
+            if bodies.len() != 1 {
+                ambiguous.push(format!("{receiver}::{name}"));
+            }
+            // Conditional platform impls may have several definitions. Union
+            // their possible effects conservatively, then refuse ambiguity
+            // only if those effects could constitute a turn loop.
+            for body in bodies {
+                let contribution = without_owned_loops(body);
+                resolved.push_str(&without_resolved_model_names(
+                    &contribution,
+                    receiver,
+                    graph,
+                ));
+                pending.push(contribution);
+            }
+        }
+    }
+    (resolved, ambiguous)
+}
+
+/// Entry dispatchers that call an independently owned turn loop are
+/// delegation, not phases. Find those owners by the same shape rule, then
+/// propagate only this boundary through actual same-receiver call edges.
+fn delegated_loop_boundaries(graph: &MethodGraph) -> BTreeSet<(String, String)> {
+    let mut boundaries = BTreeSet::new();
+    for (key, bodies) in graph {
+        for body in bodies {
+            let chars: Vec<char> = body.chars().collect();
+            for (_, open, close) in loop_bodies(&chars) {
+                let direct: String = chars[open..=close].iter().collect();
+                let (resolved, _) = resolved_loop_body(&direct, &key.0, graph, &BTreeSet::new());
+                if drives_a_model(&resolved)
+                    && dispatches_tool_calls(&resolved)
+                    && assembles_prompt_history(&resolved)
+                {
+                    boundaries.insert(key.clone());
+                }
+            }
+        }
+    }
+    loop {
+        let before = boundaries.len();
+        for (key, bodies) in graph {
+            if bodies.iter().any(|body| {
+                called_identifiers(body).any(|name| {
+                    body.match_indices(name)
+                        .any(|(at, _)| method_receiver(body, at) == Some("self"))
+                        && boundaries.contains(&(key.0.clone(), name.to_string()))
+                })
+            }) {
+                boundaries.insert(key.clone());
+            }
+        }
+        if boundaries.len() == before {
+            return boundaries;
+        }
+    }
+}
+
+/// Find every turn loop by shape, following only resolved same-receiver local
+/// calls in its declared source closure. No method name is an exemption.
+fn detect_turn_loops_with_graph(
+    src: &str,
+    rel_path: &str,
+    graph: &MethodGraph,
+) -> Vec<TurnLoopSite> {
     let prepared = sanitize(&strip_cfg_test(src));
+    let methods = local_methods(&prepared);
+    let delegates = delegated_loop_boundaries(graph);
     let chars: Vec<char> = prepared.chars().collect();
     let mut sites: Vec<TurnLoopSite> = Vec::new();
     for (keyword, open, close) in loop_bodies(&chars) {
-        let body: String = chars[open..=close.max(open)].iter().collect();
-        if !drives_a_model(&body) {
+        let direct: String = chars[open..=close.max(open)].iter().collect();
+        let (body, ambiguous) = methods
+            .iter()
+            .find(|m| m.open <= open && close <= m.close)
+            .map_or_else(
+                || (direct.clone(), Vec::new()),
+                |m| resolved_loop_body(&direct, &m.receiver, graph, &delegates),
+            );
+        if !(drives_a_model(&body)
+            && dispatches_tool_calls(&body)
+            && assembles_prompt_history(&body))
+        {
             continue;
         }
-        if !dispatches_tool_calls(&body) {
-            continue;
-        }
-        if !assembles_prompt_history(&body) {
-            continue;
-        }
+        assert!(
+            ambiguous.is_empty(),
+            "ambiguous local turn-loop phase resolution: {ambiguous:?}"
+        );
         let owner = enclosing_fn(&chars, open);
         let line = chars[..open].iter().filter(|c| **c == '\n').count() + 1;
-        // One finding per (file, enclosing function): nested loops inside one
-        // turn loop are the same turn loop.
         if sites.iter().any(|s| s.owner == owner) {
             continue;
         }
@@ -526,6 +786,71 @@ fn detect_turn_loops(src: &str, rel_path: &str) -> Vec<TurnLoopSite> {
         });
     }
     sites
+}
+
+fn detect_turn_loops(src: &str, rel_path: &str) -> Vec<TurnLoopSite> {
+    detect_turn_loops_with_graph(src, rel_path, &method_graph(&[src.to_string()]))
+}
+
+/// Follow ordinary literal out-of-line modules, not every file in a directory.
+/// This is a finite local closure. Test-only declarations are blanked first;
+/// missing declared files fail instead of silently dropping a phase.
+fn local_module_sources(file: &Path, seen: &mut BTreeSet<PathBuf>, out: &mut Vec<String>) {
+    let file = file.canonicalize().expect("declared module source exists");
+    if !seen.insert(file.clone()) {
+        return;
+    }
+    let source = std::fs::read_to_string(&file).expect("read declared module source");
+    let prepared = sanitize(&strip_cfg_test(&source));
+    let base = if matches!(
+        file.file_name().and_then(|n| n.to_str()),
+        Some("lib.rs" | "main.rs" | "mod.rs")
+    ) {
+        file.parent().unwrap().to_path_buf()
+    } else {
+        file.with_extension("")
+    };
+    for (at, _) in prepared.match_indices("mod ") {
+        if at > 0 && is_ident_char(prepared[..at].chars().next_back().unwrap()) {
+            continue;
+        }
+        // Inline-module declarations need their own lexical directory and
+        // are not folded into this file's local method namespace.
+        if prepared[..at].chars().fold(0isize, |depth, ch| match ch {
+            '{' => depth + 1,
+            '}' => depth - 1,
+            _ => depth,
+        }) != 0
+        {
+            continue;
+        }
+        let rest = prepared[at + 4..].trim_start();
+        let end = rest.find(|c: char| !is_ident_char(c)).unwrap_or(rest.len());
+        if end == 0 || !rest[end..].trim_start().starts_with(';') {
+            continue;
+        }
+        // An explicit path is not guessed as a conventional module. Leave it
+        // unresolved so the required owner's stale-entry assertion can fail.
+        let line_prefix = prepared[..at]
+            .rsplit_once([';', '{', '}'])
+            .map_or(&prepared[..at], |(_, p)| p);
+        if line_prefix.contains("path") {
+            continue;
+        }
+        let named = base.join(format!("{}.rs", &rest[..end]));
+        let directory = base.join(&rest[..end]).join("mod.rs");
+        let child = match (named.is_file(), directory.is_file()) {
+            (true, false) => named,
+            (false, true) => directory,
+            _ => panic!(
+                "missing or ambiguous declared module {} in {}",
+                &rest[..end],
+                file.display()
+            ),
+        };
+        local_module_sources(&child, seen, out);
+    }
+    out.push(source);
 }
 
 // ---------------------------------------------------------------------------
@@ -616,7 +941,27 @@ fn workspace_declares_exactly_one_turn_loop() {
             continue;
         };
         scanned += 1;
-        sites.extend(detect_turn_loops(&text, &rel_slash(&root, file)));
+        let prepared = sanitize(&strip_cfg_test(&text));
+        let chars: Vec<char> = prepared.chars().collect();
+        let needs_local_closure = loop_bodies(&chars).iter().any(|(_, open, close)| {
+            let body: String = chars[*open..=*close].iter().collect();
+            body.contains("self")
+        });
+        if needs_local_closure {
+            let mut sources = Vec::new();
+            local_module_sources(file, &mut BTreeSet::new(), &mut sources);
+            let resolved = std::panic::catch_unwind(|| {
+                detect_turn_loops_with_graph(
+                    &text,
+                    &rel_slash(&root, file),
+                    &method_graph(&sources),
+                )
+            })
+            .unwrap_or_else(|_| panic!("local turn-loop resolution failed in {}", file.display()));
+            sites.extend(resolved);
+        } else {
+            sites.extend(detect_turn_loops(&text, &rel_slash(&root, file)));
+        }
     }
     assert!(
         scanned > 100,
@@ -786,4 +1131,223 @@ fn core_does_not_reintroduce_a_placeholder_engine_module() {
          boundary type that does real work belongs in a named module, not a \
          second `engine`."
     );
+}
+
+#[test]
+fn detector_follows_resolved_phases_across_declared_modules() {
+    let root = r#"impl DifferentName { async fn outer(&mut self) {
+        loop { self.request_phase().await; self.apply_phase().await; }
+    } }"#;
+    let request = r#"use super::*; impl DifferentName { async fn request_phase(&mut self) {
+        messages.push(input); client.create_message_stream(request).await;
+    } }"#;
+    let apply = r#"use super::*; impl DifferentName { async fn apply_phase(&mut self) {
+        self.execute_tool_calls(calls).await;
+    } }"#;
+    let graph = method_graph(&[request.into(), apply.into(), root.into()]);
+    let sites = detect_turn_loops_with_graph(root, "arbitrary.rs", &graph);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].owner, "outer");
+    // A missing phase cannot produce a green approximation of the owner.
+    let missing = method_graph(&[request.into(), root.into()]);
+    assert!(detect_turn_loops_with_graph(root, "arbitrary.rs", &missing).is_empty());
+}
+
+#[test]
+fn detector_local_call_cycles_are_finite_and_do_not_join_unrelated_impls() {
+    let src = r#"
+        impl A {
+            async fn renamed(&mut self) { loop { self.first().await; } }
+            async fn first(&mut self) { self.second().await; }
+            async fn second(&mut self) { self.first().await;
+                client.create_message_stream(req).await;
+                self.execute_tool_calls(calls).await; messages.push(msg);
+            }
+        }
+        impl B { fn first(&mut self) { history.push(msg); } }
+    "#;
+    let sites = detect_turn_loops(src, "cycles.rs");
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].owner, "renamed");
+    let unrelated = r#"
+        impl A { fn outer(&mut self) { loop { self.first(); } }
+                 fn first(&mut self) { messages.push(msg); } }
+        impl B { fn first(&mut self) {
+            client.create_message_stream(req); execute_tool_calls(calls);
+        } }
+    "#;
+    assert!(detect_turn_loops(unrelated, "unrelated.rs").is_empty());
+}
+
+#[test]
+fn detector_does_not_hide_two_phased_owners_or_a_foreign_inline_loop() {
+    let src = r#"impl Owner {
+        fn one(&mut self) { loop { self.model(); self.results(); } }
+        fn two(&mut self) { loop { self.model(); self.results(); } }
+        fn model(&mut self) { client.create_message_stream(req); }
+        fn results(&mut self) { execute_tool_calls(calls); history.push(msg); }
+    }
+    fn foreign() { loop { client.create_message_stream(req);
+        execute_tool_calls(calls); history.push(msg); } }
+    "#;
+    let sites = detect_turn_loops(src, "more_than_one.rs");
+    let owners: BTreeSet<&str> = sites.iter().map(|s| s.owner.as_str()).collect();
+    assert_eq!(owners, BTreeSet::from(["one", "two", "foreign"]));
+}
+
+#[test]
+fn detector_does_not_transfer_a_delegated_loop_to_its_caller() {
+    let src = r#"impl Owner {
+        fn transport(&mut self) { loop { self.other_owner(); } }
+        fn other_owner(&mut self) { loop { self.request(); self.results(); } }
+        fn request(&mut self) { client.create_message_stream(req); }
+        fn results(&mut self) { execute_tool_calls(calls); history.push(msg); }
+    }"#;
+    let sites = detect_turn_loops(src, "delegated.rs");
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].owner, "other_owner");
+}
+
+#[test]
+fn detector_ignores_test_only_effects_and_refuses_ambiguous_methods() {
+    let root = r#"impl Owner { fn outer(&mut self) { loop { self.phase(); } } }
+        #[cfg(test)] impl Owner { fn phase(&mut self) {
+            client.create_message_stream(req); execute_tool_calls(calls); messages.push(msg);
+        } }"#;
+    assert!(detect_turn_loops(root, "tests.rs").is_empty());
+    let one = "use super::*; impl Owner { fn phase(&mut self) { client.create_message_stream(req); execute_tool_calls(calls); messages.push(msg); } }";
+    let graph = method_graph(&[one.into(), one.into(), root.into()]);
+    assert!(
+        std::panic::catch_unwind(|| detect_turn_loops_with_graph(root, "ambiguous.rs", &graph))
+            .is_err()
+    );
+}
+
+#[test]
+fn local_module_closure_reads_only_declared_production_sources() {
+    let dir = std::env::temp_dir().join(format!(
+        "cw-turn-phases-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(dir.join("outer")).unwrap();
+    let root = dir.join("outer.rs");
+    std::fs::write(&root, "mod phase; #[cfg(test)] mod absent; impl Owner { fn outer(&mut self) { loop { self.phase(); } } }").unwrap();
+    std::fs::write(dir.join("outer/phase.rs"), "use super::*; impl Owner { fn phase(&mut self) { client.create_message_stream(req); execute_tool_calls(calls); messages.push(msg); } }").unwrap();
+    std::fs::write(
+        dir.join("outer/undeclared.rs"),
+        "impl Owner { fn phase(&mut self) { } }",
+    )
+    .unwrap();
+    let mut sources = Vec::new();
+    local_module_sources(&root, &mut BTreeSet::new(), &mut sources);
+    assert_eq!(sources.len(), 2);
+    assert_eq!(
+        detect_turn_loops_with_graph(&sources[1], "outer.rs", &method_graph(&sources)).len(),
+        1
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn gated_fields_and_initializers_do_not_unbalance_the_local_graph() {
+    let src = r#"struct Owner {
+        #[cfg(test)] hidden: std::collections::BTreeMap<String, String>,
+        actual: bool,
+    }
+    impl Owner {
+        fn new() -> Self { Self { #[cfg(test)] hidden: value, actual: true } }
+        #[cfg(test)] fn fixture(&self, first: bool, second: bool) {
+            let text = "{not a brace}";
+        }
+        fn outer(&mut self) { loop { self.phase(); } }
+        fn phase(&mut self) { client.create_message_stream(req); execute_tool_calls(calls); history.push(msg); }
+    }"#;
+    let sites = detect_turn_loops(src, "field.rs");
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].owner, "outer");
+}
+
+#[test]
+fn resolved_completion_named_snapshot_helper_is_not_a_model_call() {
+    let src = r#"impl Owner {
+        fn operations(&mut self) { loop { self.snapshot_before_complete(); self.results(); } }
+        fn snapshot_before_complete(&mut self) { persist_snapshot(); }
+        fn results(&mut self) { execute_tool_calls(calls); history.push(msg); }
+    }"#;
+    assert!(detect_turn_loops(src, "completion.rs").is_empty());
+    // An unresolved provider helper remains conservatively visible, and a
+    // locally resolved provider helper is followed to its real client call.
+    let unknown = src.replace(
+        "fn snapshot_before_complete(&mut self) { persist_snapshot(); }",
+        "",
+    );
+    assert_eq!(detect_turn_loops(&unknown, "unknown.rs").len(), 1);
+    let actual = src.replace("persist_snapshot();", "client.create_message_stream(req);");
+    assert_eq!(detect_turn_loops(&actual, "actual.rs").len(), 1);
+}
+
+#[test]
+fn same_named_child_type_or_unrelated_import_cannot_impersonate_a_phase() {
+    let root = "impl Owner { fn outer(&mut self) { loop { self.phase(); } } }";
+    let effects = "impl Owner { fn phase(&mut self) { client.create_message_stream(req); execute_tool_calls(calls); history.push(msg); } }";
+    let shadow = format!("use super::*; struct Owner; {effects}");
+    let unrelated = format!("use unrelated::Owner; {effects}");
+    for child in [shadow, unrelated, effects.to_string()] {
+        let graph = method_graph(&[child, root.to_string()]);
+        assert!(detect_turn_loops_with_graph(root, "owner.rs", &graph).is_empty());
+    }
+    // False-green counterpart: an unrelated child's non-provider method
+    // cannot erase a real unresolved model marker on the root receiver.
+    let actual_root = "impl Owner { fn outer(&mut self) { loop { self.create_message_stream(req); execute_tool_calls(calls); history.push(msg); } } }";
+    for child in [
+        "use super::*; struct Owner; impl Owner { fn create_message_stream(&mut self) { } }",
+        "use unrelated::Owner; impl Owner { fn create_message_stream(&mut self) { } }",
+    ] {
+        let graph = method_graph(&[child.to_string(), actual_root.to_string()]);
+        assert_eq!(
+            detect_turn_loops_with_graph(actual_root, "actual.rs", &graph).len(),
+            1
+        );
+    }
+    for import in ["use super::*;", "use super::Owner;"] {
+        let child = format!("{import} {effects}");
+        let graph = method_graph(&[child, root.to_string()]);
+        assert_eq!(
+            detect_turn_loops_with_graph(root, "owner.rs", &graph).len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn rlm_cannot_reintroduce_client_only_authority_or_a_direct_provider_producer() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("tui/src");
+    for path in [
+        "rlm/bridge.rs",
+        "rlm/turn.rs",
+        "tools/rlm.rs",
+        "core/engine/rlm_host.rs",
+    ] {
+        let source = std::fs::read_to_string(root.join(path)).unwrap();
+        let production = sanitize(&strip_cfg_test(&source));
+        for retired in [
+            "ModelClientRlmAdapter",
+            "RlmLlmClient",
+            "run_rlm_turn_impl",
+            "create_message_boxed",
+            "create_message_stream",
+        ] {
+            assert!(
+                !production.contains(retired),
+                "{path} reintroduced retired model authority {retired}"
+            );
+        }
+    }
 }

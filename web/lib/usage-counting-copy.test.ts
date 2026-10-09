@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { USAGE_COUNTING_COPY } from "./content/usage-counting";
-import { PRIVACY_SECTIONS } from "./legal-copy";
+import { WEBSITE_USAGE_DISCLOSURE } from "./legal-copy";
 import { PRODUCT_COUNTER_FIELDS, type ProductCounter } from "./telemetry/product-usage";
 
 // How the public copy names each counter the website can send.
@@ -44,7 +44,7 @@ function recordedCounters(): Set<string> {
 
 describe("usage-counting copy", () => {
   const recorded = recordedCounters();
-  const privacy = PRIVACY_SECTIONS.find((s) => s.title === "Anonymous usage counting")?.body ?? "";
+  const privacy = WEBSITE_USAGE_DISCLOSURE.body;
 
   it("only names website counters the copy knows how to describe", () => {
     for (const counter of recorded) {

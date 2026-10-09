@@ -1,7 +1,6 @@
 //! Cucumber acceptance test for the public LLM/tool lifecycle.
 
 use std::io::Read;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -112,7 +111,7 @@ async fn user_asks(world: &mut ToolLifecycleWorld, prompt: String) {
     world.stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         output.status.success(),
-        "codewhale-tui exec failed\nstdout:\n{}\nstderr:\n{}",
+        "codewhale exec failed\nstdout:\n{}\nstderr:\n{}",
         world.stdout,
         world.stderr
     );
@@ -552,7 +551,7 @@ fn run_codewhale_exec(
         .to_path_buf();
     let home = world.home.as_ref().expect("home").path().to_path_buf();
 
-    let mut command = Command::new(codewhale_tui_binary());
+    let mut command = Command::new(crate::binary::codewhale());
     preserve_host_env(&mut command);
     command
         .current_dir(&workspace)
@@ -595,11 +594,11 @@ fn run_codewhale_exec(
 }
 
 fn run_with_timeout(mut command: Command, timeout: Duration) -> std::process::Output {
-    let mut child = command.spawn().expect("spawn codewhale-tui exec");
+    let mut child = command.spawn().expect("spawn codewhale exec");
     let stdout_reader = read_pipe_in_background(child.stdout.take().expect("stdout pipe"));
     let stderr_reader = read_pipe_in_background(child.stderr.take().expect("stderr pipe"));
 
-    let status = match child.wait_timeout(timeout).expect("wait for codewhale-tui") {
+    let status = match child.wait_timeout(timeout).expect("wait for codewhale") {
         Some(status) => status,
         None => {
             let _ = child.kill();
@@ -607,7 +606,7 @@ fn run_with_timeout(mut command: Command, timeout: Duration) -> std::process::Ou
             let stdout = join_pipe_reader(stdout_reader, "stdout");
             let stderr = join_pipe_reader(stderr_reader, "stderr");
             panic!(
-                "codewhale-tui exec timed out after {timeout:?}\nstdout:\n{}\nstderr:\n{}",
+                "codewhale exec timed out after {timeout:?}\nstdout:\n{}\nstderr:\n{}",
                 String::from_utf8_lossy(&stdout),
                 String::from_utf8_lossy(&stderr)
             );
@@ -944,21 +943,4 @@ fn assert_expected_action(event: &Value, expected: &[(String, String)]) {
         Some(&json!(action)),
         "canonical tool action should be visible in the lifecycle event"
     );
-}
-
-fn codewhale_tui_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-
-    let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
-    path
 }

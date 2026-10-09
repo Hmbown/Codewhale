@@ -6,10 +6,12 @@ import os from "node:os";
 import { deflateRawSync } from "node:zlib";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { newerVersion, releaseUpdate, validateReleaseZip, readUpdateResult } from "../app/updates.mjs";
+import { newerVersion, releaseUpdate, checkForUpdate, prepareUpdate, validateReleaseZip, readUpdateResult } from "../app/updates.mjs";
 import { replaceMacBundle } from "../app/install-macos.mjs";
+import { APP_VERSION } from "../src/app-socket.mjs";
 
-const release = () => ({ tag_name:"v0.4.0",assets:[{name:"Codewhale-Computer-Use-0.4.0-macos-universal.zip",browser_download_url:"https://github.com/Hmbown/codewhale-cu-plugin/releases/download/v0.4.0/Codewhale-Computer-Use-0.4.0-macos-universal.zip",digest:`sha256:${"a".repeat(64)}`,size:1024}] });
+const release = (version="0.4.0") => ({ tag_name:`v${version}`,assets:[{name:`Codewhale-Computer-Use-${version}-macos-universal.zip`,browser_download_url:`https://github.com/codewhale-hq/codewhale-cu-plugin/releases/download/v${version}/Codewhale-Computer-Use-${version}-macos-universal.zip`,digest:`sha256:${"a".repeat(64)}`,size:1024}] });
+const nextVersion = APP_VERSION.replace(/\d+$/,patch=>String(Number(patch)+1));
 test("updates only offer a newer stable installer with the exact release identity",()=>{
   assert.equal(newerVersion("0.10.0","0.9.13"),true);
   for(const value of ["0.9.13","0.8.0","0.10.0-beta","v0.10.0","nonsense"]) assert.equal(newerVersion(value,"0.9.13"),false);
@@ -18,6 +20,32 @@ test("updates only offer a newer stable installer with the exact release identit
   for(const change of [{digest:null},{size:Infinity},{size:512*1024*1024},{browser_download_url:"https://example.org/app.zip"},{name:"unexpected.zip"}]) {
     const data=release(); Object.assign(data.assets[0],change); assert.equal(releaseUpdate(data,"0.3.0").available,false);
   }
+  for(const owner of ["Hmbown","other-owner"]) {
+    const data=release(); data.assets[0].browser_download_url=data.assets[0].browser_download_url.replace("/codewhale-hq/",`/${owner}/`);
+    assert.equal(releaseUpdate(data,"0.3.0").available,false);
+  }
+});
+test("update discovery uses the canonical API and refuses redirects",async t=>{
+  const request=t.mock.method(globalThis,"fetch",async(url,options)=>{
+    assert.equal(url,"https://api.github.com/repos/codewhale-hq/codewhale-cu-plugin/releases/latest");
+    assert.equal(options.redirect,"error");
+    assert.equal(options.headers.Accept,"application/vnd.github+json");
+    assert.ok(options.signal instanceof AbortSignal);
+    return new Response(JSON.stringify(release(nextVersion)),{status:200});
+  });
+  const update=await checkForUpdate();
+  assert.equal(update.available,true);
+  assert.equal(update.url,release(nextVersion).assets[0].browser_download_url);
+  assert.equal(request.mock.callCount(),1);
+});
+test("update preparation rejects legacy and foreign repository identities before downloading",async t=>{
+  const request=t.mock.method(globalThis,"fetch",()=>{throw new Error("Unexpected update download");});
+  const update=releaseUpdate(release(nextVersion));
+  assert.equal(update.available,true);
+  for(const owner of ["Hmbown","other-owner"]) {
+    await assert.rejects(prepareUpdate({...update,url:update.url.replace("/codewhale-hq/",`/${owner}/`)}),/The update identity is invalid/);
+  }
+  assert.equal(request.mock.callCount(),0);
 });
 function zip(name,{kind=0x8000,localName=name,size=1,payload=Buffer.from("x"),method=0}={}) {
   const local=Buffer.alloc(30); local.writeUInt32LE(0x04034b50); local.writeUInt16LE(Buffer.byteLength(localName),26); local.writeUInt32LE(payload.length,18); local.writeUInt32LE(size,22); local.writeUInt16LE(method,8);

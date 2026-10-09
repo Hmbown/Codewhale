@@ -34,8 +34,8 @@ export const GETTING_STARTED_STEPS: GuideStep[] = [
     id: "install",
     title: { en: "Install Codewhale", zh: "安装 Codewhale" },
     body: {
-      en: "The command below installs the latest published release on macOS or Linux into ~/.local/bin. If that folder is not on your PATH yet, the installer prints the one line to add for your shell; run it before the next steps. Use the install guide for Windows, package managers, or building the unreleased source candidate.",
-      zh: "下方命令会在 macOS 或 Linux 上把最新发布版本安装到 ~/.local/bin。如果该目录还不在 PATH 中，安装程序会打印适用于你所用 shell 的一行命令；请先运行它，再进行后续步骤。Windows、包管理器以及未发布候选版的源码构建方式，请参阅安装指南。",
+      en: "Install the latest release on macOS or Linux. Follow any PATH instruction the installer prints, then open a folder where you want to work. The guide covers Windows and other install options.",
+      zh: "在 macOS 或 Linux 上安装最新发布版本。按安装程序的提示完成 PATH 设置，然后打开你想工作的文件夹。Windows 和其他安装方式见指南。",
     },
     commands: ["curl -fsSL https://codewhale.net/install.sh | sh"],
     link: {
@@ -47,8 +47,8 @@ export const GETTING_STARTED_STEPS: GuideStep[] = [
     id: "connect-provider",
     title: { en: "Connect your model", zh: "连接你的模型" },
     body: {
-      en: "Codewhale needs a model to answer. Save your own provider key, as in the DeepSeek example below, or run a local model such as Ollama, which needs no key. You pay the provider directly.",
-      zh: "Codewhale 需要一个模型来回答问题。你可以像下方的 DeepSeek 示例那样保存自己的提供商密钥，也可以运行 Ollama 等本地模型，本地模型不需要密钥。费用由你直接付给提供商。",
+      en: "Use a model API you already have, or connect local or self-hosted inference. The command below saves a DeepSeek key; local Ollama models do not need an API key.",
+      zh: "使用你已有的模型 API，或连接本地、自托管推理服务。下方命令用于保存 DeepSeek 密钥；本地 Ollama 模型无需 API 密钥。",
     },
     commands: ["codewhale auth set --provider deepseek"],
     link: {
@@ -58,10 +58,10 @@ export const GETTING_STARTED_STEPS: GuideStep[] = [
   },
   {
     id: "first-session",
-    title: { en: "Give it a task", zh: "交给它一项任务" },
+    title: { en: "Describe your first task", zh: "描述第一个任务" },
     body: {
-      en: "Open Codewhale in your project folder and ask for something concrete. (If codewhale is not found, add ~/.local/bin to your PATH as in step 1.) Start in /mode plan to have it explain the project without changing anything, then switch to /mode work for edits and commands. It shows each edit as a diff and asks before running a shell command.",
-      zh: "在项目文件夹中打开 Codewhale，交给它一件具体的事。（如果找不到 codewhale 命令，请按第 1 步把 ~/.local/bin 加入 PATH。）可以先用 /mode plan 让它在不改动任何东西的前提下讲解项目，需要修改文件或运行命令时再切换到 /mode work。它会以 diff 展示每一处修改，并在运行 shell 命令前先征求你的同意。",
+      en: "Start Codewhale and describe the result: a small app, a script that saves you time, or a report from your data. Choose its permissions, review what it does and steer it as you go.",
+      zh: "启动 Codewhale，说出你想要的结果：一个小应用、节省时间的脚本，或一份根据数据生成的报告。设定权限、查看它的工作，并随时调整方向。",
     },
     commands: ["codewhale"],
     link: {
@@ -71,15 +71,15 @@ export const GETTING_STARTED_STEPS: GuideStep[] = [
   },
   {
     id: "fleet-workflow",
-    title: { en: "Add a Fleet when you need one", zh: "需要时配置 Fleet" },
+    title: { en: "Use multiple agents", zh: "使用多个智能体" },
     body: {
-      en: "When a task would benefit from several models and roles, run /fleet setup inside Codewhale to save roles and the model each one uses. From your shell, codewhale fleet status counts the Fleet runs that are queued, running, or finished.",
-      zh: "当任务需要多个模型和角色配合时，可以在 Codewhale 中运行 /fleet setup，保存角色以及每个角色使用的模型。在 shell 中，codewhale fleet status 会统计排队中、运行中和已结束的 Fleet 运行。",
+      en: "Split a larger job across agents with different roles and models. Inside Codewhale, save your team with /fleet setup, then check its runs with /fleet status.",
+      zh: "把较大的任务分配给不同角色、不同模型的智能体。在 Codewhale 中用 /fleet setup 保存团队，再用 /fleet status 查看运行状态。",
     },
-    commands: ["/fleet setup", "codewhale fleet status"],
+    commands: ["/fleet setup", "/fleet status"],
     link: {
       href: "/docs/fleet",
-      label: { en: "Run a workflow", zh: "运行 Workflow" },
+      label: { en: "Set up a Fleet", zh: "配置 Fleet" },
     },
   },
 ];
@@ -107,11 +107,19 @@ export const GUIDE_NEXT_LINKS: { href: string; label: LocalizedText; note: Local
     },
   },
   {
+    href: "/docs/mcp",
+    label: { en: "Connect your tools", zh: "连接你常用的工具" },
+    note: {
+      en: "Connect an email tool through MCP, then ask Codewhale to turn the messages it can access into an action list.",
+      zh: "通过 MCP 连接邮件工具，再让 Codewhale 把可访问的邮件整理成行动清单。",
+    },
+  },
+  {
     href: "/docs/hooks",
     label: { en: "Run commands on events", zh: "在事件发生时运行命令" },
     note: {
-      en: "Run your own scripts when a session starts, before a tool call, or when a turn ends — to add context, enforce a rule, or get notified.",
-      zh: "在会话开始、工具调用之前或回合结束时运行你自己的脚本——用来补充上下文、执行规则或接收通知。",
+      en: "Run your own scripts when a session starts, before a tool call, or when a turn ends. Use them to add context, enforce a rule, or send a notification.",
+      zh: "在会话开始、工具调用之前或回合结束时运行你自己的脚本。可以用它们补充上下文、执行规则或发送通知。",
     },
   },
 ];

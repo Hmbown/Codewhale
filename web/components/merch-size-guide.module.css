@@ -1,0 +1,25 @@
+.guide { min-width: 0; margin-block: var(--section-gap); }
+.guide h2 { font-size: var(--text-section); margin-block-end: 1rem; }
+.guide p { max-width: 75ch; margin-block: .8rem; line-height: 1.65; }
+.note { color: var(--muted); font-size: var(--text-ui); }
+.controls { display: flex; flex-wrap: wrap; align-items: end; gap: 1.5rem 2rem; margin-block: 1.5rem; }
+.field { display: grid; gap: .5rem; min-width: 0; max-width: 100%; }
+.field label, .units legend { font-size: var(--text-ui); font-weight: 600; }
+.field select { width: 100%; max-width: 100%; min-height: 48px; padding: .75rem .85rem; border: 1px solid var(--line-strong); border-radius: var(--radius-control); background: var(--surface); color: var(--text); font: inherit; }
+.units { display: flex; flex-wrap: wrap; gap: .5rem 1rem; border: 0; padding: 0; margin: 0; min-width: 0; }
+.units legend { margin-block-end: .5rem; }
+.units label { display: inline-flex; align-items: center; gap: .5rem; min-height: 48px; cursor: pointer; }
+.units input { width: 1.15rem; height: 1.15rem; accent-color: var(--accent); }
+.tableScroll { max-width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius-control); }
+.tableScroll table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.tableScroll caption { text-align: start; padding: 1rem; font-weight: 600; }
+.tableScroll th, .tableScroll td { padding: .8rem 1rem; text-align: end; border-block-start: 1px solid var(--line); white-space: nowrap; }
+.tableScroll thead th { color: var(--muted); font-size: var(--text-ui); white-space: normal; }
+.tableScroll th:first-child { text-align: start; }
+.tableScroll tbody tr[data-confirmation] { background: var(--panel); }
+.tableScroll abbr { color: var(--accent); text-decoration: none; }
+.warning { border-inline-start: 3px solid var(--accent); padding-inline-start: 1rem; }
+.guide :is(select, input, a, .tableScroll):focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; }
+.guide a { text-underline-offset: .2em; }
+@media (max-width: 700px) { .controls { align-items: stretch; } .field { flex-basis: 100%; } .tableScroll th, .tableScroll td { padding: .75rem; } }
+@media (prefers-reduced-motion: reduce) { .guide *, .tableScroll { scroll-behavior: auto !important; transition: none !important; animation: none !important; } }

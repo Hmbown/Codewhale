@@ -1069,7 +1069,7 @@ impl WorkingSet {
     pub fn summary_block(&self, workspace: &Path) -> Option<String> {
         // Only stat-verified paths reach the model. Prose observation happily
         // records tokens that merely look like paths ("120x40",
-        // "Hmbown/CodeWhale"), and a fabricated Active-paths line teaches the
+        // "codewhale-hq/CodeWhale"), and a fabricated Active-paths line teaches the
         // model false workspace facts it then spends turns disproving.
         // Re-statting at render time also drops files deleted mid-session.
         // Bytes only change when the filesystem genuinely changed — the same
@@ -1735,7 +1735,7 @@ mod tests {
     #[test]
     fn summary_block_renders_only_paths_that_stat_verify() {
         // Prose observation records tokens that merely look like paths
-        // ("120x40", "Hmbown/CodeWhale"); the rendered Active-paths list must
+        // ("120x40", "codewhale-hq/CodeWhale"); the rendered Active-paths list must
         // never teach the model a workspace fact the filesystem contradicts.
         let tmp = TempDir::new().expect("tempdir");
         let src = tmp.path().join("src");
@@ -1744,14 +1744,14 @@ mod tests {
 
         let mut ws = WorkingSet::default();
         ws.observe_user_message(
-            "Fix src/real.rs, test at 120x40/80x24, and check Hmbown/CodeWhale",
+            "Fix src/real.rs, test at 120x40/80x24, and check codewhale-hq/CodeWhale",
             tmp.path(),
         );
 
         let block = ws.summary_block(tmp.path()).expect("block");
         assert!(block.contains("- src/real.rs (file)"), "{block}");
         assert!(!block.contains("120x40"), "{block}");
-        assert!(!block.contains("Hmbown/CodeWhale"), "{block}");
+        assert!(!block.contains("codewhale-hq/CodeWhale"), "{block}");
 
         // A file deleted mid-session falls out on the next render — the same
         // filesystem-changed exception #280 makes for newly observed paths.

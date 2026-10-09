@@ -1057,7 +1057,7 @@ fn compact_action_id(action_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ApiProvider, Config};
+    use crate::config::{Config, ProviderKind};
     use crate::tui::app::TuiOptions;
     use crate::tui::hotbar::HotbarActionRegistry;
     use codewhale_localization::{Locale, MessageId, tr};
@@ -1531,11 +1531,12 @@ mod tests {
     #[test]
     fn keyboard_controls_navigate_source_action_and_slot() {
         let mut config = Config {
-            provider: Some(ApiProvider::Deepseek.as_str().to_string()),
+            provider: Some(ProviderKind::Deepseek.as_str().to_string()),
             ..Config::default()
         };
         config
-            .provider_config_for_mut(ApiProvider::Openrouter)
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Openrouter))
+            .unwrap()
             .model = Some("anthropic/claude-sonnet-4".to_string());
         let app = test_app_with_config(&config);
         let mut view = HotbarSetupView::new(&app, &config);

@@ -2,13 +2,14 @@
   "name": "codewhale-web",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "description": "Community site for Codewhale \u2014 codewhale.net",
   "scripts": {
-    "dev": "node scripts/derive-facts.mjs && node scripts/derive-changelog.mjs && node scripts/derive-install.mjs && next dev",
+    "dev": "node scripts/opennext-config.mjs && node scripts/derive-facts.mjs && node scripts/derive-changelog.mjs && node scripts/derive-install.mjs && next dev",
     "prebuild": "node scripts/derive-facts.mjs && node scripts/derive-changelog.mjs && node scripts/derive-install.mjs",
     "build": "next build",
     "start": "next start",
-    "test": "vitest run",
+    "test": "node --test scripts/dependency-security.test.mjs && vitest run",
     "check": "npm run check:facts && npm run check:latest-release && npm run prebuild && npm run check:docs && npm run check:tokens && npm run lint && tsc --noEmit && npm run build",
     "check:facts": "node scripts/check-facts.mjs && node scripts/check-cloud-facts.mjs",
     "sync:latest-release": "node scripts/sync-latest-release.mjs",
@@ -21,22 +22,29 @@
     "compare:deployed-facts": "node scripts/compare-deployed-facts.mjs",
     "check:deployed-facts": "node scripts/compare-deployed-facts.mjs --require-current",
     "lint": "eslint .",
-    "preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview",
+    "build:opennext": "node scripts/opennext-config.mjs && opennextjs-cloudflare build --config .cloudflare/opennext.json",
+    "build:cloudflare": "npm run build:opennext && node node_modules/wrangler/bin/cf-wrangler.js build",
+    "preview": "npm run build:cloudflare && opennextjs-cloudflare populateCache local --config .cloudflare/opennext.json && node node_modules/wrangler/bin/cf-wrangler.js dev",
     "predeploy": "node scripts/check-kv-id.mjs",
-    "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
-    "cf-typegen": "wrangler types"
+    "deploy": "npm run build:cloudflare && opennextjs-cloudflare populateCache remote --config .cloudflare/opennext.json && cf deploy --prebuilt",
+    "cf-typegen": "cf workers types",
+    "postinstall": "node scripts/patch-braces.mjs",
+    "audit:dependencies": "node scripts/audit-dependencies.mjs"
   },
   "dependencies": {
-    "next": "^16.3.6",
+    "next": "^16.4.0",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "stripe": "23.0.0"
   },
   "devDependencies": {
-    "@opennextjs/cloudflare": "^1.20.6",
+    "@cloudflare/config": "0.23.0",
+    "@opennextjs/cloudflare": "^1.20.9",
     "@types/node": "^26.6.1",
     "@types/react": "^19.0.7",
     "@types/react-dom": "^19.2.5",
     "autoprefixer": "^10.6.1",
+    "cf": "1.0.0-beta.12",
     "eslint": "^9.39.4",
     "eslint-config-next": "^15.5.18",
     "github-slugger": "^2.0.0",
@@ -46,14 +54,15 @@
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.3",
     "vitest": "^4.1.11",
-    "wrangler": "^4.137.0"
+    "wrangler": "4.147.0"
   },
   "overrides": {
     "esbuild": "0.28.1",
     "nanoid": "^3.3.17",
     "postcss": "^8.5.18",
-    "sharp": "0.35.4",
+    "sharp": "0.35.5",
     "ws": "8.21.0",
-    "undici": "7.29.1"
+    "undici": "7.29.1",
+    "postcss-selector-parser": "7.1.6"
   }
 }

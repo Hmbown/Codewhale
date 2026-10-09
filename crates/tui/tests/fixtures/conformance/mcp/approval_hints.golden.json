@@ -1,0 +1,79 @@
+{
+  "server_received": [],
+  "steps": [
+    {
+      "op": "boot",
+      "outcome": "ok"
+    },
+    {
+      "op": "catalog",
+      "tools": [
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_confused"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_deleter"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_gentle_writer"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_plain"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_reader"
+        }
+      ]
+    },
+    {
+      "hints": {
+        "mcp_conformance_confused": "destructive",
+        "mcp_conformance_deleter": "destructive",
+        "mcp_conformance_gentle_writer": null,
+        "mcp_conformance_plain": null,
+        "mcp_conformance_reader": null
+      },
+      "op": "approval_hints"
+    }
+  ]
+}

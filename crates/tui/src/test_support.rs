@@ -37,7 +37,9 @@ pub(crate) fn isolated_test_state_root() -> &'static Path {
                 root.display()
             )
         });
-        root
+        // Match resolvers that canonicalize their root (macOS aliases /var to
+        // /private/var). Every fence must name the same physical test store.
+        root.canonicalize().expect("canonical test state root")
     })
 }
 
@@ -79,6 +81,35 @@ pub(crate) fn unsealed_test_state_root() -> PathBuf {
 
 thread_local! {
     static HOLDER_ROOT: OnceLock<PathBuf> = const { OnceLock::new() };
+}
+
+/// Where a state resolver must put `name` instead of the user's home: the
+/// isolated test root when no test has sealed the home (see [`home_is_sealed`]),
+/// `None` when one has and the resolver should follow the environment as
+/// production does.
+///
+/// Every resolver that reaches `~/.codewhale` and is reachable from a test
+/// needs this fence, because incidental callers (an `App` constructor, a
+/// command dispatch) never think about the home at all. Call it first, under
+/// `#[cfg(test)]`, so the production path stays byte-for-byte unchanged.
+///
+/// The directory is under the shared isolated root, not the per-holder one
+/// [`unsealed_test_state_root`] hands to lock holders: these resolvers are
+/// reached from worker threads as well as the test thread, and a test must see
+/// one directory from both. The directory exists when this returns, so callers
+/// need no filesystem call of their own on the fenced branch.
+pub(crate) fn unsealed_state_dir(name: impl AsRef<Path>) -> Option<PathBuf> {
+    if home_is_sealed() {
+        return None;
+    }
+    let dir = isolated_test_state_root().join(name);
+    std::fs::create_dir_all(&dir).unwrap_or_else(|error| {
+        panic!(
+            "failed to create the unsealed test state dir {}: {error}",
+            dir.display()
+        )
+    });
+    Some(dir)
 }
 
 /// A fixture workspace an OS sandbox can still see (#6305).
@@ -297,6 +328,37 @@ pub(crate) fn guarded_environment_provides_state_paths() -> bool {
     .any(|var| guarded_path_is_present(var))
 }
 
+/// Whether the calling test's live seal pins the user's *home* — the root that
+/// user state (sessions, snapshots, plugin bundles, logs) resolves under — as
+/// opposed to merely redirecting a config file.
+///
+/// The owner and workers enrolled through [`join_env_scope`] follow the seal.
+/// Unrelated parallel tests and workers without that scope use the isolated
+/// root: following another test's environment would race its restoration to
+/// the developer's real profile. Pass [`env_scope_ticket`] to workers that need
+/// their owner's home.
+///
+/// Stricter than [`guarded_environment_provides_state_paths`], which also
+/// accepts a guarded config-path override: such a test still resolves
+/// `~/.codewhale` for everything else. `CODEWHALE_HOME` outranks `HOME` when it
+/// is set, so a guarded `HOME` seals nothing while an unguarded
+/// `CODEWHALE_HOME` is in the ambient environment.
+pub(crate) fn home_is_sealed() -> bool {
+    if !current_thread_holds_test_env_lock() {
+        return false;
+    }
+    let present = |var: &str| {
+        std::env::var_os(var)
+            .is_some_and(|value| value.to_str().is_none_or(|text| !text.trim().is_empty()))
+    };
+    if present("CODEWHALE_HOME") {
+        return env_var_currently_guarded("CODEWHALE_HOME");
+    }
+    ["HOME", "USERPROFILE"]
+        .iter()
+        .any(|var| env_var_currently_guarded(var) && present(var))
+}
+
 impl EnvVarGuard {
     pub(crate) fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
         debug_assert!(
@@ -321,14 +383,14 @@ impl EnvVarGuard {
         register_guarded_env_key(key);
         Self { key, previous }
     }
-
-    pub(crate) fn previous(&self) -> Option<OsString> {
-        self.previous.clone()
-    }
 }
 
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
+        // Withdraw the claim *before* restoring the value: a reader on another
+        // thread that still saw the key as guarded would otherwise follow the
+        // restored — ambient, possibly real — path for the instant in between.
+        unregister_guarded_env_key(self.key);
         // SAFETY: callers hold the process-wide test env mutex until after this
         // guard is dropped.
         unsafe {
@@ -338,7 +400,94 @@ impl Drop for EnvVarGuard {
                 std::env::remove_var(self.key);
             }
         }
-        unregister_guarded_env_key(self.key);
+    }
+}
+
+/// Seal the user's home onto a directory the test owns, for the life of one
+/// test.
+///
+/// This is the one way a test takes the user's state out of play. It pins
+/// `HOME`, `USERPROFILE` and `CODEWHALE_HOME` through [`EnvVarGuard`] — so
+/// [`guarded_environment_provides_state_paths`] recognises the seal — and
+/// removes the aliases that would otherwise route around them
+/// (`HOMEDRIVE`/`HOMEPATH`, `CODEWHALE_CONFIG_PATH`, `DEEPSEEK_CONFIG_PATH`,
+/// `DEEPSEEK_HOME`). Pinning `HOME` alone is not a seal: an ambient
+/// `CODEWHALE_HOME` takes precedence over it, so a test that "scoped" only
+/// `HOME` still wrote the developer's real profile.
+///
+/// It holds the process-wide environment lock, which is not reentrant: keep
+/// one seal per test, and build any fixture that takes the lock itself
+/// (settings, diagnostics harnesses) after it. Anything that reads or writes
+/// the user's state — instructions, skills, sessions, snapshots, settings,
+/// credentials — then lands in the seal.
+pub(crate) struct SealedHome {
+    // Drop order matters: restore the environment, then delete the directory,
+    // then release the lock.
+    _vars: Vec<EnvVarGuard>,
+    _dir: Option<tempfile::TempDir>,
+    home: PathBuf,
+    codewhale_home: PathBuf,
+    _lock: TestEnvLock,
+}
+
+impl SealedHome {
+    /// Seal onto fresh, empty directories: `<tmp>/home` and
+    /// `<tmp>/codewhale-home`.
+    pub(crate) fn new() -> Self {
+        let lock = lock_test_env();
+        let dir = tempfile::TempDir::new().expect("sealed home tempdir");
+        let home = dir.path().join("home");
+        let codewhale_home = dir.path().join("codewhale-home");
+        std::fs::create_dir_all(&home).expect("sealed home dir");
+        std::fs::create_dir_all(&codewhale_home).expect("sealed codewhale home dir");
+        Self::pin(lock, Some(dir), home, codewhale_home)
+    }
+
+    /// Seal onto a home the test already owns: `HOME` is `home` and the
+    /// Codewhale home is `home/.codewhale`, the layout an unset
+    /// `CODEWHALE_HOME` resolves to. For tests whose fixtures are built under
+    /// one tempdir that also plays the home.
+    pub(crate) fn at(home: &Path) -> Self {
+        let lock = lock_test_env();
+        let codewhale_home = home.join(".codewhale");
+        Self::pin(lock, None, home.to_path_buf(), codewhale_home)
+    }
+
+    fn pin(
+        lock: TestEnvLock,
+        dir: Option<tempfile::TempDir>,
+        home: PathBuf,
+        codewhale_home: PathBuf,
+    ) -> Self {
+        // `CODEWHALE_HOME` first: it is dropped first, so the seal never
+        // outlives the override that outranks `HOME`.
+        let vars = vec![
+            EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home),
+            EnvVarGuard::set("HOME", &home),
+            EnvVarGuard::set("USERPROFILE", &home),
+            EnvVarGuard::remove("HOMEDRIVE"),
+            EnvVarGuard::remove("HOMEPATH"),
+            EnvVarGuard::remove("CODEWHALE_CONFIG_PATH"),
+            EnvVarGuard::remove("DEEPSEEK_CONFIG_PATH"),
+            EnvVarGuard::remove("DEEPSEEK_HOME"),
+        ];
+        Self {
+            _vars: vars,
+            _dir: dir,
+            home,
+            codewhale_home,
+            _lock: lock,
+        }
+    }
+
+    /// The sealed `HOME` / `USERPROFILE`.
+    pub(crate) fn home(&self) -> &Path {
+        &self.home
+    }
+
+    /// The sealed `CODEWHALE_HOME`.
+    pub(crate) fn codewhale_home(&self) -> &Path {
+        &self.codewhale_home
     }
 }
 
@@ -462,7 +611,7 @@ pub(crate) fn test_app_with_options(options: crate::tui::app::TuiOptions) -> cra
     // Pin the route identity: without this, a machine with customized
     // settings computes context-window assertions against a different model
     // than the requested deepseek-v4-pro.
-    app.set_provider_identity(crate::config::ApiProvider::Deepseek, "deepseek");
+    app.set_provider_identity(crate::config::ProviderKind::Deepseek, "deepseek");
     app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
     app.model = "deepseek-v4-pro".to_string();
     app.auto_model = false;
@@ -491,6 +640,281 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    fn env_snapshot(keys: &[&str]) -> Vec<Option<OsString>> {
+        let _lock = lock_test_env();
+        keys.iter().map(std::env::var_os).collect()
+    }
+
+    #[test]
+    fn sealed_home_pins_every_alias_and_restores_the_environment() {
+        const KEYS: [&str; 8] = [
+            "HOME",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "CODEWHALE_HOME",
+            "CODEWHALE_CONFIG_PATH",
+            "DEEPSEEK_CONFIG_PATH",
+            "DEEPSEEK_HOME",
+        ];
+        let before = env_snapshot(&KEYS);
+        {
+            let seal = SealedHome::new();
+            let now = |key: &str| std::env::var_os(key);
+            assert_eq!(now("HOME").as_deref(), Some(seal.home().as_os_str()));
+            assert_eq!(now("USERPROFILE").as_deref(), Some(seal.home().as_os_str()));
+            assert_eq!(
+                now("CODEWHALE_HOME").as_deref(),
+                Some(seal.codewhale_home().as_os_str())
+            );
+            for alias in [
+                "HOMEDRIVE",
+                "HOMEPATH",
+                "CODEWHALE_CONFIG_PATH",
+                "DEEPSEEK_CONFIG_PATH",
+                "DEEPSEEK_HOME",
+            ] {
+                assert_eq!(now(alias), None, "{alias} would route around the seal");
+            }
+            assert!(guarded_environment_provides_state_paths());
+            assert!(home_is_sealed());
+            // A resolver that follows the environment lands inside the seal.
+            let sessions = crate::session_manager::default_sessions_dir().expect("sessions dir");
+            assert_eq!(sessions, seal.codewhale_home().join("sessions"));
+        }
+        {
+            let owned = tempfile::tempdir().expect("owned home");
+            let seal = SealedHome::at(owned.path());
+            assert_eq!(seal.home(), owned.path());
+            assert_eq!(seal.codewhale_home(), owned.path().join(".codewhale"));
+        }
+        assert_eq!(env_snapshot(&KEYS), before, "the seal must restore the env");
+    }
+
+    /// The fence on every resolver a test reaches without ever thinking about
+    /// the home: an unsealed test must land in the isolated root, whatever the
+    /// ambient `HOME` / `CODEWHALE_HOME` say. Add a resolver here when it grows
+    /// a `#[cfg(test)]` fence — and fence the next one before a test finds it.
+    #[test]
+    fn unsealed_state_resolvers_stay_inside_the_isolated_root() {
+        // Hold the barrier to keep the fixture's environment stable.
+        let _lock = lock_test_env();
+        assert!(!home_is_sealed());
+        let root = isolated_test_state_root();
+        let inside = |label: &str, path: &Path| {
+            assert!(
+                path.starts_with(root),
+                "{label} resolved outside the isolated test root: {}",
+                path.display()
+            );
+        };
+
+        inside(
+            "sessions",
+            &crate::session_manager::default_sessions_dir().expect("sessions dir"),
+        );
+        inside(
+            "snapshots",
+            &crate::snapshot::snapshot_dir_for(Path::new("/nonexistent/codewhale-fence-probe"))
+                .expect("snapshot dir"),
+        );
+        for bundle in crate::plugins::builtin::materialized_dirs() {
+            inside("built-in plugins", &bundle);
+        }
+        let audit = crate::audit::audit_log_path().expect("audit log path");
+        assert!(
+            audit.starts_with(std::env::temp_dir()),
+            "the audit log resolved outside the temp dir: {}",
+            audit.display()
+        );
+    }
+
+    #[test]
+    fn home_seal_is_available_only_to_its_owner_and_enrolled_workers() {
+        let seal = SealedHome::new();
+        let sessions = seal.codewhale_home().join("sessions");
+        let ticket = env_scope_ticket().expect("seal owns an environment scope");
+
+        std::thread::spawn(move || {
+            assert!(!home_is_sealed(), "a foreign worker cannot follow the seal");
+            assert!(
+                crate::session_manager::default_sessions_dir()
+                    .expect("isolated sessions dir")
+                    .starts_with(isolated_test_state_root())
+            );
+
+            let membership = join_env_scope(Some(ticket)).expect("enroll worker");
+            assert!(home_is_sealed());
+            assert_eq!(
+                crate::session_manager::default_sessions_dir().expect("sealed sessions dir"),
+                sessions
+            );
+            drop(membership);
+            assert!(!home_is_sealed(), "leaving the scope withdraws the seal");
+        })
+        .join()
+        .expect("home seal worker");
+    }
+
+    /// Tripwire for the leak this module exists to prevent: run a sample of
+    /// the tests that once wrote `~/.codewhale` in a child process whose
+    /// *ambient* `HOME` and `CODEWHALE_HOME` are a seeded, read-only sentinel,
+    /// then require both that they pass and that the sentinel is byte-for-byte
+    /// as it was. A test that writes the ambient home without sealing its own
+    /// fails here by name, instead of silently rewriting a developer's profile.
+    ///
+    /// The sample covers one test per resolver class that leaked
+    /// (`App::new`, command dispatch, sessions, snapshots, plugin bundles,
+    /// credentials, the `/import-claude` report). To sweep a whole family,
+    /// set `CODEWHALE_TEST_AMBIENT_HOME_FILTER` to a libtest filter such as
+    /// `commands::`; that takes minutes, which is why it is not the default.
+    #[cfg(unix)]
+    #[test]
+    fn ambient_home_survives_a_sample_of_state_touching_tests() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const PROBE_ENV: &str = "CODEWHALE_TEST_AMBIENT_HOME_PROBE";
+        const FILTER_ENV: &str = "CODEWHALE_TEST_AMBIENT_HOME_FILTER";
+        const SAMPLE: &[&str] = &[
+            "commands::contract::tests::bundle_construction_performs_no_eager_work",
+            "commands::contract::tests::skill_group_snapshot_list_and_restore_roundtrip",
+            "commands::debug_diagnostics_host_tests::test_context_report_subcommands_return_source_map",
+            "commands::debug_mutation_host_tests::test_patch_undo_requests_session_resync_after_restore",
+            "commands::groups::core::core::tests::test_clear_resets_all_state",
+            "commands::groups::plugins::tests::kimi_managed_import_refuses_linked_children",
+            "commands::session_lifecycle_regression_tests::fork_saves_parent_and_switches_to_child_session",
+            "commands::session_lifecycle_regression_tests::test_save_creates_file_and_sets_session_id",
+            "commands::tests::every_registered_command_dispatches_to_a_handler",
+            "commands::tests::every_command_alias_dispatches_to_a_handler",
+            "commands::tests::feat020_plugin_dispatches_through_public_seam",
+        ];
+
+        // The child runs the sample; it must not recurse into this probe.
+        if std::env::var_os(PROBE_ENV).is_some() {
+            return;
+        }
+
+        fn walk(dir: &Path, visit: &mut dyn FnMut(&Path, &std::fs::Metadata)) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .expect("read sentinel dir")
+                .map(|entry| entry.expect("sentinel entry").path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                let metadata = std::fs::symlink_metadata(&path).expect("sentinel metadata");
+                visit(&path, &metadata);
+                if metadata.is_dir() {
+                    walk(&path, visit);
+                }
+            }
+        }
+        fn listing(root: &Path) -> Vec<String> {
+            let mut out = Vec::new();
+            walk(root, &mut |path, metadata| {
+                let mtime = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |elapsed| elapsed.as_nanos());
+                out.push(format!(
+                    "{} dir={} len={} mtime={mtime} contents={:?}",
+                    path.strip_prefix(root).unwrap_or(path).display(),
+                    metadata.is_dir(),
+                    metadata.len(),
+                    metadata
+                        .is_file()
+                        .then(|| std::fs::read(path).expect("read sentinel file"))
+                ));
+            });
+            out
+        }
+        fn set_readonly(root: &Path, readonly: bool) {
+            let mode = |dir: bool| match (dir, readonly) {
+                (true, true) => 0o500,
+                (true, false) => 0o700,
+                (false, true) => 0o400,
+                (false, false) => 0o600,
+            };
+            let apply = |path: &Path, dir: bool| {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode(dir)))
+                    .expect("set sentinel permissions");
+            };
+            walk(root, &mut |path, metadata| {
+                if !metadata.file_type().is_symlink() {
+                    apply(path, metadata.is_dir());
+                }
+            });
+            apply(root, true);
+        }
+
+        let sentinel = tempfile::tempdir().expect("sentinel tempdir");
+        let home = sentinel.path().join("home");
+        let codewhale_home = sentinel.path().join("codewhale-home");
+        // Content a leaking test would read, rewrite or migrate.
+        for (relative, body) in [
+            (
+                "home/.claude/CLAUDE.md",
+                "# someone's Claude instructions\n",
+            ),
+            ("home/.claude.json", "{\"mcpServers\":{}}\n"),
+            ("home/.codewhale/instructions.md", "# real instructions\n"),
+            ("home/.deepseek/config.toml", "model = \"keep-me\"\n"),
+            ("home/.deepseek/sessions/legacy.json", "{}\n"),
+            ("codewhale-home/instructions.md", "# real instructions\n"),
+            ("codewhale-home/sessions/keep.json", "{}\n"),
+        ] {
+            let path = sentinel.path().join(relative);
+            std::fs::create_dir_all(path.parent().expect("sentinel parent")).expect("seed dir");
+            std::fs::write(path, body).expect("seed file");
+        }
+        assert!(home.is_dir() && codewhale_home.is_dir());
+        let before = listing(sentinel.path());
+        set_readonly(sentinel.path(), true);
+
+        let filter = std::env::var(FILTER_ENV).ok().filter(|f| !f.is_empty());
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        child.arg("--test-threads=4");
+        match &filter {
+            Some(filter) => child.arg(filter),
+            None => child.arg("--exact").args(SAMPLE),
+        };
+        let output = child
+            .env(PROBE_ENV, "1")
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("CODEWHALE_HOME", &codewhale_home)
+            .env_remove("HOMEDRIVE")
+            .env_remove("HOMEPATH")
+            .env_remove("CODEWHALE_CONFIG_PATH")
+            .env_remove("DEEPSEEK_CONFIG_PATH")
+            .env_remove("DEEPSEEK_HOME")
+            .output();
+
+        // Restore write access first so a failure still cleans up after itself.
+        set_readonly(sentinel.path(), false);
+        let output = output.expect("run the sample under a read-only ambient home");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let report = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+
+        assert!(
+            output.status.success(),
+            "a test failed under a read-only ambient home — it reaches the user's \
+             state without sealing it (use SealedHome, or fence the resolver):\n{report}"
+        );
+        if filter.is_none() {
+            assert!(
+                stdout.contains(&format!("running {} tests", SAMPLE.len())),
+                "the sample names drifted from real tests; update SAMPLE:\n{report}"
+            );
+        }
+        assert_eq!(
+            listing(sentinel.path()),
+            before,
+            "a test wrote the ambient home:\n{report}"
+        );
+    }
+
     #[test]
     fn ambient_codewhale_home_is_not_a_test_seal() {
         let _lock = lock_test_env();
@@ -501,6 +925,34 @@ mod tests {
 
         register_guarded_env_key("CODEWHALE_HOME");
         assert!(!sealed, "ambient developer state must remain confined");
+    }
+
+    #[test]
+    fn a_config_path_guard_or_a_home_shadowed_by_the_ambient_override_is_not_a_home_seal() {
+        let _lock = lock_test_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            // Redirecting the config file leaves `~/.codewhale` in play.
+            let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", dir.path().join("config.toml"));
+            let _no_home_override = EnvVarGuard::remove("CODEWHALE_HOME");
+            assert!(guarded_environment_provides_state_paths());
+            assert!(!home_is_sealed());
+        }
+        {
+            // `CODEWHALE_HOME` outranks `HOME`: guarding only `HOME` while an
+            // ambient `CODEWHALE_HOME` is set seals nothing.
+            let _ambient = EnvVarGuard::set("CODEWHALE_HOME", dir.path().join("ambient"));
+            unregister_guarded_env_key("CODEWHALE_HOME");
+            let _home = EnvVarGuard::set("HOME", dir.path());
+            let sealed = home_is_sealed();
+            register_guarded_env_key("CODEWHALE_HOME");
+            assert!(!sealed, "an ambient CODEWHALE_HOME shadows a guarded HOME");
+        }
+        {
+            let _no_home_override = EnvVarGuard::remove("CODEWHALE_HOME");
+            let _home = EnvVarGuard::set("HOME", dir.path());
+            assert!(home_is_sealed());
+        }
     }
 
     #[test]

@@ -1,8 +1,9 @@
 # Public website design
 
-The GPUI app is the product client and the website follows its visual language:
-warm paper or charcoal, Shannon Sans, quiet navigation, distinct raised inputs,
-and restrained blue for actions, selection and keyboard focus. This supersedes
+The GPUI app is the product client. The website shares its Shannon Sans,
+interface inks, control geometry and quiet navigation, applied to warm paper
+by default and deep navy when the reader chooses dark. Blue marks actions,
+selection and keyboard focus. This supersedes
 the earlier serif “Tidal Folio” palette and typography description in this file.
 The source already made that visual transition; this document now names its
 actual authority.
@@ -26,10 +27,14 @@ constants no longer supply the website's colors.
 
 ## Theme and components
 
-The website respects the OS appearance and the person's theme choice. The
-footer, terminal code plates and existing homepage water section retain dark
-surfaces. `web/app/styles/tokens-roles.css` maps each surface to the shared
-palette; components use roles rather than hex values.
+The website defaults to paper and preserves the person's explicit light or
+dark theme choice; it does not follow the OS appearance. The footer, terminal
+code plates and homepage install section retain the dark sea in both
+appearances. The homepage promise, task example and reading sections use the
+page ground: paper by default, navy in dark.
+`web/app/styles/tokens-roles.css` owns the website's ocean and brand roles and
+maps them with the shared interface inks; components use roles rather than
+hex values.
 
 Use the official whale assets and locally loaded Shannon Sans. Code uses the
 system monospace stack at the artifact's size. CJK uses the shared fallback
@@ -59,3 +64,9 @@ Verify the changed surface in a real browser at desktop and phone widths,
 including focus, theme controls and reduced motion. Screenshots prove the
 rendered source; they do not prove deployment or release acceptance. Public
 claims continue to come from repository facts and the media manifest.
+
+The homepage's task example shows a useful artifact rather than a gallery of
+terminal views. Keep its sample data label visible, derive the displayed report
+and download from the same data, and give secondary task examples less visual
+weight. Native product captures belong on the product and guide pages, with
+their build provenance intact.

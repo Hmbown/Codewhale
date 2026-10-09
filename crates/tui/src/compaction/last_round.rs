@@ -271,6 +271,25 @@ pub(super) fn replacement_messages(
         retained.retain(|message| !crate::runtime_handoff::is_operate_contract_message(message));
         retained.insert(0, contract.clone());
     }
+    // Contributions are captured once per turn. Preserve the complete latest
+    // snapshot, including a withdrawal, rather than summarizing or truncating
+    // instructions that still apply to this tool loop.
+    if let Some(snapshot) = messages.iter().rev().find(|message| {
+        crate::runtime_handoff::extension_prompt_contributions_display(message).is_some()
+    }) {
+        retained.retain(|message| {
+            crate::runtime_handoff::extension_prompt_contributions_display(message).is_none()
+        });
+        retained.insert(0, snapshot.clone());
+    }
+    if let Some(snapshot) = messages
+        .iter()
+        .rev()
+        .find(|message| crate::runtime_handoff::constitution_display(message).is_some())
+    {
+        retained.retain(|message| crate::runtime_handoff::constitution_display(message).is_none());
+        retained.insert(0, snapshot.clone());
+    }
     retained
 }
 
@@ -693,6 +712,103 @@ mod tests {
         )))
     }
 
+    #[test]
+    fn replacement_keeps_only_latest_complete_prompt_snapshot_and_withdrawal() {
+        use crate::runtime_handoff::{
+            extension_prompt_contributions_display, extension_prompt_contributions_runtime_message,
+        };
+        let old = extension_prompt_contributions_runtime_message(Some("old instructions"));
+        let current_text = "current instructions ".repeat(400);
+        for current in [
+            extension_prompt_contributions_runtime_message(Some(&current_text)),
+            extension_prompt_contributions_runtime_message(None),
+        ] {
+            let quoted = msg(
+                "user",
+                &user_text_of(&current).expect("runtime snapshot has text"),
+            );
+            let original = vec![
+                old.clone(),
+                quoted.clone(),
+                current.clone(),
+                msg("user", "Continue this task."),
+                tool_use("first", "Read", json!({"path": "first"})),
+                tool_result("first", "first output"),
+                tool_use("second", "Read", json!({"path": "second"})),
+                tool_result("second", "second output"),
+                tool_use("third", "Read", json!({"path": "third"})),
+                tool_result("third", "third output"),
+            ];
+            let kept = replacement_messages(&original, 20_000);
+            let snapshots: Vec<_> = kept
+                .iter()
+                .filter(|message| extension_prompt_contributions_display(message).is_some())
+                .collect();
+            assert_eq!(snapshots, [&current]);
+            assert!(
+                kept.contains(&quoted),
+                "a person's quote is ordinary user text"
+            );
+            assert_eq!(
+                replacement_messages(&kept, 20_000)
+                    .iter()
+                    .filter(|message| extension_prompt_contributions_display(message).is_some())
+                    .count(),
+                1,
+                "repeated compaction must not accumulate snapshots"
+            );
+        }
+    }
+
+    /// The handoff header tells the next turn what survived. It must match
+    /// what the replacement history keeps: only the last steps of a long
+    /// round, with long tool output shortened and marked.
+    #[test]
+    fn profile_constitution_compaction_keeps_only_the_complete_latest_snapshot() {
+        use crate::runtime_handoff::{constitution_display, constitution_runtime_message};
+        let old = constitution_runtime_message(Some("old instructions"));
+        let current_text = "current instructions ".repeat(400);
+        for current in [
+            constitution_runtime_message(Some(&current_text)),
+            constitution_runtime_message(None),
+        ] {
+            let quoted = msg(
+                "user",
+                &user_text_of(&current).expect("runtime snapshot has text"),
+            );
+            let original = vec![
+                old.clone(),
+                quoted.clone(),
+                current.clone(),
+                msg("user", "Continue this task."),
+                tool_use("first", "Read", json!({"path": "first"})),
+                tool_result("first", "first output"),
+                tool_use("second", "Read", json!({"path": "second"})),
+                tool_result("second", "second output"),
+                tool_use("third", "Read", json!({"path": "third"})),
+                tool_result("third", "third output"),
+            ];
+            let kept = replacement_messages(&original, 20_000);
+            let snapshots: Vec<_> = kept
+                .iter()
+                .filter(|message| constitution_display(message).is_some())
+                .collect();
+            assert_eq!(snapshots, [&current]);
+            assert!(
+                kept.contains(&quoted),
+                "a person's quote is ordinary user text"
+            );
+            assert_eq!(
+                replacement_messages(&kept, 20_000)
+                    .iter()
+                    .filter(|message| constitution_display(message).is_some())
+                    .count(),
+                1,
+                "repeated compaction must not accumulate snapshots"
+            );
+        }
+    }
+
     /// The handoff header tells the next turn what survived. It must match
     /// what the replacement history keeps: only the last steps of a long
     /// round, with long tool output shortened and marked.
@@ -1029,6 +1145,68 @@ mod tests {
             replaced
                 .iter()
                 .filter(|message| crate::runtime_handoff::is_operate_contract_message(message))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn compaction_replaces_v0_10_0_operate_contract_with_current() {
+        // A v0.10.0 session that entered Operate after a tool round, resumed on
+        // a later build: the protected round reaches back past both contracts.
+        let shipped = crate::runtime_handoff::v0_10_0_operate_contract_runtime_message();
+        let current = crate::runtime_handoff::operate_contract_runtime_message();
+        let original = vec![
+            msg("user", "Run the failing test."),
+            tool_use("live", "Bash", json!({"command": "cargo test"})),
+            tool_result("live", "test session_store::roundtrip ... FAILED"),
+            shipped.clone(),
+            msg("user", "Fix it."),
+            msg("assistant", "Fixed."),
+            current.clone(),
+            msg("user", "Continue"),
+            msg("assistant", "Working"),
+        ];
+        assert_eq!(last_round_start(&original), 0);
+        let replaced = build_replacement_history(
+            &original,
+            &format!("{COMPACTION_SUMMARY_MARKER}: work continues"),
+            None,
+            1,
+        )
+        .expect("current contract must survive compaction");
+        assert_eq!(replaced.first(), Some(&current));
+        assert!(
+            !replaced.contains(&shipped),
+            "the v0.10.0 contract contradicts the current one about goals"
+        );
+        assert_eq!(
+            replaced
+                .iter()
+                .filter(|message| crate::runtime_handoff::is_operate_contract_message(message))
+                .count(),
+            1
+        );
+
+        // Until an Operate turn on the new build appends the current wording,
+        // the saved contract is the only one and is kept once, at the front.
+        let only_shipped = vec![
+            shipped.clone(),
+            msg("user", "Continue"),
+            msg("assistant", "Working"),
+        ];
+        let replaced = build_replacement_history(
+            &only_shipped,
+            &format!("{COMPACTION_SUMMARY_MARKER}: work continues"),
+            None,
+            1,
+        )
+        .expect("saved contract must survive compaction");
+        assert_eq!(replaced.first(), Some(&shipped));
+        assert_eq!(
+            replaced
+                .iter()
+                .filter(|message| **message == shipped)
                 .count(),
             1
         );

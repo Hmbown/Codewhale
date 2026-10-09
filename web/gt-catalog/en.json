@@ -22,7 +22,7 @@
     "themeDark": "dark",
     "themeAria": "Theme: {mode} (click to cycle)",
     "themeTitle": "Theme · auto / light / dark",
-    "footerTagline": "Create what you want and automate everyday work with the models you choose.",
+    "footerTagline": "Build apps and automate work with your own models and connected tools.",
     "footerProduct": "Product",
     "footerProject": "Project",
     "footerDocs": "Docs",
@@ -46,123 +46,125 @@
     "partialBadge": "(partial)"
   },
   "home": {
-    "metaTitle": "Codewhale — Build and automate with the models you choose",
-    "metaDescription": "Build software, work with your files, and automate everyday tasks using open-source agents and your choice of hosted or local AI models.",
-    "heroTitle": "Build and automate with the models you choose",
-    "heroIntro": "{brand} is an open-source agent that reads files, edits code, runs commands, and can run your tests to check its work. Use it in your terminal or local browser with a hosted or local model. You choose the tools and permissions; the session keeps the conversation and tool results.",
-    "getCodewhale": "Get Codewhale",
+    "metaTitle": "Codewhale: build with your models and tools",
+    "metaDescription": "Build apps, automate workflows, and work across connected tools with Codewhale. Open source, with your own model APIs or local and self-hosted inference.",
+    "heroTitle": "Build apps and automate your work.",
+    "heroIntro": "{brand} is an open-source agent that writes code, runs commands and works with the tools you connect. Use your existing model APIs, or run models locally and on your own servers.",
+    "getCodewhale": "Install Codewhale",
     "heroInstallAria": "Install command",
-    "exploreProduct": "Explore the product",
+    "exploreProduct": "Explore Codewhale",
     "shotPreview": "Terminal preview",
-    "shotBuild": "v{version} pre-release build",
-    "screenshotAlt": "Codewhale v{version} pre-release build: whale mark, new session, message composer, Ask permissions, Work mode and model status. Rendered from an isolated terminal capture.",
+    "screenshotAlt": "Codewhale v{version}: a captured terminal view with the conversation, message composer and session controls.",
     "latestRelease": "Latest release {tag}",
     "releaseUnavailable": "Release status unavailable",
     "currentSource": "Source",
     "sourceCandidate": "Unreleased",
     "publishedRelease": "released",
-    "figcaptionSourceCandidate": "unreleased",
-    "chapterTerminal": "Your terminal",
-    "chapterTerminalTitle": "Start with something you want to make",
-    "gainHeading": "What you can do with Codewhale",
-    "gainLede": "Ask for a concrete result: fix a bug, understand a project, or turn a repeated task into a workflow. Start with one agent and split larger jobs when useful.",
+    "gainHeading": "What you can do",
+    "gainLede": "Describe what you want to build or automate. Codewhale can edit files, run commands and check the result, with access you control.",
     "gain": [
       [
-        "Build and check a project",
-        "Ask the agent to inspect a project, make a change, then run its tests. Follow the file edits and command results as it works."
+        "Build apps and tools",
+        "Create an app, add a feature or write a script. Codewhale can work through the project files, run the code and test what it builds."
       ],
       [
-        "Reuse work that repeats",
-        "Turn a repeated task into a script or saved workflow. Use codewhale exec in scripts and CI, or give parts of a larger job to several agents."
+        "Automate the work you repeat",
+        "Run workflows from your terminal, scripts or CI. For larger tasks, delegate parts of the work to a Fleet of agents with different models."
       ],
       [
-        "Stay in control",
-        "Set permissions before work starts, respond to approval requests, and interrupt a running task. Review the conversation and tool results before continuing."
+        "Connect the tools you use",
+        "Add tools through plugins and MCP servers, or use APIs from your own scripts. Each service needs its own setup and authentication."
       ]
     ],
     "chapterModels": "Your models",
-    "modelsHeading": "A choice of models for every task",
-    "modelsBody": "Choose the provider and model for each session: connect with an API key, use a supported provider sign-in, or run a local model. Your Codewhale account and your model connection serve different purposes.",
+    "modelsHeading": "Use the models you choose",
+    "modelsBody": "Connect your provider accounts, an OpenAI-compatible endpoint, or local and self-hosted models. Pick a model for the session and for each agent in a Fleet.",
     "modelsFacts": [
       [
-        "Hosted",
-        "Your own API key, saved with codewhale auth set --provider <id>"
+        "Your API accounts",
+        "Connect providers such as OpenAI, Anthropic, Google or DeepSeek with your own keys."
       ],
       [
-        "Gateway",
-        "One endpoint for many models, provider still chosen by you"
+        "Your gateway",
+        "Use an OpenAI-compatible endpoint and choose the models it serves."
       ],
       [
-        "Local",
-        "vLLM, SGLang, Ollama on localhost — usually no key"
+        "Your inference",
+        "Run local or self-hosted models with Ollama, vLLM or SGLang."
       ]
     ],
-    "modelsLink": "Explore models and providers",
-    "startHeading": "Getting started with Codewhale",
-    "startLede": "Install the published release, connect a model, then try one task in your project folder. A team of agents is optional; start with one and add more when the work can be split.",
-    "startGuideLink": "Read the getting-started guide",
+    "modelsLink": "Browse models and providers",
+    "startHeading": "Get started",
+    "startLede": "Install Codewhale, connect a model and open a project folder. You can add plugins and more agents as you need them.",
+    "startGuideLink": "Follow the getting-started guide",
     "startVocabularyLink": "Look up a term",
     "chapterAvailability": "Where it runs",
-    "availabilityHeading": "Where you can use Codewhale",
-    "availabilityLede": "The terminal and local browser client are available now. Desktop and hosted web apps are being developed around the same session model; their availability is listed separately below.",
+    "availabilityHeading": "Available now and in development",
+    "availabilityLede": "The terminal and local browser client are available now. A native desktop app and a rebuilt hosted web app are in development.",
     "availability": [
       [
         "Terminal and local browser",
         "Released",
-        "Install on Linux, macOS, or Windows. Run codewhale in your terminal, or codewhale web for the local browser client. npm and Cargo are alternatives; Android on Termux is a preview."
+        "Install on Linux, macOS, or Windows, then run codewhale, or codewhale web for the local browser client. npm and Cargo also work; Android on Termux is a preview."
+      ],
+      [
+        "CodeWhale GUI (VS Code)",
+        "Available",
+        "A separate, community-maintained project: chat, threads, and file changes in a VS Code sidebar over the same Codewhale Runtime. Install it from the VS Code Marketplace.",
+        "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode"
       ],
       [
         "Hosted web app",
         "Development preview",
-        "Sign in with a Codewhale account, then type /rc in a running terminal session to continue it from the web app. Hosted task execution is still being qualified."
+        "Being rebuilt to match the desktop app. Today you can sign in, then type /rc in a running terminal session to continue it on the web; hosted task execution is still being qualified."
       ],
       [
         "Desktop",
         "Development build",
-        "The macOS app brings folders, conversations, and model connections into a desktop window. A public download is coming later."
+        "The native app becoming the main Codewhale client: folders, conversations, and model connections in one window. No public download yet."
       ],
       [
         "Cloud computers",
         "In development",
-        "Hosted computers for running your tasks."
+        "Hosted computers that run your tasks."
       ]
     ],
-    "availabilityNote": "The terminal and local browser do not require a Codewhale account. An account is used for hosted web and desktop access; it does not replace your model connection. Hosted model usage with your own key is billed by that provider.",
+    "availabilityNote": "The terminal, local browser, and GUI need no Codewhale account. Hosted web and desktop use an account. When you use your own provider key, your provider bills that usage.",
     "accountLink": "Create an account",
-    "surfacesHeading": "Tools, connected apps, and saved work",
+    "surfacesHeading": "Work across files and tools",
     "surfaces": [
       [
-        "Files and commands",
-        "Read a project, edit files, run tests, and inspect command output within the permissions you set."
+        "Files and terminal",
+        "Create files, run commands, inspect data and test what you build. You set the working folder and permissions."
       ],
       [
-        "Plugins and MCP",
-        "Connect additional tools and services. Review and enable plugins before the agent can use them."
+        "Plugins and connected apps",
+        "Add skills and tools through plugins and MCP. Review and enable the connections you want the agent to use."
       ],
       [
-        "Computer Use · preview",
-        "A plugin that lets the agent see and operate other applications. Enable it explicitly and grant the system permissions it asks for."
+        "Browser and computer · preview",
+        "Use browser tools and the Computer Use plugin for work in apps and websites, with the access you grant."
       ],
       [
-        "Saved sessions",
-        "Keep the conversation and tool results together. The local browser connects to the same Codewhale session on your computer; resume saved work instead of starting over."
+        "Sessions you can return to",
+        "Keep the conversation, tool results and work history together. Resume the task in the terminal or its local browser client."
       ],
       [
-        "Fleet",
-        "Assign parts of a task to agents with different models and roles, and follow their progress."
+        "Teams of agents",
+        "Use Fleet to split a larger job between agents with different roles and models, and follow their progress in one place."
       ]
     ],
-    "runtimeLink": "Explore integrations",
-    "installBandHeading": "Install Codewhale on macOS or Linux",
+    "runtimeLink": "Explore tools and integrations",
+    "installBandHeading": "Install on macOS or Linux",
     "copy": "Copy",
     "copied": "Copied ✓",
     "binaries": "Binaries",
     "chinaMirrors": "China mirrors",
     "installGuideLink": "Read the install guide",
-    "communityHeading": "Help make Codewhale better",
-    "communityBody": "Whether you have found a bug, have an idea for a feature, or want to send your first pull request, we would like to hear from you and work together on what comes next.",
+    "communityHeading": "Contribute to Codewhale",
+    "communityBody": "Report a bug, improve the docs or contribute code on GitHub. You can also build plugins and share workflows with others.",
     "communityLinksAria": "Community links",
-    "contribute": "Send a pull request"
+    "contribute": "Contribute on GitHub"
   },
   "docs-guide": {
     "metaTitle": "Start your first task · Codewhale Docs",
@@ -179,8 +181,8 @@
     "metaTitle": "Docs · Codewhale",
     "metaDescription": "Install Codewhale, connect a provider, and get work done: modes and approvals, reviewing changes, workflows, sub-agents, MCP tools, hooks, the Runtime API, and troubleshooting.",
     "portalMark": "Codewhale documentation",
-    "heroTitle": "Get something done with Codewhale.",
-    "heroLead": "Start from what you want to do. Each page says what you need, shows commands you can run today, and points to the next step.",
+    "heroTitle": "Install and use Codewhale",
+    "heroLead": "Find installation steps, model setup, tool configuration and troubleshooting. The guides include commands and examples you can run.",
     "installCta": "Install Codewhale",
     "releaseLabel": "Release",
     "releasePublished": "Latest release {tag} · {date}",
@@ -207,8 +209,8 @@
     "breadcrumbAria": "Breadcrumb",
     "breadcrumbHome": "Home",
     "breadcrumbDocs": "Docs",
-    "helpTitle": "Need more than this page?",
-    "helpLead": "Every guide is checked against a document in the repository. If something is wrong or missing, say so where the maintainer will see it.",
+    "helpTitle": "Get help",
+    "helpLead": "Ask a question on Discord or report a documentation problem on GitHub.",
     "helpSource": "Source: {name}",
     "helpTroubleshooting": "Fix a problem",
     "helpFaq": "FAQ",
@@ -534,7 +536,7 @@
         "title": "Run in Docker",
         "blocks": [
           {
-            "code": "docker volume create codewhale-home\ndocker run --rm -it \\\n  -e DEEPSEEK_API_KEY=\"$DEEPSEEK_API_KEY\" \\\n  -v codewhale-home:/home/codewhale/.codewhale \\\n  -v \"$PWD:/workspace\" -w /workspace \\\n  ghcr.io/hmbown/codewhale:latest",
+            "code": "docker volume create codewhale-home\ndocker run --rm -it \\\n  -e DEEPSEEK_API_KEY=\"$DEEPSEEK_API_KEY\" \\\n  -v codewhale-home:/home/codewhale/.codewhale \\\n  -v \"$PWD:/workspace\" -w /workspace \\\n  ghcr.io/codewhale-hq/codewhale:latest",
             "lang": "Terminal"
           },
           {
@@ -766,7 +768,7 @@
         "title": "Run a batch of tasks",
         "blocks": [
           {
-            "p": "When you have a list of separate tasks rather than one plan, write them as a task file and run them as a Fleet run. Each task names its goal, its role, and the paths it may write. [The tutorial](https://github.com/Hmbown/CodeWhale/blob/main/docs/FLEET_WORKFLOW_TUTORIAL.md) has a complete `tasks.json`."
+            "p": "When you have a list of separate tasks rather than one plan, write them as a task file and run them as a Fleet run. Each task names its goal, its role, and the paths it may write. [The tutorial](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/FLEET_WORKFLOW_TUTORIAL.md) has a complete `tasks.json`."
           },
           {
             "code": "codewhale fleet init\ncodewhale fleet run tasks.json --max-workers 4\ncodewhale fleet status\ncodewhale fleet logs <worker-id>\ncodewhale fleet resume <run-id>\ncodewhale fleet stop --all",
@@ -888,17 +890,17 @@
         "title": "Compose tool calls with code mode (experimental)",
         "blocks": [
           {
-            "p": "Code mode lets the model write one short JavaScript program that calls several tools, loops, and filters results, instead of making each call as a separate step. Only the program's final value goes back to the model, which keeps long lookups compact. It is off by default. Try it for one session, or turn it on in config:"
+            "p": "Code mode lets the model write one short JavaScript program that calls several tools, loops, and filters results, instead of making each call as a separate step. Only the program's final value goes back to the model, which keeps long lookups compact. It is on by default — `execute_tools` is advertised from the first request — and MCP and plugin tools compose inside a program the same way built-in ones do. To turn it off for one session, or in config:"
           },
           {
-            "code": "codewhale --enable code_mode\n\n# ~/.codewhale/config.toml\n[features]\ncode_mode = true",
+            "code": "codewhale --disable code_mode\n\n# ~/.codewhale/config.toml\n[features]\ncode_mode = false",
             "lang": "Terminal / config.toml"
           },
           {
             "list": [
-              "Only read-only tools that need no approval can run inside a program. Anything that writes, runs a shell command, or would ask you stops the program and reports which call it refused.",
-              "MCP tools cannot be called from a program yet. Use them as ordinary tool calls.",
-              "Limits per program: 50 tool calls, 4 at a time, 30 seconds, and 16 KiB returned.",
+              "Nested native, MCP and plugin calls pass the same gate as a direct call: allow/deny lists, ask-rules, and review still apply. A call that needs approval raises the normal approval card and pauses the program; allow resumes it, deny fails only that call. Approving the program itself grants nothing.",
+              "MCP calls run through the session's MCP pool, and plugin tools are callable inside a program just like built-in ones.",
+              "Limits per program: 50 nested calls, 4 at a time, and 16 KiB returned. There is no fixed 30-second cap: a program runs on the turn's remaining wall clock, unbounded unless `[tui].turn_wall_clock_secs` is set.",
               "Code mode is not available in Plan mode."
             ]
           }
@@ -1113,7 +1115,7 @@
             ]
           },
           {
-            "p": "[docs/RUNTIME_API.md](https://github.com/Hmbown/CodeWhale/blob/main/docs/RUNTIME_API.md) lists every route, request body, and event."
+            "p": "[docs/RUNTIME_API.md](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/RUNTIME_API.md) lists every route, request body, and event."
           }
         ]
       },
@@ -1200,7 +1202,7 @@
               ],
               [
                 "Linux",
-                "Bubblewrap, but only if you turn it on (below). Without it, commands run with no OS sandbox."
+                "Bubblewrap, automatically, once it is installed and verified working (opt out below). Without it, commands run with no OS sandbox."
               ],
               [
                 "Windows",
@@ -1226,17 +1228,17 @@
       },
       {
         "id": "linux",
-        "title": "Turn on the Linux sandbox",
+        "title": "Enable (or turn off) the Linux sandbox",
         "blocks": [
           {
-            "p": "Install bubblewrap, then opt in with one line in `~/.codewhale/config.toml`:"
+            "p": "Install bubblewrap — Codewhale uses it by default. To run Linux commands unwrapped instead, opt out with one line in `~/.codewhale/config.toml`:"
           },
           {
-            "code": "sudo apt install bubblewrap      # Fedora: dnf install bubblewrap · Arch: pacman -S bubblewrap\n\n# ~/.codewhale/config.toml\nprefer_bwrap = true",
+            "code": "sudo apt install bubblewrap      # Fedora: dnf install bubblewrap · Arch: pacman -S bubblewrap\n\n# ~/.codewhale/config.toml\nprefer_bwrap = false",
             "lang": "Terminal / config.toml"
           },
           {
-            "p": "Codewhale uses `/usr/bin/bwrap` only when that file exists and is executable. Commands then see a read-only view of the system, write only where the sandbox mode allows, and have no network unless the mode enables it."
+            "p": "Codewhale uses `/usr/bin/bwrap` only when that file exists, is executable, and a probe shows it can create its sandbox namespaces — an installed-but-blocked bwrap is treated as absent, not used. Commands then see a read-only view of the system, write only where the sandbox mode allows, and have no network unless the mode enables it."
           }
         ]
       },
@@ -1910,19 +1912,19 @@
   "states": {
     "loadingLabel": "Loading…",
     "emptyTitle": "Nothing here yet",
-    "emptyBody": "There is no record to show. Nothing has been invented to fill the space.",
+    "emptyBody": "There are no records to show yet.",
     "errorTitle": "This page did not finish loading",
-    "errorBody": "Something failed on the way here. Nothing you did was lost; try again, and if it keeps failing, report it.",
+    "errorBody": "Something went wrong. Try again, or report the problem if it continues.",
     "retry": "Try again",
     "reload": "Reload the page",
     "homeLink": "Back to the home page",
     "docsIndexLink": "Open the documentation index",
-    "notFoundTitle": "We all make typos.",
+    "notFoundTitle": "Typo in the URL?",
     "notFoundBody": "This page doesn’t exist yet.\nNeither does this game.",
     "notFoundHomeLink": "Return to base",
     "notFoundPosterAlt": "A blue whale in tactical gear on the fictional Codwhale: Modern Whalefare game poster.",
     "unavailableTitle": "The live record has not loaded",
-    "unavailableBody": "The source did not answer the last refresh, or this page has not refreshed since it was built. Nothing is shown in its place.",
+    "unavailableBody": "The latest information is unavailable. Try refreshing this page.",
     "offlineTitle": "You are offline",
     "offlineBody": "Actions are paused until the connection returns. Nothing shown here is refreshing.",
     "reconnectingTitle": "Reconnecting…",
@@ -1992,7 +1994,7 @@
         "body": "Review, trust, and enable Computer Use in Codewhale’s plugin marketplace. Use plugin 0.3.1 or later so local actions go through the helper’s Pause and Stop controls."
       }
     ],
-    "controlsTitle": "Keep working. Keep control.",
+    "controlsTitle": "Pause or stop app control",
     "controlsBody": "Supported actions operate on the selected app in the background. Apps and gestures that need foreground control require your authorization. The menu shows the target and input mode; Pause suspends helper input, and Stop ends its existing sessions.",
     "updateTitle": "Updates when you choose",
     "updateBody": "Choose Check for updates from the app. Before installing an update, it checks the download, Codewhale signature, and Apple notarization, and keeps the previous app for recovery.",

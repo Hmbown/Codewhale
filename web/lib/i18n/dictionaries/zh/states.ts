@@ -7,9 +7,9 @@ import type { StatesDict } from "../types";
 export const states: StatesDict = {
   loadingLabel: "加载中…",
   emptyTitle: "这里还没有内容",
-  emptyBody: "暂时没有可显示的记录。这里不会用编造的内容填充。",
+  emptyBody: "暂无可显示的记录。",
   errorTitle: "页面没有加载完成",
-  errorBody: "中途出了问题。你的操作没有丢失；请重试，如果持续失败，请报告给我们。",
+  errorBody: "出了点问题。请重试；如果问题持续，请报告给我们。",
   retry: "重试",
   reload: "重新加载页面",
   homeLink: "返回首页",
@@ -19,7 +19,7 @@ export const states: StatesDict = {
   notFoundHomeLink: "返回基地",
   notFoundPosterAlt: "虚构游戏《Codwhale: Modern Whalefare》的海报，一只身穿战术装备的蓝鲸。",
   unavailableTitle: "实时记录尚未加载",
-  unavailableBody: "数据源没有响应上一次刷新，或者此页面自构建以来尚未刷新。这里不会用编造的内容填充。",
+  unavailableBody: "暂时无法获取最新信息。请尝试刷新此页面。",
 
   offlineTitle: "你已离线",
   offlineBody: "操作已暂停，直到网络恢复。此处显示的内容不会刷新。",

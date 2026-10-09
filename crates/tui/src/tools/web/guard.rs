@@ -9,6 +9,13 @@
 use crate::network_policy::{Decision, NetworkPolicyDecider};
 use crate::tools::spec::{ToolContext, ToolError};
 use std::net::IpAddr;
+use std::time::Duration;
+
+/// Wall-clock bound for one pre-flight DNS resolution. The resolution runs
+/// before the guarded request (and once per redirect), so a hung resolver
+/// would otherwise stall the tool far beyond the documented request timeout
+/// envelope (`super::fetch::HARD_MAX_TIMEOUT`).
+const DNS_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// DNS pin returned when a hostname was resolved to a validated public IP.
 /// Callers should pass this to `reqwest::ClientBuilder::resolve` so the
@@ -111,13 +118,17 @@ pub(crate) async fn validate_fetch_target(
         return Ok(None);
     }
 
-    let addrs = tokio::net::lookup_host((host.as_str(), 0u16))
-        .await
-        .map_err(|e| {
-            ToolError::permission_denied(format!(
-                "could not resolve host before {tool} request: {e}"
-            ))
-        })?;
+    let addrs = tokio::time::timeout(
+        DNS_PREFLIGHT_TIMEOUT,
+        tokio::net::lookup_host((host.as_str(), 0u16)),
+    )
+    .await
+    .map_err(|_| {
+        ToolError::permission_denied(format!("timed out resolving host before {tool} request"))
+    })?
+    .map_err(|e| {
+        ToolError::permission_denied(format!("could not resolve host before {tool} request: {e}"))
+    })?;
     let mut first_valid: Option<IpAddr> = None;
     for addr in addrs {
         validate_dns_resolved_ip(&host, &addr.ip(), context.network_policy.as_ref(), tool)?;
@@ -742,6 +753,20 @@ mod tests {
         assert!(
             message.contains("web_run") || message.contains("restricted address"),
             "error should be labeled for web_run or report restricted IP; got {err}"
+        );
+    }
+
+    #[test]
+    fn dns_preflight_bound_stays_below_the_fetch_hard_cap() {
+        // The pre-flight resolution runs before every guarded request (and
+        // once per redirect); its own bound must leave room inside the fetch
+        // tool's hard cap instead of being able to outlast it. A wedged
+        // resolver surfaces as a timeout error, not a stalled tool.
+        assert!(
+            DNS_PREFLIGHT_TIMEOUT < super::super::fetch::HARD_MAX_TIMEOUT,
+            "DNS pre-flight bound {:?} must stay below the fetch hard cap {:?}",
+            DNS_PREFLIGHT_TIMEOUT,
+            super::super::fetch::HARD_MAX_TIMEOUT
         );
     }
 }

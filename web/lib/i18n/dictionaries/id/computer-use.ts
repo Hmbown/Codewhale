@@ -29,7 +29,7 @@ export const computerUse: ComputerUseDict = {
     { title: "Jalankan pemeriksaan latar belakang", body: "Pembantu membuka jendela latihan sementara, mengetikkan teks, dan menangkap tampilan jendela tersebut. Ia memeriksa apakah penunjuk atau aplikasi aktif berubah selama proses berlangsung." },
     { title: "Hubungkan ke Codewhale", body: "Tinjau, percayai, dan aktifkan Computer Use di pasar plugin Codewhale. Gunakan plugin versi 0.3.1 atau lebih baru agar tindakan lokal berjalan melalui kontrol Pause dan Stop milik pembantu." },
   ],
-  controlsTitle: "Tetap bekerja. Tetap memegang kendali.",
+  controlsTitle: "Jeda atau hentikan kontrol aplikasi",
   controlsBody: "Tindakan yang didukung berjalan pada aplikasi terpilih di latar belakang. Aplikasi dan gestur yang membutuhkan kendali latar depan memerlukan persetujuan Anda. Menu menampilkan aplikasi target dan mode input; Pause menangguhkan input pembantu, dan Stop mengakhiri sesi pembantu yang sedang berjalan.",
   updateTitle: "Perbarui saat Anda mau",
   updateBody: "Pilih Check for updates di aplikasi. Sebelum memasang pembaruan, aplikasi memeriksa berkas unduhan, tanda tangan Codewhale, dan notarisasi Apple, serta menyimpan versi sebelumnya untuk pemulihan.",

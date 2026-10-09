@@ -1,103 +1,177 @@
-<!-- source: README.md sha256:925619135f77 -->
-# Codewhale
+<!-- source: README.md sha256:c28f2ad5a8ed -->
+<div align="center">
 
-Codewhale एक ओपन सोर्स एजेंट है जो आपकी पसंद के होस्ट किए गए या लोकल मॉडल से आपका प्रोजेक्ट पढ़ता है, फ़ाइलें संपादित करता है, कमांड चलाता है और अपने काम की जाँच करता है। टर्मिनल में एक काम से शुरुआत करें। बड़े काम के हिस्से अलग-अलग मॉडल और भूमिकाओं वाले एजेंटों को सौंपें।
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="brand/wordmark-inverted.svg">
+  <img src="brand/wordmark.svg" alt="Codewhale" width="320">
+</picture>
 
-![टर्मिनल में चलता Codewhale](web/public/codewhale-tui-5765d80.png)
+**ओपन सोर्स कोडिंग एजेंट, जो किसी भी मॉडल के साथ काम करता है।**
 
-*v0.10.0 के विकासाधीन बिल्ड से टर्मिनल का पूर्वावलोकन।*
+Codewhale आपका प्रोजेक्ट पढ़ता है, फ़ाइलें संपादित करता है, कमांड चलाता है और अपने काम की
+खुद जाँच करता है — आपके टर्मिनल में, आपके चुने हुए होस्ट किए गए या लोकल मॉडल के साथ।
+
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
+[![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
+
+[वेबसाइट](https://codewhale.net) · [दस्तावेज़](docs/README.md) · [बदलावों की सूची](CHANGELOG.md) · [योगदान](CONTRIBUTING.md)
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
-[![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
-[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
+<img src="web/public/codewhale-tui-0102-demo.png" alt="टर्मिनल में चलता Codewhale सेशन" width="760">
+
+<sub>कॉन्फ़िगर किए गए स्थानीय डेमो सत्र से Codewhale के असली टर्मिनल का कैप्चर।</sub>
+
+</div>
 
 ## इंस्टॉल करें
 
-macOS या Linux पर नए इंस्टॉलेशन के लिए आधिकारिक GitHub रिलीज़ इस्तेमाल करें:
+macOS और Linux:
 
 ```bash
 curl -fsSL https://codewhale.net/install.sh | sh
-"$HOME/.local/bin/codewhale"
 ```
 
-अगर सिर्फ़ `codewhale` चलाने पर "command not found" दिखे, तो इसका मतलब है कि `~/.local/bin` अभी आपके PATH में नहीं है: इंस्टॉलर आपके शेल के लिए जो एक लाइन प्रिंट करता है उसे चलाएँ, या [इसे PATH में जोड़ें](docs/INSTALL.md#put-it-on-your-path) देखें।
+इंस्टॉलर चेकसम से सत्यापित बाइनरी `~/.local/bin` में डाउनलोड करता है। अगर इसके बाद
+`codewhale` चलाने पर "command not found" दिखे, तो इंस्टॉलर जो एक PATH लाइन प्रिंट
+करता है उसे चलाएँ, या [इसे PATH में जोड़ें](docs/INSTALL.md#put-it-on-your-path) देखें।
+कभी भी `codewhale update` से अपग्रेड करें।
 
-इंस्टॉलर सबसे नई प्रकाशित रिलीज़ चुनता है। [बदलावों की सूची](CHANGELOG.md) में अगली रिलीज़ के अभी तक अप्रकाशित कैंडिडेट का भी विवरण है; रिलीज़ उपलब्ध होने तक ये बदलाव प्रकाशित डाउनलोड में शामिल नहीं होते।
+<details>
+<summary><b>Windows, npm, Cargo और अन्य तरीके</b></summary>
 
-Windows पर [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest) से उपयुक्त इंस्टॉलर या आर्काइव डाउनलोड करें। मौजूदा सीधे इंस्टॉलेशन को अपडेट करने के लिए `codewhale update` चलाएँ; केवल जाँच के लिए `codewhale update --check` इस्तेमाल करें। अपडेटर executable का पथ दिखाता है और नए बिल्ड सुरक्षित रखता है। npm और Cargo वैकल्पिक पैकेजिंग तरीके हैं। पैकेज मैनेजर वाले इंस्टॉलेशन से माइग्रेशन और PATH के लिए [इंस्टॉलेशन गाइड](docs/INSTALL.md) देखें।
+```bash
+winget install HunterBown.CodeWhale  # Windows x64 (or Scoop, or the installer from GitHub Releases)
+npm install -g codewhale            # wraps the same release binaries
+cargo install codewhale-cli --locked  # build from crates.io
+```
 
-पहली बार चलाने पर Codewhale सीधे कंपोज़र खोलता है; यह आपको किसी सेटअप प्रक्रिया से नहीं गुज़ारता। मॉडल से जवाब पाने के लिए किसी होस्ट किए गए या लोकल मॉडल से कनेक्शन ज़रूरी है: जब तक कोई मॉडल जुड़ा नहीं होता, लॉन्च स्क्रीन पर "no model connected" दिखता है। होस्टेड कुंजी जोड़ने या कोई लोकल रनटाइम चुनने के लिए `/provider` चलाएँ (या F3 दबाएँ)। अगर Ollama पहले से किसी चैट मॉडल के साथ चल रहा है, तो Codewhale अपने-आप उस पर चला जाता है। Codewhale अतिरिक्त पैकेजिंग विकल्पों के रूप में npm और Cargo के साथ-साथ Docker, Nix, Scoop, Android/Termux और वैकल्पिक CNB मिरर का भी समर्थन करता है। पैकेज मैनेजर से प्रबंधित मौजूदा इंस्टॉलेशन के लिए माइग्रेशन के निर्देश मिलते हैं। [इंस्टॉलेशन और PATH से जुड़ी मदद](docs/INSTALL.md) देखें।
+Docker, Linux पर Nix और Homebrew, Android/Termux, चेकसम सत्यापन के साथ मैन्युअल
+डाउनलोड और वैकल्पिक CNB मिरर [इंस्टॉलेशन गाइड](docs/INSTALL.md) में दिए गए हैं।
+कोई एक तरीका चुनें: एक मशीन पर कई इंस्टॉलेशन `PATH` को लेकर आपस में टकराते हैं।
 
-हर शेल में Tab completion के लिए केवल एक कमांड चाहिए — `codewhale completion bash|zsh|fish|powershell|elvish`। [शेल कंप्लीशन](docs/INSTALL.md#8-shell-completions) देखें।
+</details>
 
-## उपयोग
+## क्विकस्टार्ट
 
-अपने प्रोजेक्ट फ़ोल्डर में टर्मिनल खोलें और `codewhale` चलाएँ (जब यह [आपके PATH में](docs/INSTALL.md#put-it-on-your-path) हो)। `/provider` से अपना प्रोवाइडर और `/model` से अपना मॉडल चुनें। फिर कोई ठोस काम बताएँ:
+**अपने प्रदाताओं की API कुंजियाँ एक ही जगह सँभालें।** [Codewhale खाता बनाएँ](https://app.codewhale.net/register)
+या साइन इन करने के लिए `codewhale login` चलाएँ। अपने खाते में API कुंजियाँ सहेजें और अपडेट करें,
+फिर साइन इन किए हुए उपकरणों पर Codewhale के मॉडल रूट के ज़रिए उनका इस्तेमाल करें।
+[खाते की कुंजियाँ सेट अप करें](docs/CONFIGURATION.md#account-provider-keys)।
+साइन इन करने से मौजूदा स्थानीय कुंजियाँ अपलोड नहीं होतीं; बिना खाते के भी स्थानीय रूप से काम कर सकते हैं।
+
+1. **अपना प्रोजेक्ट खोलें।** जिस फ़ोल्डर में काम करना है, उसमें `codewhale` चलाएँ।
+2. **कोई मॉडल जोड़ें।** होस्टेड कुंजी जोड़ने या कोई लोकल रनटाइम चुनने के लिए `/provider`
+   चलाएँ (या `F3` दबाएँ)। अगर Ollama पहले से किसी चैट मॉडल के साथ चल रहा है, तो
+   Codewhale अपने-आप उस पर चला जाता है। मॉडल बदलने के लिए `/model` इस्तेमाल करें।
+3. **कोई ठोस काम बताएँ।**
 
 ```text
 Fix the failing tests and explain what changed.
 ```
 
-या TUI खोले बिना कोई कार्य चलाएँ:
+यही काम किसी स्क्रिप्ट या CI जॉब से बिना इंटरफ़ेस के भी चलता है:
 
 ```bash
 codewhale exec "fix the failing tests and explain what changed"
 ```
 
-Codewhale आपकी रिपॉज़िटरी पढ़ सकता है, फ़ाइलें संपादित कर सकता है, कमांड चला सकता है, परिणामों की जाँच कर सकता है और लक्ष्य की ओर काम जारी रख सकता है। फ़ाइलें बदले या शेल कमांड चलाए बिना पड़ताल करने के लिए `/mode plan` इस्तेमाल करें, और बदलाव करवाने के लिए `/mode work` चुनें। Ask, Auto-Review या Full Access चुनने के लिए `Shift+Tab` दबाएँ; [मोड और अनुमतियों की गाइड](docs/MODES.md) बताती है कि हर विकल्प में क्या करने की अनुमति है।
+कमांड और कीबोर्ड शॉर्टकट देखने के लिए `/help` चलाएँ।
 
-## टर्मिनल, ऐप और Computer Use
+## इसे चलाने के तरीके
 
-टर्मिनल और ग्राफ़िकल क्लाइंट Codewhale Runtime से जुड़ते हैं, जो एजेंट और उसके टूल चलाता है:
+हर क्लाइंट उसी लोकल Codewhale Runtime को चलाता है, इसलिए सेशन, टूल और अनुमतियाँ हर जगह
+एक जैसे व्यवहार करते हैं।
 
-- **टर्मिनल:** `codewhale` इंटरैक्टिव इंटरफ़ेस खोलता है; `codewhale exec` किसी स्क्रिप्ट या CI जॉब से काम चलाता है।
-- **लोकल ब्राउज़र:** `codewhale web` उसी रनटाइम के लिए पैकेज में शामिल [लोकल वेब क्लाइंट](docs/WEB.md) खोलता है।
-- **Codewhale डेस्कटॉप ऐप (GPUI):** एक अलग रिपॉज़िटरी में विकसित नेटिव डेस्कटॉप ऐप साइन-इन किए गए प्रोडक्ट क्लाइंट की दिशा है। app.codewhale.net पर होस्ट किया गया वेब ऐप उसी के अनुरूप फिर से बनाया जाएगा; मार्केटिंग साइट, साइन-इन, बिलिंग, कानूनी और डाउनलोड पेज वेब पर बने रहेंगे। उपलब्धता [प्रोडक्ट पेज](https://codewhale.net/en/product) पर दी गई है।
+| कमांड | क्या करता है |
+| --- | --- |
+| `codewhale` | इंटरैक्टिव टर्मिनल इंटरफ़ेस |
+| `codewhale exec "…"` | किसी स्क्रिप्ट या CI से एक बिना इंटरफ़ेस वाला टर्न, JSON स्ट्रीम के साथ |
+| `codewhale web` | `127.0.0.1` पर पैकेज में शामिल [लोकल ब्राउज़र क्लाइंट](docs/WEB.md) |
+| `codewhale review --pr N` | सलाह के रूप में [pull request समीक्षा](docs/GITHUB_ACTION.md); पोस्ट करना वैकल्पिक है |
+| Runtime API | थ्रेड, इवेंट और अनुमोदन के लिए [लोकल HTTP API](docs/RUNTIME_API.md) |
 
-**Computer Use दूसरे ऐप देखने और उनके साथ इंटरैक्ट करने के लिए टूल जोड़ता है।** प्लगइन मौजूदा सोर्स कोड में शामिल है। इस्तेमाल से पहले उसके माँगे गए एक्सेस की समीक्षा करें और उसे सक्षम करें; OS की अनुमतियाँ और प्लेटफ़ॉर्म की आवश्यकताएँ तब भी लागू होती हैं। शामिल [Computer Use गाइड](crates/tui/plugins/computer-use/README.md) और [प्लगइन सेटअप](docs/PLUGINS.md) देखें।
+एक नेटिव डेस्कटॉप ऐप (GPUI) साइन-इन किए गए प्रोडक्ट क्लाइंट के रूप में बनाया जा रहा है;
+उपलब्धता के लिए [प्रोडक्ट पेज](https://codewhale.net/en/product) देखें। समुदाय द्वारा
+अनुरक्षित [VS Code एक्सटेंशन](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode)
+साइडबार से उसी Runtime से जुड़ता है ([सोर्स](https://github.com/HengQuWorld/CodeWhale-VSCode))।
 
-समुदाय द्वारा अनुरक्षित VS Code का CodeWhale एक्सटेंशन साइडबार से लोकल Runtime से जुड़ता है। इसे [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode) से इंस्टॉल करें; सोर्स कोड [GitHub](https://github.com/HengQuWorld/CodeWhale-VSCode) पर है।
+## यह क्या करता है
 
-## Codewhale क्यों
+- **कोई भी मॉडल, कोई बंधन नहीं।** 40 से अधिक बिल्ट-इन प्रोवाइडर रूट — Anthropic,
+  DeepSeek, Google, Mistral, Moonshot, OpenAI, OpenRouter, xAI और अन्य — साथ ही कोई भी
+  OpenAI-संगत एंडपॉइंट और Ollama, vLLM या SGLang के ज़रिए लोकल मॉडल।
+  [प्रोवाइडर](docs/PROVIDERS.md)
+- **नियंत्रण आपके पास रहता है।** Plan मोड कुछ बदले बिना पड़ताल करता है; Work और Operate
+  बदलाव करते हैं। अनुमोदन की स्थितियाँ तय करती हैं कि किस टूल कॉल के लिए आपकी मंज़ूरी
+  चाहिए, `/undo` और `/restore` वर्कस्पेस के बदलाव वापस लाते हैं, और `/receipts` सेशन की
+  हर फ़ाइल, कमांड और मंज़ूरी की सूची देता है। [मोड](docs/MODES.md) ·
+  [रसीदें](docs/RECEIPTS.md)
+- **लंबे कामों के लिए बना।** स्थायी `/goal` तय करें, सीमित काम
+  [सब-एजेंटों](docs/SUBAGENTS.md) को सौंपें, खर्च से पहले जाँच के साथ निगरानी में चलने वाली
+  [एजेंट टीमें](docs/FLEET.md) चलाएँ, या उन्हें रिपॉज़िटरी में रखे
+  [वर्कफ़्लो](docs/WORKFLOW_AUTHORING.md) के रूप में स्क्रिप्ट करें।
+- **जो आप पहले से इस्तेमाल करते हैं, उसे बढ़ाएँ।** [MCP सर्वर](docs/MCP.md) जोड़ें,
+  [स्किल](docs/SKILLS.md) और [प्लगइन](docs/PLUGINS.md) इंस्टॉल करें, सेशन और टूल
+  इवेंट पर [हुक](docs/HOOKS.md) चलाएँ, और मौजूदा
+  [Claude Code प्लगइन](docs/CLAUDE_PLUGIN_COMPAT.md) लोड करें।
+- **Computer Use।** शामिल प्लगइन दूसरे ऐप देखने और चलाने के टूल जोड़ता है। इस्तेमाल से
+  पहले उसके एक्सेस की समीक्षा करें और उसे सक्षम करें।
+  [गाइड](crates/tui/plugins/computer-use/README.md)
 
-- **अपने मॉडल चुनें।** होस्ट किए गए प्रोवाइडर या Ollama, vLLM अथवा SGLang के माध्यम से लोकल मॉडल जोड़ें। प्रोवाइडर बदलने के लिए `/provider` और मॉडल चुनने के लिए `/model` इस्तेमाल करें।
-- **नियंत्रण अपने पास रखें।** प्रस्तावित कार्रवाइयों और उनसे फ़ाइलों में हुए बदलावों की जाँच करें। अनुमोदन की सेटिंग तय करती हैं कि समीक्षा कब ज़रूरी है; Full Access भी नीति की बाध्यकारी सीमाओं का पालन करता है। `/undo` और `/restore` बदलावों के बाद वर्कस्पेस बहाल करने में मदद करते हैं।
-- **लंबे काम को व्यवस्थित रखें।** सेशन सहेजें, स्थायी `/goal` तय करें, वर्कफ़्लो चलने से पहले उनकी समीक्षा करें और एजेंटों के आंतरिक निर्देशों को अपनी बातचीत में जोड़े बिना उनका समन्वय करें।
-- **अपने मौजूदा एजेंट को विस्तृत करें।** MCP सर्वर और स्किल जोड़ें, हुक कॉन्फ़िगर करें और एजेंट की भूमिकाओं को अपने प्रोजेक्ट या निजी सेटिंग में पढ़ने योग्य फ़ाइलों के रूप में रखें।
+## मोड और अनुमतियाँ
 
-कमांड और कीबोर्ड शॉर्टकट देखने के लिए TUI में `/help` चलाएँ।
+| | कैसे चुनें | विकल्प |
+| --- | --- | --- |
+| **Mode** — एजेंट क्या कर रहा है | `Tab` या `/mode` | Plan (पड़ताल, कोई बदलाव नहीं) · Work (संपादन और कमांड चलाना) · Operate (नियोजित और सत्यापित चरणों से किसी लक्ष्य तक पहुँचना) |
+| **Posture** — पहले कब पूछता है | `Shift+Tab` | Ask · Auto-Review · Full Access |
+
+Full Access भी नीति की बाध्यकारी सीमाओं का पालन करता है।
+[मोड और अनुमतियों की गाइड](docs/MODES.md) हर विकल्प को समझाती है।
 
 ## सुरक्षा
 
-Codewhale आपकी मशीन पर उतने ही एक्सेस के साथ चलता है जितना आप उसे देते हैं। अनुमोदन मोड और रिपॉज़िटरी के नियम एजेंट की गतिविधियों को सीमित करते हैं; समर्थित सिस्टम पर वैकल्पिक OS सैंडबॉक्सिंग अधिक मज़बूत निष्पादन सीमा जोड़ती है। जिन मॉडलों की कीमत ज्ञात नहीं है, उन्हें मुफ़्त बताने के बजाय अज्ञात ही दिखाया जाता है।
+Codewhale आपकी मशीन पर उतने ही एक्सेस के साथ चलता है जितना आप उसे देते हैं। अनुमोदन की
+स्थितियाँ और रिपॉज़िटरी के नियम एजेंट की गतिविधियों को सीमित करते हैं, और जहाँ समर्थन है
+वहाँ कमांड OS सैंडबॉक्स के भीतर चलते हैं (macOS पर Seatbelt; Linux पर bubblewrap वैकल्पिक है)।
+कुछ भी भेजे जाने से पहले `/preview-request` सटीक, संपादित (redacted) अनुरोध दिखाता है।
+जिन मॉडलों की कीमत ज्ञात नहीं है, उन्हें मुफ़्त बताने के बजाय अज्ञात ही दिखाया जाता है।
 
-नीतियों का सटीक क्रम जानने के लिए [अधिकार क्रम](docs/AUTHORIZATION_ORDER.md) और लोकल सेटिंग के लिए [कॉन्फ़िगरेशन](docs/CONFIGURATION.md) पढ़ें।
+[अधिकार क्रम](docs/AUTHORIZATION_ORDER.md), [सैंडबॉक्सिंग](docs/SANDBOX.md) और
+[टेलीमेट्री](docs/TELEMETRY.md) देखें — उपयोग की गिनती डिफ़ॉल्ट रूप से चालू रहती है और
+`codewhale config set telemetry false` उसे बंद कर देता है।
 
 ## दस्तावेज़
 
-- [GitHub PR समीक्षा सेटअप](docs/GITHUB_ACTION.md)
-- [प्रोवाइडर और लोकल मॉडल](docs/PROVIDERS.md)
-- [एजेंट टीमें](docs/FLEET.md)
-- [MCP](docs/MCP.md), [हुक](docs/HOOKS.md) और [कॉन्फ़िगरेशन](docs/CONFIGURATION.md)
-- [लोकल वेब क्लाइंट](docs/WEB.md)
-- [सभी दस्तावेज़](docs/README.md)
-- [रिपॉज़िटरी की संरचना और योगदान गाइड](CONTRIBUTING.md#project-structure)
+| यहाँ से शुरू करें | और गहराई में जाएँ |
+| --- | --- |
+| [इंस्टॉलेशन](docs/INSTALL.md) | [कॉन्फ़िगरेशन](docs/CONFIGURATION.md) |
+| [प्रोवाइडर और लोकल मॉडल](docs/PROVIDERS.md) | [आर्किटेक्चर](docs/ARCHITECTURE.md) |
+| [मोड और अनुमतियाँ](docs/MODES.md) | [Runtime API](docs/RUNTIME_API.md) |
+| [कीबाइंडिंग](docs/KEYBINDINGS.md) | [प्लगइन लेखन](docs/PLUGIN_AUTHORING.md) |
+| [GitHub PR समीक्षा](docs/GITHUB_ACTION.md) | [सभी दस्तावेज़](docs/README.md) |
 
-## समुदाय से जुड़ें
+## समुदाय
 
-**बग रिपोर्ट, नए फ़ीचर के सुझाव और pull request का स्वागत है**, चाहे आप Codewhale का कई महीनों से इस्तेमाल कर रहे हों या पहली बार आज़मा रहे हों। यदि कोई प्रोवाइडर उपलब्ध नहीं है, कोई वर्कफ़्लो असहज है या टर्मिनल UI आपके काम में बाधा डालता है, तो [issue खोलें](https://github.com/Hmbown/CodeWhale/issues/new/choose) या [pull request भेजें](CONTRIBUTING.md), ताकि हम मिलकर इसे बेहतर बना सकें। पहले योगदान का स्वागत है और स्वीकार किए गए काम का श्रेय योगदानकर्ताओं के पास रहता है।
+बग रिपोर्ट, फ़ीचर के सुझाव और pull request का स्वागत है — चाहे आप Codewhale का कई महीनों से
+इस्तेमाल कर रहे हों या पहली बार आज़मा रहे हों। अगर कोई प्रोवाइडर उपलब्ध नहीं है या कोई
+वर्कफ़्लो असहज है, तो [issue खोलें](https://github.com/codewhale-hq/CodeWhale/issues/new/choose)
+या [pull request भेजें](CONTRIBUTING.md)। पहले योगदान का स्वागत है, और स्वीकार किए गए काम का
+श्रेय योगदानकर्ताओं के पास रहता है। [रिपॉज़िटरी की संरचना](CONTRIBUTING.md#project-structure)
+शुरुआत के लिए अच्छी जगह है।
 
-[Discord](https://discord.gg/37gfS3ksug) से जुड़ें, या WeChat पर Hunter (`hunterbown`) को जोड़कर Whale Brothers समूह में शामिल होने के लिए कहें।
+[Discord](https://discord.gg/37gfS3ksug) से जुड़ें, या WeChat पर Hunter (`hunterbown`) को जोड़कर
+Whale Brothers समूह में शामिल होने के लिए कहें।
 
-## प्रोजेक्ट का इतिहास
+## इतिहास और लाइसेंस
 
-Codewhale की शुरुआत `deepseek-tui` के रूप में हुई थी और यह आज भी उसके कॉन्फ़िगरेशन तथा सेशन के साथ संगतता बनाए रखता है। अब यह किसी प्रोवाइडर पर निर्भर नहीं है, स्वतंत्र रूप से अनुरक्षित है और किसी भी मॉडल प्रोवाइडर से संबद्ध नहीं है।
+Codewhale की शुरुआत `deepseek-tui` के रूप में हुई थी और यह आज भी उस प्रोजेक्ट का कॉन्फ़िगरेशन
+और सेशन पढ़ता है। अब यह किसी प्रोवाइडर पर निर्भर नहीं है, स्वतंत्र रूप से अनुरक्षित है और किसी भी
+मॉडल प्रोवाइडर से संबद्ध नहीं है। [हर योगदानकर्ता](docs/CONTRIBUTORS.md) और प्रोजेक्ट को आगे
+बढ़ाने वाले ओपन सोर्स समुदायों का धन्यवाद।
 
-हर योगदानकर्ता और प्रोजेक्ट को आगे बढ़ाने वाले ओपन सोर्स समुदायों का धन्यवाद। [योगदानकर्ताओं का रिकॉर्ड](docs/CONTRIBUTORS.md) देखें।
-
-## लाइसेंस
-
-[MIT](LICENSE)। अन्य ओपन सोर्स प्रोजेक्ट से लिए और अनुकूलित किए गए हिस्से [थर्ड-पार्टी नोटिस](docs/THIRD_PARTY_NOTICES.md) में दर्ज हैं।
+[MIT](LICENSE)। अन्य ओपन सोर्स प्रोजेक्ट से लिए और अनुकूलित किए गए हिस्से
+[थर्ड-पार्टी नोटिस](docs/THIRD_PARTY_NOTICES.md) में दर्ज हैं।

@@ -106,6 +106,7 @@ pub struct DebugTurnStopDiagnostics {
     pub step_budget_source: String,
     pub model_step_index: u32,
     pub model_requests_started: u32,
+    pub transport_retries: u32,
     pub transparent_stream_retries: u32,
     pub stream_resumes: u32,
     pub reasoning_only_reprompts: u32,

@@ -747,13 +747,17 @@ fn extract_media_attachment_references(input: &str) -> Vec<MediaAttachmentRefere
 // ---------------------------------------------------------------------------
 //
 // macOS parks dragged-out screenshots under a per-capture temp directory like
-// `/var/folders/…/T/Temporary Items/NSIRD_screencaptureui_XXXX/` and deletes
+// `/var/folders/…/T/Temporary Items/NSIRD_screencaptureui_XXXX/` (recent
+// releases spell it `TemporaryItems`, without the space) and deletes
 // it minutes later. Inbound references to such files are copied to a stable
 // directory the moment the message is received, so the agent later reads a
 // path that still exists.
 
 /// Marker fragments of the macOS screencapture temp directory layout.
 const SCREENCAPTURE_TEMP_DIR_MARKERS: [&str; 2] = ["Temporary Items", "screencaptureui"];
+
+/// The `Temporary Items` component as recent macOS releases spell it.
+const SCREENCAPTURE_TEMP_DIR_COMPACT: &str = "TemporaryItems";
 
 /// Stable per-session directory for stabilized screencapture files. Follows
 /// the same home-first convention as `clipboard.rs`'s clipboard-images dir.
@@ -775,7 +779,7 @@ fn is_screencapture_temp_path(path: &Path) -> bool {
         .collect();
     components
         .iter()
-        .any(|c| c == SCREENCAPTURE_TEMP_DIR_MARKERS[0])
+        .any(|c| c == SCREENCAPTURE_TEMP_DIR_MARKERS[0] || c == SCREENCAPTURE_TEMP_DIR_COMPACT)
         && components
             .iter()
             .any(|c| c.contains(SCREENCAPTURE_TEMP_DIR_MARKERS[1]))
@@ -787,22 +791,48 @@ fn stable_attachment_name(file_name: &std::ffi::OsStr) -> String {
     file_name.to_string_lossy().replace(" at ", "-")
 }
 
+/// Largest screenshot copied to a stable location.
+const MAX_STABLE_ATTACHMENT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Copy a screencapture temp file to `artifact_dir` and return the stable
 /// destination. Returns `None` when the path is not a screencapture temp
 /// file, not a regular file, or the copy fails — callers keep the original
 /// reference then. Idempotent: an existing destination is reused without a
 /// second copy.
+///
+/// `artifact_dir` is `<root>/<name>`: the destination is written through the
+/// pinned no-follow writer anchored at `root`, so a linked `artifact_dir`, a
+/// linked destination, or a dangling link at the destination name is refused
+/// instead of being written through. `root` itself may be a user-selected link
+/// (a relocated `~/.codewhale`).
 fn stabilize_screencapture_file(path: &Path, artifact_dir: &Path) -> Option<PathBuf> {
     if !is_screencapture_temp_path(path) || !path.is_file() {
         return None;
     }
-    let dest = artifact_dir.join(stable_attachment_name(path.file_name()?));
-    if !dest.exists()
-        && (std::fs::create_dir_all(artifact_dir).is_err() || std::fs::copy(path, &dest).is_err())
-    {
+    let name = stable_attachment_name(path.file_name()?);
+    let dest = artifact_dir.join(&name);
+    let relative = Path::new(artifact_dir.file_name()?).join(&name);
+    let target =
+        crate::fleet::files::WorkspaceFile::open(artifact_dir.parent()?, &relative, true).ok()?;
+    // An existing regular destination is reused; a link there fails to open.
+    if target.open_file().is_ok() {
+        return Some(dest);
+    }
+    if std::fs::metadata(path).ok()?.len() > MAX_STABLE_ATTACHMENT_BYTES {
         return None;
     }
-    Some(dest)
+    let bytes = std::fs::read(path).ok()?;
+    match target.publish(&bytes) {
+        Ok(()) => Some(dest),
+        // Lost a race to another writer of the same name: reuse only if what
+        // is there is a regular file we may open.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists && target.open_file().is_ok() =>
+        {
+            Some(dest)
+        }
+        Err(_) => None,
+    }
 }
 
 /// A path reference found in inbound text: its byte span, the path text, and
@@ -2391,6 +2421,13 @@ mod tests {
         assert!(is_screencapture_temp_path(Path::new(
             "/var/folders/x/T/Temporary Items/NSIRD_screencaptureui_ABC/Shot.png"
         )));
+        // The spelling in the founder's failing drop (macOS 26).
+        assert!(is_screencapture_temp_path(Path::new(
+            "/var/folders/gc/x/T/TemporaryItems/NSIRD_screencaptureui_IqPorQ/Screenshot 2026-10-04 at 22.25.47.png"
+        )));
+        assert!(!is_screencapture_temp_path(Path::new(
+            "/tmp/TemporaryItems/Shot.png"
+        )));
         let (tmp, source, _) = screencapture_fixture();
         assert!(is_screencapture_temp_path(&source));
         // Only one marker is not a screencapture temp location.
@@ -2486,6 +2523,30 @@ mod tests {
     }
 
     #[test]
+    fn stabilizes_a_dropped_attachment_under_compact_temporary_items() {
+        let tmp = TempDir::new().expect("tempdir");
+        let source_dir = tmp
+            .path()
+            .join("TemporaryItems")
+            .join("NSIRD_screencaptureui_IqPorQ");
+        std::fs::create_dir_all(&source_dir).expect("mkdir");
+        let source = source_dir.join("Screenshot 2026-10-04 at 22.25.47.png");
+        std::fs::write(&source, b"screenshot").expect("write");
+        let artifact_dir = tmp.path().join("attachments");
+        let input = format!("what is this?\n[Attached image: {}]\n", source.display());
+
+        let out = stabilize_screenshot_references(&input, &artifact_dir);
+
+        let stable = artifact_dir.join("Screenshot 2026-10-04-22.25.47.png");
+        assert!(stable.is_file(), "stable copy must exist");
+        assert!(
+            out.contains(&format!("[Attached image: {}]", stable.display())),
+            "got: {out}"
+        );
+        let _ = tmp;
+    }
+
+    #[test]
     fn handles_a_multibyte_final_filename_char() {
         let tmp = TempDir::new().expect("tempdir");
         let source_dir = tmp
@@ -2502,6 +2563,39 @@ mod tests {
         let stable = artifact_dir.join("截图");
         assert!(out.contains(&stable.display().to_string()), "got: {out}");
         assert!(!out.contains(&source.display().to_string()), "got: {out}");
+        let _ = tmp;
+    }
+
+    /// The stable copy is written through a no-follow writer: a dangling link
+    /// at the destination name, a linked destination, and a linked directory
+    /// are all refused, and nothing is created behind them.
+    #[cfg(unix)]
+    #[test]
+    fn stable_copies_are_never_written_through_a_link() {
+        use std::os::unix::fs::symlink;
+        let (tmp, source, artifact_dir) = screencapture_fixture();
+        let outside = TempDir::new().expect("outside");
+        let input = format!("see \"{}\"", source.display());
+        let name = "Screenshot 2026-08-10-01.09.39 截图.png";
+
+        // Dangling link at the destination name.
+        std::fs::create_dir_all(&artifact_dir).expect("mkdir");
+        let behind = outside.path().join("created-by-the-link");
+        symlink(&behind, artifact_dir.join(name)).expect("link");
+        assert_eq!(
+            stabilize_screenshot_references(&input, &artifact_dir),
+            input
+        );
+        assert!(
+            !behind.exists(),
+            "a dangling link must not be written through"
+        );
+
+        // A linked destination directory.
+        let linked_dir = tmp.path().join("linked-attachments");
+        symlink(outside.path(), &linked_dir).expect("link");
+        assert_eq!(stabilize_screenshot_references(&input, &linked_dir), input);
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
         let _ = tmp;
     }
 

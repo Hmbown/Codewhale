@@ -6,59 +6,70 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Terminal UI for open-source and open-weight coding models"
-default-run = "codewhale-tui"
+autobins = false
+# crates.io rejects packages over 10 MiB compressed, and this crate's test
+# sources (~11 MiB) push the package past that cap (0.10.1's upload was
+# refused with HTTP 413 at 11.9 MiB). None of these are compiled by
+# `cargo build` / `cargo install`; the repository keeps them for CI and local
+# test runs, and only the published package omits them.
+exclude = [
+  "tests/**",
+  "src/**/tests.rs",
+  "src/**/tests/**",
+  "src/**/*_tests.rs",
+  "src/**/test_cases_*.rs",
+  "extension-host/test/**",
+  "plugins/computer-use/tests/**",
+]
 
 [lints]
 workspace = true
 
 [features]
-default = ["mimalloc-allocator"]
-mimalloc-allocator = ["dep:mimalloc"]
+default = []
 long-running-tests = []
-# Opt-in global-allocator swap (#5872): build on rusty_alloc (the pure-Rust
-# mimalloc v2.4.5 remake — no C compiler, no build script) instead of the
-# default mimalloc. Off by default; the default build is unchanged.
-# Build with: cargo build -p codewhale-tui --no-default-features --features rusty-alloc
-rusty-alloc = ["dep:rusty_alloc-api"]
+# Accepted compatibility feature names. Allocators belong exclusively to the
+# canonical codewhale-cli executable; these library aliases have no effect.
+mimalloc-allocator = []
+rusty-alloc = []
 
 [lib]
 name = "codewhale_tui"
 path = "src/lib.rs"
 
-[[bin]]
-name = "codewhale-tui"
-path = "src/main.rs"
-
 [dependencies]
-codewhale-sanitize = { path = "../sanitize", version = "0.10.1" }
-codewhale-memory = { path = "../memory", version = "0.10.1" }
+# Independent terminal kit, pinned and vendored for reproducible binary builds.
+codewhale-ratatui = { path = "../../vendor/codewhale-ratatui", version = "0.1.0" }
+codewhale-sanitize = { path = "../sanitize", version = "0.10.2" }
+codewhale-memory = { path = "../memory", version = "0.10.2" }
 ahash = "0.8"
 anyhow.workspace = true
-codewhale-config = { path = "../config", version = "0.10.1" }
-codewhale-cloud-facts = { path = "../cloud-facts", version = "0.10.1" }
-codewhale-command-contract = { path = "../command-contract", version = "0.10.1" }
-codewhale-core = { path = "../core", version = "0.10.1" }
-codewhale-execpolicy = { path = "../execpolicy", version = "0.10.1" }
-codewhale-hooks = { path = "../hooks", version = "0.10.1" }
-codewhale-lane = { path = "../lane", version = "0.10.1" }
-codewhale-mcp = { path = "../mcp", version = "0.10.1" }
-codewhale-models = { path = "../models", version = "0.10.1" }
-codewhale-palette = { path = "../palette", version = "0.10.1" }
-codewhale-paths = { path = "../paths", version = "0.10.1" }
-codewhale-protocol = { path = "../protocol", version = "0.10.1" }
-codewhale-release = { path = "../release", version = "0.10.1" }
-codewhale-runtime = { path = "../runtime", version = "0.10.1" }
-codewhale-secrets = { path = "../secrets", version = "0.10.1" }
-codewhale-telemetry = { path = "../telemetry", version = "0.10.1" }
-codewhale-tools = { path = "../tools", version = "0.10.1" }
-codewhale-workflow = { path = "../workflow", version = "0.10.1" }
-codewhale-workflow-js = { path = "../workflow-js", version = "0.10.1" }
+codewhale-app-server = { path = "../app-server", version = "0.10.2" }
+codewhale-config = { path = "../config", version = "0.10.2" }
+codewhale-cloud-facts = { path = "../cloud-facts", version = "0.10.2" }
+codewhale-command-contract = { path = "../command-contract", version = "0.10.2" }
+codewhale-commands = { path = "../commands", version = "0.10.2" }
+codewhale-core = { path = "../core", version = "0.10.2" }
+codewhale-execpolicy = { path = "../execpolicy", version = "0.10.2" }
+codewhale-hooks = { path = "../hooks", version = "0.10.2" }
+codewhale-lane = { path = "../lane", version = "0.10.2" }
+codewhale-mcp = { path = "../mcp", version = "0.10.2" }
+codewhale-models = { path = "../models", version = "0.10.2" }
+codewhale-palette = { path = "../palette", version = "0.10.2" }
+codewhale-paths = { path = "../paths", version = "0.10.2" }
+codewhale-protocol = { path = "../protocol", version = "0.10.2" }
+codewhale-release = { path = "../release", version = "0.10.2" }
+codewhale-runtime = { path = "../runtime", version = "0.10.2" }
+codewhale-secrets = { path = "../secrets", version = "0.10.2" }
+codewhale-telemetry = { path = "../telemetry", version = "0.10.2" }
+codewhale-tools = { path = "../tools", version = "0.10.2" }
+codewhale-workflow = { path = "../workflow", version = "0.10.2" }
+codewhale-workflow-js = { path = "../workflow-js", version = "0.10.2" }
 async-stream = "0.3.6"
 async-trait.workspace = true
 base64 = "0.23.1"
 axum.workspace = true
 clap.workspace = true
-clap_complete.workspace = true
 colored = "3.0.0"
 crossterm = "0.29"
 dotenvy = "0.15.7"
@@ -68,6 +79,7 @@ dirs.workspace = true
 futures-util = "0.3.31"
 hyper-util = { version = "=0.1.20", features = ["client-proxy"] }
 oauth2 = { version = "5", default-features = false }
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
 # No ratatui-core pin: ColorCompatBackend answers `get_cursor_position()`
 # from tracked state (ratatui#2640's recommended workaround), so the CPR query
 # inside `Terminal::clear()` no longer races the input loop. See
@@ -123,6 +135,10 @@ shlex = "2.0.1"
 globset = "0.4"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+# Already a regular dependency of codewhale-workflow-js (so already linked into
+# this binary); the extension host validates tool input against the schema the
+# plugin registered with it.
+jsonschema.workspace = true
 htmd = "0.5.4"
 # lru >= 0.18.2 fixes RUSTSEC-2026-0253 (panic-unsafe `pop()`).
 lru = "0.18"
@@ -137,24 +153,21 @@ sha2.workspace = true
 # Reuse the locked cryptographic implementation for exact-call user decisions.
 ring = "0.17"
 semver.workspace = true
-codewhale-localization = { path = "../localization", version = "0.10.1" }
+codewhale-localization = { path = "../localization", version = "0.10.2" }
 shell-words = "1.1.1"
-mimalloc = { workspace = true, optional = true }
-rusty_alloc-api = { workspace = true, optional = true }
 
 [build-dependencies]
-codewhale-build-support = { path = "../build-support", version = "0.10.1" }
+codewhale-build-support = { path = "../build-support", version = "0.10.2" }
 
 [dev-dependencies]
-codewhale-runtime = { path = "../runtime", version = "0.10.1", features = [
+codewhale-runtime = { path = "../runtime", version = "0.10.2", features = [
     "test-support",
     "test-thread-scoped-state",
 ] }
-codewhale-models = { path = "../models", version = "0.10.1", features = [
+codewhale-models = { path = "../models", version = "0.10.2", features = [
     "test-support",
 ] }
 cucumber = "0.23.0"
-jsonschema.workspace = true
 wiremock = "0.6"
 tiny_http = "0.12"
 pretty_assertions = "1.4"
@@ -165,7 +178,11 @@ tokio-tungstenite = "0.30"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Wdk_Storage_FileSystem", "Win32_System_IO", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Wdk_Storage_FileSystem", "Win32_System_IO", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_SystemServices", "Win32_System_WindowsProgramming"] }
+
+[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
+# JWT verification uses upstream assembly objects when NASM is unavailable.
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["prebuilt-nasm"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))'.dependencies]
 arboard = { version = "3.4", features = ["wayland-data-control"] }

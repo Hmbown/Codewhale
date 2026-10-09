@@ -31,11 +31,12 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::process::Stdio;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use tokio::process::Command as TokioCommand;
 
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
@@ -59,6 +60,18 @@ pub(crate) const SUPPORTED_TARGET_FORMATS: &[&str] = &[
     "plain",      // plain text (formatting stripped)
     "asciidoc",   // AsciiDoc
 ];
+
+/// Wall-clock bound for one pandoc conversion: a pathological document
+/// (giant epub, pathological LaTeX) would otherwise hold the call for as
+/// long as pandoc felt like taking. Mirrors the 600s interpreter budget
+/// used by js_execution.
+const PANDOC_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Bound for the one-shot `pandoc --version` probe. A probe that cannot
+/// finish in 10s means the binary itself is wedged; like an unparseable
+/// banner, the gate then lets the conversion through and pandoc reports
+/// any flag it does not know itself.
+const PANDOC_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Tool implementing `pandoc_convert`. Converts a source file into
 /// a target format and either writes the output to disk or returns
@@ -162,20 +175,27 @@ impl ToolSpec for PandocConvertTool {
                  Windows: `winget install JohnMacFarlane.Pandoc`) and restart codewhale.",
             )
         })?;
-        require_sandbox_support(&pandoc)?;
+        require_sandbox_support(&pandoc).await?;
 
-        let mut cmd = Command::new(&pandoc);
+        let mut cmd = TokioCommand::new(&pandoc);
         cmd.args(pandoc_args(
             &source_path,
             &target_format,
             resolved_output_path.as_deref(),
         ));
+        // Kill the converter if the timeout below drops the output()
+        // future: pandoc on a pathological document would otherwise keep
+        // running orphaned after the call already failed.
+        cmd.kill_on_drop(true);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let output = cmd
-            .output()
+        let output = tokio::time::timeout(PANDOC_TIMEOUT, cmd.output())
+            .await
+            .map_err(|_| ToolError::Timeout {
+                seconds: PANDOC_TIMEOUT.as_secs(),
+            })?
             .map_err(|e| ToolError::execution_failed(format!("failed to launch pandoc: {e}")))?;
 
         if !output.status.success() {
@@ -235,19 +255,27 @@ fn parse_pandoc_version(banner: &str) -> Option<(u32, u32)> {
 
 /// Refuse a pandoc older than 2.15 with an actionable message instead of
 /// pandoc's own "Unknown option --sandbox". The version probe runs once per
-/// process; an unparseable banner is let through, and pandoc itself then
-/// rejects the flag if it does not know it.
-fn require_sandbox_support(pandoc: &str) -> Result<(), ToolError> {
-    static VERSION: OnceLock<Option<(u32, u32)>> = OnceLock::new();
-    let version = *VERSION.get_or_init(|| {
-        let out = Command::new(pandoc)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        parse_pandoc_version(&String::from_utf8_lossy(&out.stdout))
-    });
+/// process; an unparseable banner — or a probe that outlives its bound — is
+/// let through, and pandoc itself then rejects the flag if it does not know
+/// it. The child is async and kill-on-drop so a wedged `--version` can
+/// neither block the executor nor outlive the probe.
+async fn require_sandbox_support(pandoc: &str) -> Result<(), ToolError> {
+    static VERSION: tokio::sync::OnceCell<Option<(u32, u32)>> = tokio::sync::OnceCell::const_new();
+    let version = *VERSION
+        .get_or_init(|| async {
+            let mut cmd = TokioCommand::new(pandoc);
+            cmd.arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            let out = tokio::time::timeout(PANDOC_VERSION_PROBE_TIMEOUT, cmd.output())
+                .await
+                .ok()?
+                .ok()?;
+            parse_pandoc_version(&String::from_utf8_lossy(&out.stdout))
+        })
+        .await;
     match version {
         Some(found) if found < MIN_SANDBOX_VERSION => Err(ToolError::execution_failed(format!(
             "pandoc_convert: pandoc {}.{} or newer is required (found {}.{}). \
@@ -418,6 +446,21 @@ mod tests {
         assert!((2, 14) < MIN_SANDBOX_VERSION);
         assert!((2, 15) >= MIN_SANDBOX_VERSION);
         assert!((3, 0) >= MIN_SANDBOX_VERSION);
+    }
+
+    // Both invocations are bounded in time; a conversion that outlives its
+    // budget is answered with ToolError::Timeout and its child killed, but
+    // exercising that path would need a wedged `pandoc` injected past the
+    // process-global resolve_pandoc() cache, so the bounds are pinned here
+    // instead.
+    #[test]
+    fn pandoc_invocations_carry_time_bounds() {
+        assert_eq!(PANDOC_TIMEOUT, Duration::from_secs(600));
+        assert_eq!(PANDOC_VERSION_PROBE_TIMEOUT, Duration::from_secs(10));
+        assert!(
+            PANDOC_VERSION_PROBE_TIMEOUT < PANDOC_TIMEOUT,
+            "a wedged version probe must fail fast, not ride the conversion budget"
+        );
     }
 
     #[tokio::test]

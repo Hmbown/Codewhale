@@ -126,6 +126,7 @@ pub struct AudioLease {
 }
 
 enum Work {
+    View,
     Action(Request, tokio::sync::oneshot::Sender<Result<Value, String>>),
     Producer(
         Producer,
@@ -208,6 +209,7 @@ async fn frame(
     if !authorized(&headers, &state) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let _ = state.tx.try_send(Work::View);
     let Ok(frames) = state.frames.lock() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -457,6 +459,9 @@ fn run_world(
     let origin = Instant::now();
     let initial_time: f64 = context.with(|ctx| ctx.eval("JSON.parse(pet.snapshot()).timeMs"))?;
     let mut last = origin;
+    let mut last_view = origin;
+    let mut was_active = true;
+    let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
     let mut ticks = 0u64;
     let mut measurements = VecDeque::<f64>::new();
     save(&context, &mut saved, &mut store)?;
@@ -484,8 +489,13 @@ fn run_world(
         {
             audio = None;
         }
+        let active =
+            now.duration_since(last_view) <= LEASE || producer.is_some() || audio.is_some();
+        if !active || !was_active {
+            last = now;
+        }
         let elapsed = now.duration_since(last).as_secs_f64();
-        if elapsed >= 1.0 / 30.0 {
+        if active && now.duration_since(last) >= frame_interval {
             // A suspended machine advances a bounded amount and marks a gap;
             // offline wall time never invents activity or historical sound.
             let count = (elapsed * 30.0).floor().min(3.0) as u64;
@@ -591,6 +601,37 @@ fn run_world(
                         pose["style"][key] = json!(value);
                     }
                 }
+                let hollow = pose["style"]["hollow"].as_bool().unwrap_or(true);
+                let lit = pose["state"]["lit"]
+                    .as_f64()
+                    .unwrap_or(1.0)
+                    .clamp(0.18, 1.0);
+                let light = saved
+                    .appearance
+                    .background
+                    .iter()
+                    .map(|v| f64::from(*v))
+                    .sum::<f64>()
+                    > 510.0;
+                if let Some(materials) = pose["materials"].as_array_mut() {
+                    for material in materials {
+                        if let Some(channels) = material.as_array_mut().filter(|c| c.len() == 4) {
+                            for k in 0..3 {
+                                let value = if hollow {
+                                    [153., 176., 184.][k]
+                                } else if !saved.appearance.event_colors {
+                                    f64::from(saved.appearance.particle[k])
+                                } else {
+                                    channels[k].as_f64().unwrap_or(160.0)
+                                };
+                                channels[k] = json!(if light { value * 0.48 } else { value });
+                            }
+                            let alpha = channels[3].as_f64().unwrap_or(0.5);
+                            channels[3] =
+                                json!((alpha * saved.appearance.brightness * lit).clamp(0.0, 1.0));
+                        }
+                    }
+                }
                 pose["style"]["alpha"] = json!(
                     (pose["style"]["alpha"].as_f64().unwrap_or(0.5) * saved.appearance.brightness)
                         .clamp(0.0, 1.0)
@@ -614,11 +655,18 @@ fn run_world(
                 output.pop_front();
             }
         }
-        if last_save.elapsed() >= Duration::from_secs(1) {
+        if (active || was_active || storage_error) && last_save.elapsed() >= Duration::from_secs(1)
+        {
             storage_error = save(&context, &mut saved, &mut store).is_err();
             last_save = Instant::now();
         }
-        let work = match rx.recv_timeout(Duration::from_millis(2)) {
+        was_active = active;
+        let wait = if active {
+            frame_interval.saturating_sub(last.elapsed())
+        } else {
+            Duration::from_secs(1)
+        };
+        let work = match rx.recv_timeout(wait) {
             Ok(work) => work,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -626,7 +674,9 @@ fn run_world(
                 return Ok(());
             }
         };
+        last_view = Instant::now();
         match work {
+            Work::View => {}
             Work::Export(reply) => {
                 let result = context
                     .with(|ctx| super::persistence::export_recording(&ctx, true))

@@ -152,6 +152,42 @@ fn trust_and_enablement_are_separate_atomic_state_transitions() {
 }
 
 #[test]
+fn native_review_mutation_finishes_then_rechecks_current_default_receipt() {
+    let _policy = super::activation::TestPolicyGuard::extension_host(true);
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(tmp.path());
+    let plugin = config.user_plugins_dir.join("native-preset");
+    fs::create_dir_all(&plugin).unwrap();
+    fs::write(
+        plugin.join("plugin.json"),
+        r#"{"$schema":"https://agent-plugins.org/schemas/plugin.json","name":"native-preset","version":"1.0.0","extensions":{"net.codewhale":{"native":{"paths":["index.mjs"]}}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        plugin.join("index.mjs"),
+        "// codewhale-native-preset-v1 {\"id\":\"reviewer\",\"trust\":\"user\",\"is_default\":true}\nexport function apply() {}\n",
+    )
+    .unwrap();
+    let mut registry = discover_with_config(&config);
+    registry.trust("native-preset").unwrap();
+    registry.enable("native-preset").unwrap();
+    let selected = registry.selected_native_entries().to_vec();
+    assert_eq!(selected.len(), 1);
+    let fresh = discover_with_config(&config);
+    assert_eq!(fresh.selected_native_entries(), selected);
+    assert!(fresh.with_native_preset(selected[0].clone()).is_ok());
+
+    registry.disable("native-preset").unwrap();
+    assert!(registry.with_native_preset(selected[0].clone()).is_err());
+    assert!(!discover_with_config(&config).is_active("native-preset"));
+    registry.enable("native-preset").unwrap();
+    assert!(registry.with_native_preset(selected[0].clone()).is_ok());
+    registry.revoke_trust("native-preset").unwrap();
+    assert!(registry.with_native_preset(selected[0].clone()).is_err());
+    assert!(!discover_with_config(&config).is_active("native-preset"));
+}
+
+#[test]
 fn declarative_runtime_sources_survive_restart_only_from_the_staged_snapshot() {
     let fixture = super::test_fixture::DeclarativePluginFixture::new();
     let plugin = fixture.registry.get("runtime-demo").expect("plugin");
@@ -1022,6 +1058,7 @@ fn write_dsh_package(root: &Path, url: &str) -> PathBuf {
 #[test]
 fn dsh_packages_import_through_the_reviewed_install_and_update_flow() {
     let tmp = tempfile::tempdir().unwrap();
+    let _home = crate::test_support::SealedHome::at(tmp.path());
     let config = config(tmp.path());
     let network = allow_all_network();
     let package = write_dsh_package(tmp.path(), "https://docs.example.invalid/mcp");
@@ -1266,7 +1303,7 @@ fn mutation_install_rejects_names_claimed_by_other_scopes() {
 }
 
 #[test]
-fn mutation_update_refuses_local_installs_and_foreign_scopes() {
+fn mutation_update_accepts_unchanged_local_installs_and_refuses_foreign_scopes() {
     let tmp = tempfile::tempdir().unwrap();
     let config = config(tmp.path());
     let source = write_install_source(tmp.path(), "demo");
@@ -1286,16 +1323,62 @@ fn mutation_update_refuses_local_installs_and_foreign_scopes() {
     ))
     .unwrap();
 
+    let installed = config.user_plugins_dir.join("demo");
+    let before = [
+        installed.join("plugin.toml"),
+        installed.join("skills/hello/SKILL.md"),
+        installed.join(super::install::INSTALLED_FROM_MARKER),
+    ]
+    .map(|path| {
+        let bytes = fs::read(&path).unwrap();
+        (path, bytes)
+    });
+    let state_before = fs::read(&config.state_path).ok();
     let mut registry = discover_with_config(&config);
-    let err = block_on(super::mutation::execute(
+    let receipt = block_on(super::mutation::execute(
         super::mutation::PluginMutationRequest::Update {
             selector: "demo".to_string(),
         },
         &ctx,
         &mut registry,
     ))
+    .unwrap();
+    assert_eq!(
+        receipt.outcome,
+        super::mutation::PluginMutationOutcome::NoChange
+    );
+    for (path, bytes) in before {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    assert_eq!(fs::read(&config.state_path).ok(), state_before);
+
+    let workspace_bundle = config.workspace_plugins_dir.join("workspace-demo");
+    fs::create_dir_all(&workspace_bundle).unwrap();
+    let workspace_manifest =
+        b"schema_version = 1\n[plugin]\nname = \"workspace-demo\"\nversion = \"1.0.0\"\n";
+    fs::write(workspace_bundle.join("plugin.toml"), workspace_manifest).unwrap();
+    let mut registry = discover_with_config(&config);
+    let err = block_on(super::mutation::execute(
+        super::mutation::PluginMutationRequest::Update {
+            selector: "workspace-demo".to_string(),
+        },
+        &ctx,
+        &mut registry,
+    ))
     .unwrap_err();
-    assert!(format!("{err:#}").contains("local path"), "got: {err:#}");
+    assert!(
+        format!("{err:#}").contains("only user-scope bundles"),
+        "got: {err:#}"
+    );
+    assert!(
+        format!("{err:#}").contains("workspace bundle"),
+        "got: {err:#}"
+    );
+    assert_eq!(
+        fs::read(workspace_bundle.join("plugin.toml")).unwrap(),
+        workspace_manifest
+    );
+    assert!(!config.user_plugins_dir.join("workspace-demo").exists());
 
     let err = block_on(super::mutation::execute(
         super::mutation::PluginMutationRequest::Update {

@@ -27,5 +27,12 @@ Platform truths:
   `snapshot_display` frames at `intervalMs` and muxes with ffmpeg on stop.
   The receipt labels the mode `snapshot-series` — never call it real-time.
 
-Screenshots: `screenshot` returns the saved path and raster geometry; `zoom`
-crops the latest raster when a target is too small to read.
+Screenshots: `screenshot` returns a saved path, geometry and `raster_id`. Carry
+that ID in pixel targets and as the parent of `zoom` when a target is too small
+to read. Each zoom returns a new child ID; use it for child-image coordinates.
+OCR coordinate targets already include their pin. Pins remain reusable while
+current; older unpinned calls retain latest-raster behavior. A replaced capture,
+app launch or route change retires the context. On `raster_stale` or `no_raster`,
+observe again; never drop the ID to retry. Pins detect capture replacement,
+not a changed UI: re-observe after UI changes and verify input separately.
+An omitted image cannot supply coordinates.

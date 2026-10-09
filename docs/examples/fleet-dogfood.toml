@@ -6,7 +6,7 @@
 # a headless `codewhale exec` run (see docs/AGENT_RUNTIME.md).
 #
 # Automated CI-safe smoke (no external services, no model calls):
-#   cargo test -p codewhale-tui --bins fleet::executor
+#   cargo test -p codewhale-tui --lib fleet::executor
 # It drives several concurrent exec-style workers (with one injected failure)
 # through the real host adapter and asserts terminal pass/fail outcomes.
 #

@@ -65,7 +65,7 @@ function isPublishedRelease(value: unknown): value is PublishedReleaseFact {
     value.tag === `v${value.version}` &&
     typeof value.publishedAt === "string" &&
     Number.isFinite(Date.parse(value.publishedAt)) &&
-    value.url === `https://github.com/Hmbown/CodeWhale/releases/tag/${value.tag}`
+    value.url === `https://github.com/codewhale-hq/CodeWhale/releases/tag/${value.tag}`
   );
 }
 

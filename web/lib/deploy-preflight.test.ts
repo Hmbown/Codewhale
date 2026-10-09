@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { convertToWranglerConfig, loadAndParseConfig } from "@cloudflare/config";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -171,23 +172,42 @@ describe("web workflow deploy trigger contract", () => {
     expect(deploy).toContain('--expected-revision "$GITHUB_SHA"');
   });
 
-  it("builds one OpenNext bundle before preview or deploy without a Wrangler rebuild", () => {
-    const packageJson = JSON.parse(
+  it("builds and caches one bundle before cf deploy consumes it", () => {
+    const { scripts } = JSON.parse(
       readFileSync(new URL("../package.json", import.meta.url), "utf8"),
     ) as { scripts: Record<string, string> };
-    const wrangler = JSON.parse(
-      readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8"),
-    ) as { build?: { command?: string } };
-
-    expect(packageJson.scripts.preview).toBe(
-      "opennextjs-cloudflare build && opennextjs-cloudflare preview",
+    const bundler = readFileSync(new URL("../wrangler.config.ts", import.meta.url), "utf8");
+    expect(scripts["build:cloudflare"].split("npm run build:opennext")).toHaveLength(2);
+    expect(scripts.deploy.indexOf("npm run build:cloudflare")).toBeLessThan(
+      scripts.deploy.indexOf("populateCache remote"),
     );
-    expect(packageJson.scripts.deploy).toBe(
-      "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
-    );
-    expect(wrangler.build).toBeUndefined();
+    expect(scripts.deploy).toMatch(/populateCache remote .* && cf deploy --prebuilt$/);
+    expect(scripts.preview).toMatch(/^npm run build:cloudflare && .*populateCache local/);
+    expect(bundler).not.toMatch(/build\s*:/);
     expect(deploy).toContain("run: npm run deploy");
     expect(deploy).not.toContain("npm run build");
-    expect(deploy).not.toContain("npx opennextjs-cloudflare build");
+  });
+
+  it("preserves the website's existing storage and Worker identities in cf config", async () => {
+    const { result } = await loadAndParseConfig(
+      fileURLToPath(new URL("../cloudflare.config.ts", import.meta.url)),
+      { isPreview: false, mode: undefined },
+    );
+    if (!result.success) throw new Error(String(result.error));
+    const config = convertToWranglerConfig(result.data);
+    expect(config.name).toBe("codewhale-web");
+    expect(config.kv_namespaces).toEqual([
+      { binding: "CURATED_KV", id: "abaa6a753c9d45bfa5c0afaf26dc67b3" },
+      { binding: "NEXT_INC_CACHE_KV", id: "a2e6f324db9b4b03bbc940a4ba246985" },
+    ]);
+    expect(config.durable_objects?.bindings).toEqual([
+      { name: "DRAFT_CLAIM_LOCK", class_name: "DraftClaimLock", script_name: "codewhale-web" },
+    ]);
+    expect(config.exports).toEqual({ DraftClaimLock: { type: "durable-object", storage: "sqlite" } });
+    expect(config.routes).toEqual([
+      { pattern: "codewhale.net", custom_domain: true },
+      { pattern: "www.codewhale.net", custom_domain: true },
+    ]);
+    expect(config.services).toEqual([{ binding: "WORKER_SELF_REFERENCE", service: "codewhale-web" }]);
   });
 });

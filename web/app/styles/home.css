@@ -1,38 +1,26 @@
 /* ------------------------------------------------------------------ */
-/*  Home — the whale on the horizon                                     */
+/*  Home — paper above, sea below                                      */
 /* ------------------------------------------------------------------ */
 /*
- * The sky holds the promise, the actions and the install plate, over water
- * rising from the bottom right (the hero strata). The whale rests on one
- * straight horizon. Below it are the shallows (the terminal, what you can
- * do, the models, the start), then one waterline band into deep water
- * (`.stage`, in both appearances) that runs on into the footer.
+ * Paper holds the promise, capabilities and reading sections.
+ * The live whale stays beside the hero. The page ends in the sea with the
+ * install command, which runs on into the footer.
  */
 
-.home-hero { position: relative; }
+.home { --home-measure: 36rem; }
 
-.home-sky {
+/* ---------- paper: the hero ---------- */
+.home-hero {
   position: relative;
-  isolation: isolate;
-  padding-block: clamp(2.5rem, 7vw, 5.5rem) 0;
-  /* The sky rises into the logo's blue at the horizon, not away from it. */
-  background: linear-gradient(180deg, transparent 0, transparent 30%, var(--sky-rise) 100%);
-}
-
-/* The hero water: static, decorative, anchored to the horizon. */
-.home-strata {
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  overflow: hidden;
-  pointer-events: none;
+  padding-block: clamp(3.5rem, 9vw, 7.5rem) 0;
+  background: var(--bg);
 }
 
 .home-hero-inner {
   display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 0.75fr);
   align-items: end;
-  gap: var(--space-6) clamp(2rem, 5vw, 4rem);
+  gap: var(--space-6) clamp(2rem, 6vw, 5rem);
   width: var(--container);
   margin-inline: auto;
 }
@@ -40,142 +28,200 @@
 .home-hero-copy {
   display: grid;
   gap: var(--space-5);
-  padding-bottom: clamp(2rem, 5vw, 3.5rem);
+  padding-bottom: clamp(3rem, 7vw, 5.5rem);
   min-width: 0;
 }
 
+/* Type is the hero's structure: large, tight, set in the brand face. */
+/* Measured in em, not ch, so CJK and long compound words wrap the same as
+   English; hyphenation lets German compounds break at syllables. */
 .home-title {
-  max-width: 16ch;
-  font-size: var(--text-display-lg);
-  line-height: 1.02;
-  letter-spacing: -0.03em;
+  max-width: 9.5em;
+  font-size: clamp(2.5rem, 1.4rem + 4.4vw, 5rem);
+  hyphens: auto;
+  font-weight: 650;
+  line-height: 0.98;
+  letter-spacing: -0.035em;
+  text-wrap: balance;
+  color: var(--text);
 }
 
+:lang(en) .home-title { hyphens: none; }
+
 .home-lede {
-  max-width: 38rem;
+  max-width: var(--home-measure);
   color: var(--muted);
-  font-size: clamp(1.0625rem, 1rem + 0.3vw, 1.1875rem);
-  line-height: 1.6;
+  font-size: clamp(1.0625rem, 1rem + 0.35vw, 1.25rem);
+  line-height: 1.55;
+  text-wrap: pretty;
 }
 .home-lede strong { color: var(--text); font-weight: 600; }
 
-.home-hero-copy .hero-install { max-width: 34rem; }
+/* CJK headlines carry more meaning per glyph: a step smaller, wider measure,
+   and no breaks inside words (Korean) or mid-phrase where avoidable. */
+:lang(zh) .home-title,
+:lang(ja) .home-title,
+:lang(ko) .home-title {
+  max-width: 11em;
+  font-size: clamp(2.125rem, 1.2rem + 3.4vw, 4rem);
+  line-height: 1.12;
+  letter-spacing: -0.01em;
+  word-break: keep-all;
+  line-break: strict;
+}
 
-/* The whale rests on the horizon: its lowest point sits on the line. */
+.home-hero-copy .hero-install { max-width: 32rem; margin-top: var(--space-2); }
+.home-hero-copy .actions { margin-top: calc(var(--space-2) * -1); }
+
+/* The whale rests on the horizon: its lowest point meets the line. */
 .home-whale {
-  position: relative;
   display: flex;
   justify-content: center;
   align-self: end;
+  min-width: 0;
 }
-.home-whale .whale-pose {
-  --pose-size: clamp(12rem, 32vw, 26rem);
-  /* The pose's square has air below the body; drop it onto the line. */
-  margin-bottom: calc(var(--pose-size) * -0.16);
+.home-whale .whale-live {
+  --whale-size: clamp(18rem, 40vw, 34rem);
+  width: var(--whale-size);
+  /* The rig fills the middle 72% of the canvas; drop its belly onto the
+     waterline where the tide begins. */
+  margin-bottom: calc(var(--whale-size) * -0.26);
   position: relative;
   z-index: 2;
 }
 
-/* ---------- the sea ---------- */
-.home-sea {
+/* ---------- the live whale ---------- */
+.whale-live {
   position: relative;
-  overflow: hidden;
-  background: var(--home-sea);
-  background-size: 100% 70rem, auto;
-  background-repeat: no-repeat;
+  aspect-ratio: 1;
 }
-
-/* The resting whale breathes: a slow rise of a few pixels, and its
-   reflection answers. Still under reduced motion. */
-@keyframes whale-breathe { from { translate: 0 0; } to { translate: 0 -4px; } }
-@keyframes whale-breathe-reflect { from { translate: 0 0; } to { translate: 0 4px; } }
-@media (prefers-reduced-motion: no-preference) {
-  .home-whale .whale-pose { animation: whale-breathe 4.5s ease-in-out infinite alternate; }
-  .home-reflection .whale-pose { animation: whale-breathe-reflect 4.5s ease-in-out infinite alternate; }
-}
-
-/* The whale's reflection: the same pose, flipped and fading into the water. */
-.home-reflection {
+.whale-live > .whale-live-poster,
+.whale-live > .whale-live-canvas {
   position: absolute;
-  top: 0;
-  inset-inline: 0;
-  width: var(--container);
-  margin-inline: auto;
-  display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
-  gap: clamp(2rem, 5vw, 4rem);
-  pointer-events: none;
+  inset: 0;
+  width: 100%;
+  height: 100%;
 }
-.home-reflection .whale-pose {
-  --pose-size: clamp(12rem, 32vw, 26rem);
-  grid-column: 2;
-  justify-self: center;
-  margin-top: calc(var(--pose-size) * -0.16);
-  transform: scaleY(-1);
-  opacity: 0.2;
-  -webkit-mask-image: linear-gradient(0deg, #000, transparent 70%);
-  mask-image: linear-gradient(0deg, #000, transparent 70%);
-}
-
-.home-sea-body {
-  position: relative;
-  width: var(--container);
-  margin-inline: auto;
-  padding-block: clamp(5rem, 10vw, 8rem) var(--section-gap);
-}
-
-.home-section + .home-section { padding-top: var(--section-gap); }
-
-/* The real terminal, floating just under the surface. */
-.home-shot {
-  display: grid;
-  gap: var(--space-5);
-  width: min(100%, 60rem);
-  margin-inline: auto;
-}
-.home-shot .figure-frame {
-  box-shadow: 0 24px 60px -24px rgb(0 0 0 / 0.6), 0 0 0 1px var(--line);
-  border: 0;
-}
-.home-shot figcaption {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  gap: var(--space-2) var(--space-4);
-}
-
-/* The deep water after the waterline, in both appearances; the footer's
-   band rises out of it. */
-.home-deep { background: var(--ocean-floor); }
-.home-deep .home-sea-body { padding-top: var(--space-6); }
-
-.home-modes { font-family: var(--font-body); }
-
-.home-install {
-  display: grid;
-  gap: var(--space-5);
-  grid-template-columns: minmax(0, 1fr);
+/* The phase, in a word: a small point of light and a label, above the
+   whale's back. Light means live work (DIRECTION.md). */
+.whale-live-state {
+  position: absolute;
+  inset-inline-start: 50%;
+  top: 8%;
+  translate: -50% 0;
+  display: inline-flex;
   align-items: center;
-  padding: clamp(1.5rem, 4vw, 2.5rem);
+  gap: var(--space-2);
+  padding: 0.3rem 0.75rem;
   border: 1px solid var(--line);
-  border-radius: var(--radius-sheet);
-  background: color-mix(in srgb, var(--panel) 60%, transparent);
+  border-radius: var(--radius-pill);
+  background: var(--panel);
+  color: var(--text);
+  font-size: var(--text-caption);
+  font-weight: 500;
+  white-space: nowrap;
+  box-shadow: 0 6px 18px -10px rgb(11 72 187 / 0.35);
 }
-@media (min-width: 900px) {
-  .home-install { grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr); }
+.whale-live-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: var(--radius-pill);
+  background: var(--brand-light);
 }
-.home-install-channels { color: var(--muted); font-size: var(--text-ui); line-height: 1.6; }
+.whale-live-state[data-state="done"] .whale-live-dot { background: var(--live); }
+.whale-live-state[data-state="rest"] .whale-live-dot { background: var(--muted); }
+@media (prefers-reduced-motion: no-preference) {
+  .whale-live-state:not([data-state="rest"]):not([data-state="done"]) .whale-live-dot {
+    animation: whale-pulse 1.4s var(--ease-out) infinite;
+  }
+}
+@keyframes whale-pulse {
+  0% { box-shadow: 0 0 0 0 rgb(30 143 216 / 0.55); }
+  100% { box-shadow: 0 0 0 0.5rem rgb(30 143 216 / 0); }
+}
+.whale-live-poster { --pose-size: 100%; padding: 14%; box-sizing: border-box; }
+.whale-live-canvas { opacity: 0; }
+.whale-live[data-ready] .whale-live-canvas { opacity: 1; }
+.whale-live[data-ready] .whale-live-poster { visibility: hidden; }
+
+/* The install band ends the page in the sea: one line of light at its top,
+   and water that reaches the floor colour by its own bottom edge, so it runs
+   into the footer without a seam. */
+.home-install {
+  position: relative;
+  background: var(--sea-band), var(--ocean-floor);
+}
+.home-install::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto;
+  height: 1px;
+  background: var(--horizon-light);
+}
+
+/* ---------- release and source status ---------- */
+.home-release {
+  width: var(--container);
+  margin-inline: auto;
+  padding-block: var(--space-5);
+  border-block: 1px solid var(--line);
+  font-size: var(--text-ui);
+}
+
+.home-terminal {
+  width: var(--container);
+  max-width: 1000px;
+  margin-inline: auto;
+  padding-block-start: var(--space-6);
+}
+
+/* ---------- paper: the reading sections ---------- */
+.home-body {
+  width: var(--container);
+  margin-inline: auto;
+  padding-block: clamp(4.5rem, 9vw, 7rem);
+}
+.home-body > .home-section { padding-block: 0; }
+.home-body > .home-section + .home-section {
+  margin-top: clamp(2.5rem, 6vw, 5rem);
+  padding-top: clamp(2.5rem, 6vw, 5rem);
+  border-top: 1px solid var(--line);
+}
+
+/* Terms read as words, not as code: the brand face, a little weight. */
+.home-body .ruled-list dt {
+  font-family: var(--font-body);
+  font-size: var(--text-body);
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--text);
+}
 
 .product-start-links { display: flex; flex-wrap: wrap; gap: var(--space-3) var(--space-5); margin-top: var(--space-5); }
 
+/* ---------- the sea: install, into the footer ---------- */
+.home-install-inner {
+  display: grid;
+  gap: var(--space-6);
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  width: var(--container);
+  margin-inline: auto;
+  padding-block: clamp(4.5rem, 9vw, 7rem) clamp(2.5rem, 5vw, 4rem);
+}
+@media (min-width: 900px) {
+  .home-install-inner { grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr); }
+}
+.home-install-channels { color: var(--muted); font-size: var(--text-ui); line-height: 1.6; }
+
+/* ---------- narrow screens ---------- */
 @media (max-width: 900px) {
-  .home-hero-inner,
-  .home-reflection { grid-template-columns: minmax(0, 1fr); }
+  .home-hero-inner { grid-template-columns: minmax(0, 1fr); }
+  .home-hero-copy { padding-bottom: var(--space-4); }
   .home-whale { justify-content: flex-end; }
-  .home-whale .whale-pose,
-  .home-reflection .whale-pose { --pose-size: clamp(8rem, 36vw, 12rem); }
-  .home-reflection .whale-pose { grid-column: 1; justify-self: end; }
-  .home-hero-copy { padding-bottom: 0; }
-  /* On a narrow sky the water keeps to the lower half, under the whale. */
-  .home-strata { top: 40%; }
+  .home-whale .whale-live { --whale-size: clamp(14rem, 70vw, 20rem); margin-inline: auto; }
+}
+
+@media (forced-colors: active) {
+  .home-install::before { background: CanvasText; }
 }

@@ -1,43 +1,39 @@
 "use client";
 
 /**
- * <ThemeToggle> — an icon-only System / Light / Dark control in the site nav,
- * shown on every page. The current mode is in its accessible name.
+ * <ThemeToggle> — an icon-only Light / Dark control in the site nav, shown
+ * on every page. The current mode is in its accessible name.
  *
- * The whole site follows the OS appearance by default, the way the GPUI
- * client follows its `set_theme` light/dark pair: with no `data-theme` on
- * <html>, the stylesheet's `prefers-color-scheme` rules pick the scheme and
- * track OS changes live. "light" and "dark" pin the scheme through
- * `data-theme`; "system" removes the pin.
+ * Paper is the site's appearance (paper above, sea below the horizon), so
+ * the site no longer follows the OS. Dark pins the navy ground through
+ * `data-theme="dark"`; light removes the pin.
  *
  * One storage contract, shared with the web app: the `cw-theme` key holds
- * `system | light | dark`. A stored `auto` (this toggle's former name for
- * system) reads as `system`. localStorage is per-origin, so the choice made
- * here does not carry to another Codewhale host. The inline boot script in
- * the locale layout applies a stored pin before paint, so there is no theme
- * flash on reload.
+ * `light | dark`. A stored `system` or `auto` (earlier modes) reads as
+ * light. The inline boot script in the locale layout applies a stored pin
+ * before paint, so there is no theme flash on reload.
  */
 
 import { useEffect, useState } from "react";
 import { fill } from "@/lib/i18n/dictionaries";
 import { Icon, type IconName } from "./icon";
 
-type Mode = "system" | "light" | "dark";
-const ORDER: Mode[] = ["system", "light", "dark"];
+type Mode = "light" | "dark";
+const ORDER: Mode[] = ["light", "dark"];
 const KEY = "cw-theme";
 
 function load(): Mode {
   try {
     const stored = localStorage.getItem(KEY);
-    return stored === "light" || stored === "dark" ? stored : "system";
+    return stored === "dark" ? "dark" : "light";
   } catch {
-    return "system";
+    return "light";
   }
 }
 
 function apply(mode: Mode) {
   const el = document.documentElement;
-  if (mode === "system") el.removeAttribute("data-theme");
+  if (mode === "light") el.removeAttribute("data-theme");
   else el.setAttribute("data-theme", mode);
   try {
     localStorage.setItem(KEY, mode);
@@ -47,21 +43,20 @@ function apply(mode: Mode) {
 }
 
 export function ThemeToggle({
-  autoLabel,
   lightLabel,
   darkLabel,
   ariaTemplate,
   titleLabel,
 }: {
-  /** Label for the "system" mode (follow the OS). */
-  autoLabel: string;
+  /** Former "system" mode label; unused since paper became the default. */
+  autoLabel?: string;
   lightLabel: string;
   darkLabel: string;
   /** "Theme: {mode} (click to cycle)" — interpolated with fill(). */
   ariaTemplate: string;
   titleLabel: string;
 }) {
-  const [mode, setMode] = useState<Mode>("system");
+  const [mode, setMode] = useState<Mode>("light");
   const [mounted, setMounted] = useState(false);
 
   useEffect(() => {
@@ -76,12 +71,11 @@ export function ThemeToggle({
   };
 
   const labels: Record<Mode, string> = {
-    system: autoLabel,
     light: lightLabel,
     dark: darkLabel,
   };
-  const glyph: Record<Mode, IconName> = { system: "monitor", light: "sun", dark: "moon" };
-  const shown = mounted ? mode : "system";
+  const glyph: Record<Mode, IconName> = { light: "sun", dark: "moon" };
+  const shown = mounted ? mode : "light";
 
   return (
     <button

@@ -1,7 +1,7 @@
 //! Operator-approved route replacement at the first-request seam.
 //!
 //! The observed failure: a saved reviewer pin answered its first request with
-//! `Authorization failed: You have run out of credits or need a Grok
+//! `Provider plan quota exhausted: You have run out of credits or need a Grok
 //! subscription.` and no review was produced.
 use super::*;
 
@@ -101,7 +101,7 @@ async fn reviewer_tool_with(
     Arc<AtomicUsize>,
     Arc<AtomicUsize>,
 ) {
-    let (backup, backup_calls, _) = delayed_chat_client(Duration::ZERO, "review done").await;
+    let (backup, backup_calls, _, _) = delayed_chat_client(Duration::ZERO, "review done").await;
     let (pin_url, pin_calls) = refusing_chat_server().await;
     let config_path = root.join("config.toml");
     let parent_url = if parent_refuses {
@@ -194,7 +194,7 @@ replacements = ["BackupRoute/fixture-backup-model"]
     let note = route.fallback_note.expect("replacement note");
     for fact in [
         "fixture-pin-model",
-        "provider refused authorization",
+        "quota exhausted",
         "run out of credits",
         "BackupRoute/fixture-backup-model",
         "attempt 1 of 1",
@@ -219,15 +219,32 @@ model = "PinRoute/fixture-pin-model"
     let SubAgentStatus::Failed(error) = &result.status else {
         panic!("an exact refused pin fails: {:?}", result.status);
     };
-    assert!(error.contains("run out of credits"), "{error}");
+    for fact in [
+        "quota exhausted",
+        "run out of credits",
+        "requested model `fixture-pin-model`",
+        "config.toml role pin for \"reviewer\" routes PinRoute/fixture-pin-model",
+    ] {
+        assert!(error.contains(fact), "{fact} missing from {error}");
+    }
+    assert!(!error.contains("fixture-pin-key") && !error.contains("fixture-backup-key"));
     assert_eq!(result.child_route.unwrap().provider_id, "PinRoute");
 }
 
 #[test]
 fn replacement_reasons_are_typed_never_message_matched() {
     let refusal = |status| anyhow::Error::new(LlmError::from_http_response(status, REFUSAL));
+    // A 403 whose body is quota evidence is a typed quota refusal.
     assert_eq!(
         route_replacement_reason(&refusal(403)),
+        Some("quota exhausted")
+    );
+    // A 403 without quota evidence is still an authorization refusal.
+    assert_eq!(
+        route_replacement_reason(&anyhow::Error::new(LlmError::from_http_response(
+            403,
+            "Forbidden"
+        ))),
         Some("provider refused authorization")
     );
     assert_eq!(
@@ -562,7 +579,7 @@ fn a_resumed_child_names_its_saved_route_source() {
     let message = annotate_child_model_error_with_origin(
         &subagent_failure_message(&refusal),
         "fixture-pin-model",
-        crate::config::ApiProvider::Deepseek,
+        crate::config::ProviderKind::Deepseek,
         &ModelRoute::Fixed("fixture-pin-model".into()),
         Some(&origin),
     );
@@ -579,7 +596,7 @@ fn a_resumed_child_names_its_saved_route_source() {
     let message = annotate_child_model_error(
         &subagent_failure_message(&refusal),
         "fixture-pin-model",
-        crate::config::ApiProvider::Deepseek,
+        crate::config::ProviderKind::Deepseek,
         &ModelRoute::Fixed("fixture-pin-model".into()),
     );
     assert!(
@@ -723,3 +740,6 @@ replacements = ["BackupRoute/fixture-backup-model"]
     assert_eq!(route.provider_id, "BackupRoute");
     assert_eq!(route.route_source, "role.replacement");
 }
+
+#[path = "persona_receipt.rs"]
+mod persona_receipt;

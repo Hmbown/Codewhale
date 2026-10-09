@@ -259,7 +259,7 @@ pub(crate) const NETWORK_TOOL_DENYLIST: &[&str] = &[
     // they document intent and because two of them (`fetch_url`,
     // `wait_for_dev_server`) are not matched by either glob.
     //
-    // The child registry's action seam (`SubAgentToolRegistry::is_action_allowed`)
+    // The captured ChildGrant action ceiling enforced by Core's tool registry
     // lets a network-denied child keep exactly `Web{search, fetch}` past the
     // denied aliases, and the URL-input guard refuses a URL-addressed
     // `fetch` at dispatch, so the reach stays closed.

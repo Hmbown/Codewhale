@@ -83,7 +83,7 @@
 
 ## 翻译状态
 
-若想问询文档的翻译排期与逐篇状态，可在 [issue #5482](https://github.com/Hmbown/CodeWhale/issues/5482) 跟踪。
+若想问询文档的翻译排期与逐篇状态，可在 [issue #5482](https://github.com/codewhale-hq/CodeWhale/issues/5482) 跟踪。
 
 截至 2026-09-29，本目录已收录上文列出的全部中文译文。译文可能落后于英文原版：请以各篇顶部的 `last synced with English revision` 日期为准，并对照英文原版核对命令、参数与配置项。
 

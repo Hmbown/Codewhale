@@ -14,6 +14,7 @@
  *   so it is parsed defensively here and containment-checked before use.
  */
 
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ItemRecord } from "./api";
 import { renderMarkdown } from "./markdown";
@@ -160,6 +161,10 @@ function sanitizePath(value: string): string | undefined {
  * True when `candidate` resolves strictly inside `root`. Used to keep a
  * model-supplied path from escaping the workspace via `..` or an absolute
  * path somewhere else on disk.
+ *
+ * This check is lexical: it does not look at the disk, so it cannot see a
+ * symbolic link. Anything that is about to be opened must also pass
+ * {@link isRealPathInsideRoot}.
  */
 export function isInsideRoot(root: string, candidate: string): boolean {
   if (!root) {
@@ -168,5 +173,66 @@ export function isInsideRoot(root: string, candidate: string): boolean {
   const rootAbs = path.resolve(root);
   // Relative candidates resolve against the root, not the process cwd.
   const relative = path.relative(rootAbs, path.resolve(rootAbs, candidate));
-  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+  return (
+    relative !== "" &&
+    relative !== ".." &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
+  );
+}
+
+/**
+ * The real path of `target`, following every link, even when the last
+ * components do not exist yet: the deepest existing ancestor is resolved and
+ * the missing tail is appended. A dangling link is refused (`undefined`)
+ * because its destination is unknown.
+ */
+async function realPathAllowingMissingTail(target: string): Promise<string | undefined> {
+  const missing: string[] = [];
+  let current = target;
+  for (;;) {
+    try {
+      const real = await fs.promises.realpath(current);
+      return missing.length === 0 ? real : path.join(real, ...missing.reverse());
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        return undefined;
+      }
+    }
+    try {
+      if ((await fs.promises.lstat(current)).isSymbolicLink()) {
+        return undefined;
+      }
+    } catch {
+      // Nothing is there: keep climbing.
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return undefined;
+    }
+    missing.push(path.basename(current));
+    current = parent;
+  }
+}
+
+/**
+ * True when `candidate` is strictly inside `root` after links are resolved on
+ * both sides. A link inside the workspace that points elsewhere is therefore
+ * outside, which a lexical check cannot tell. Fails closed: a root or target
+ * that cannot be resolved is not inside.
+ */
+export async function isRealPathInsideRoot(root: string, candidate: string): Promise<boolean> {
+  if (!isInsideRoot(root, candidate)) {
+    return false;
+  }
+  const rootAbs = path.resolve(root);
+  let realRoot: string;
+  try {
+    realRoot = await fs.promises.realpath(rootAbs);
+  } catch {
+    return false;
+  }
+  const realTarget = await realPathAllowingMissingTail(path.resolve(rootAbs, candidate));
+  return realTarget !== undefined && isInsideRoot(realRoot, realTarget);
 }

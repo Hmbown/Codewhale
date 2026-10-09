@@ -692,6 +692,7 @@ fn capability_patch_preserves_cost_authority_and_price_block_is_atomic() {
             output: Some(2.0),
             cache_read: Some(0.1),
             cache_write: Some(3.0),
+            ..Default::default()
         }),
         ..Default::default()
     };
@@ -732,7 +733,8 @@ fn capability_patch_preserves_cost_authority_and_price_block_is_atomic() {
             input: Some(4.0),
             output: None,
             cache_read: None,
-            cache_write: None
+            cache_write: None,
+            ..Default::default()
         })
     );
     facts.valid_until = Some(0);

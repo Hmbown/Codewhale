@@ -37,7 +37,7 @@ export const chrome: ChromeDict = {
   themeTitle: "Theme · auto / light / dark",
 
   footerTagline:
-    "Create what you want and automate everyday work with the models you choose.",
+    "Build apps and automate work with your own models and connected tools.",
   footerProduct: "Product",
   footerProject: "Project",
   footerDocs: "Docs",

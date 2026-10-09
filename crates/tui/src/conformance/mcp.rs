@@ -5,14 +5,17 @@
 //! `tools/call` (a result, an `isError` result, a JSON-RPC error, progress
 //! notifications before the result, or no answer at all until the caller
 //! cancels) — plus the steps a host takes against it. The harness serves the
-//! transcript as a real Streamable HTTP MCP server on loopback, so any client
-//! that can open a URL can be pointed at it, including a child Node process.
+//! transcript as a real Streamable HTTP MCP server on loopback
+//! ([`server`]), so any client that can open a URL can be pointed at it,
+//! including a child Node process; or, for `"transport": "stdio"`, as a
+//! POSIX-shell child (`stdio_server.sh.fixture`, named so the repo's `*.sh`
+//! ignore rule does not swallow it) the dispatch spawns itself.
 //!
 //! [`DISPATCHES`] is the seam for the TypeScript migration
 //! (TS-EXTENSION-HOST-DESIGN §5.2, §9.3): today it holds the Rust pool path
 //! production uses (`Engine::execute_mcp_tool_with_pool`); `HostMcpDispatch`
-//! joins it in Phase 2 and must produce the *same* golden, because the
-//! golden does not name the dispatch. Production MCP code is not touched.
+//! now joins it and must produce the *same* golden, because the golden
+//! does not name the dispatch. It uses the real pinned SDK and Rust broker.
 //!
 //! Normalization: the server URL/port is masked; results are
 //! `{"ok": {success, content, metadata, content_blocks}}` with JSON content
@@ -20,35 +23,87 @@
 //! `server_received` lists the side-effecting requests the server saw
 //! (`tools/call`, `resources/read`, `prompts/get`) — a call that must not be
 //! sent, or must not be replayed, shows up there.
+//!
+//! # Case fields beyond the original two cases
+//!
+//! All optional; an absent field is the original behaviour, so the original
+//! goldens did not move.
+//!
+//! - `transport`: `"http"` (default) or `"stdio"`. A stdio case's `server`
+//!   object is written to files for `stdio_server.sh.fixture`; only `initialize`,
+//!   `tools/list` and `tools/call` (by `match.name`, with `"exit": true` for
+//!   a server that dies after reading the call) are supported. Unix only.
+//! - `config`: extra `McpServerConfig` fields merged over the harness's own.
+//! - `disallowed_tools`: deny rules handed to the dispatch (pool-level and
+//!   per-call, as the engine does).
+//! - `expect_boot`: `"error"` records a failed boot as
+//!   `{"op":"boot","outcome":{"err":detail}}` instead of failing the harness;
+//!   steps still run, so the catalog after a failed boot is pinned too. A
+//!   case that expects an error and boots cleanly fails the harness.
+//! - `server_options`: `numbered_sessions`, `require_bearer` (see [`server`]).
+//! - `bearer_secret`: a fake token the harness exports as the server's
+//!   `bearer_token_env_var`. It must appear in no recorded byte: the outcome
+//!   is scanned for it before a golden is compared or written, in update mode
+//!   too.
+//! - `sink`: start a second server and put its URL where the spec says
+//!   `{{sink_url}}`; the outcome records how many requests reached it.
+//! - `record_requests`: `"full"` adds every POST the server saw (session,
+//!   protocol version, authorization shape, status) to the outcome as
+//!   `requests`; `"summary"` adds only the distinct methods, authorization
+//!   shapes and statuses (`requests_summary`), for cases that must not pin how
+//!   often a client retries a connect.
+//!
+//! Steps: `catalog`, `call`, and `approval_hints` (`{"op":"approval_hints",
+//! "tools":[model names]}`, read after a `catalog` step).
+//!
+//! What a host-backed dispatch is *not* tested on by this family is listed in
+//! the fixture README's coverage boundaries: reviewed-plugin launches (hash
+//! refusal, trusted-read-only approval hints), real OAuth login, the SSE
+//! legacy transport, the 32 MiB aggregate catalog byte cap, concurrent
+//! calls, and a held stdio call.
 
+mod controls;
+mod server;
+
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use self::server::{ServerOptions, TranscriptServer};
 use super::golden::{self, Failures, Sandbox};
 use crate::core::engine::Engine;
 use crate::core::events::Event;
-use crate::mcp::{McpConfig, McpPool};
+use crate::mcp::{McpConfig, McpPool, McpToolApprovalHint};
+use crate::test_support::EnvVarGuard;
 use crate::tools::spec::{RichToolResult, ToolError};
 
 const FAMILY: &str = "mcp";
 const CALL_DEADLINE: Duration = Duration::from_secs(30);
-/// A held `tools/call` is released after this long even if nobody cancels,
-/// so a dispatch that ignores cancellation fails the case instead of hanging.
-const HOLD_LIMIT: Duration = Duration::from_secs(20);
+/// The environment variable a case's `bearer_secret` is exported through.
+const BEARER_ENV: &str = "CODEWHALE_CONFORMANCE_MCP_TOKEN";
 
 // === The dispatch seam ===
 
+/// Everything a dispatch is built from: the connection config, and the deny
+/// rules the engine would also hand to the pool (`--disallowed-tools`).
+struct DispatchSetup {
+    config: McpConfig,
+    disallowed_tools: Vec<String>,
+}
+
 /// One implementation of "call a tool on an external MCP server", as the
 /// engine sees it. Planning, hooks and approval happen before `call`;
-/// implementors never gate (design §5.2).
+/// implementors never gate (design §5.2) — except that deny rules are part of
+/// the dispatch's setup and refuse a call before anything reaches a server.
 #[async_trait::async_trait]
 trait McpDispatchUnderTest: Send + Sync {
-    /// Connect to every configured server.
+    /// Connect to every configured server. An `Err` is a connect failure
+    /// (including needs-auth); the dispatch must still answer `catalog` and
+    /// `call` afterwards, with whatever it can still advertise.
     async fn boot(&self) -> Result<(), String>;
     /// The model-visible tool catalog this dispatch advertises.
     async fn catalog(&self) -> Vec<codewhale_models::Tool>;
@@ -59,53 +114,42 @@ trait McpDispatchUnderTest: Send + Sync {
         input: Value,
         cancel: CancellationToken,
     ) -> Result<RichToolResult, ToolError>;
+    /// Addition for the approval-hint case: how the approval path may treat
+    /// `model_name` given what the server's catalog declared, read after
+    /// `catalog()`. `"destructive"` (each call keeps its prompt),
+    /// `"trusted_read_only"` (a reviewed plugin's read-only tool runs
+    /// unprompted), or `None`. Implementation-neutral: any dispatch that
+    /// consumes MCP tool annotations has this answer.
+    async fn approval_hint(&self, model_name: &str) -> Option<&'static str>;
     async fn shutdown(&self);
 }
 
-#[tokio::test]
-async fn harness_timeout_rejects_a_real_unanswered_mcp_call() {
-    let mut case = golden::read_case(FAMILY, "tools_resources_prompts");
-    let held = case["steps"]
-        .as_array()
-        .expect("steps")
-        .iter()
-        .find(|step| step["cancel"] == "after_server_holds")
-        .expect("held-call fixture")
-        .clone();
-    let mut held = held;
-    held.as_object_mut().expect("step").remove("cancel");
-    case["steps"] = json!([held]);
-    let _sandbox = Sandbox::new(&Value::Null);
-    let outcome =
-        run_transcript_with_deadline(&case, McpPoolDispatch::boxed, Duration::from_secs(1)).await;
-    let mut failures = Failures::default();
-    match outcome {
-        Err(error) => failures.push("unanswered_call", error),
-        Ok(_) => panic!("an unanswered MCP call became recordable output"),
-    }
-    assert!(failures.contains("harness timeout: MCP call"));
-}
-
-type DispatchFactory = fn(config: McpConfig) -> Box<dyn McpDispatchUnderTest>;
+type DispatchFactory = fn(setup: DispatchSetup) -> Box<dyn McpDispatchUnderTest>;
 
 /// Every dispatch runs every transcript against the same golden.
-const DISPATCHES: &[(&str, DispatchFactory)] = &[("mcp_pool", McpPoolDispatch::boxed)];
+const DISPATCHES: &[(&str, DispatchFactory)] = &[
+    ("mcp_pool", McpPoolDispatch::boxed),
+    ("host_sdk", HostMcpDispatch::boxed),
+];
 
 /// The Rust path production uses today: the shared pool behind the engine's
 /// direct MCP execution seam.
 struct McpPoolDispatch {
     pool: Arc<AsyncMutex<McpPool>>,
     tx_event: mpsc::Sender<Event>,
+    disallowed_tools: Vec<String>,
     // Kept open so status events the dispatch emits never hit a closed channel.
     _rx_event: Mutex<mpsc::Receiver<Event>>,
 }
 
 impl McpPoolDispatch {
-    fn boxed(config: McpConfig) -> Box<dyn McpDispatchUnderTest> {
+    fn boxed(setup: DispatchSetup) -> Box<dyn McpDispatchUnderTest> {
         let (tx_event, rx_event) = mpsc::channel(64);
+        let pool = McpPool::new(setup.config).with_disallowed_tools(setup.disallowed_tools.clone());
         Box::new(Self {
-            pool: Arc::new(AsyncMutex::new(McpPool::new(config))),
+            pool: Arc::new(AsyncMutex::new(pool)),
             tx_event,
+            disallowed_tools: setup.disallowed_tools,
             _rx_event: Mutex::new(rx_event),
         })
     }
@@ -145,11 +189,20 @@ impl McpDispatchUnderTest for McpPoolDispatch {
                 &self.tx_event,
                 model_name,
                 input,
-                &[],
+                // The engine hands the registry context's rules to every call
+                // as well as to the pool; do both.
+                &self.disallowed_tools,
                 // Conformance probes cannot supply a person's card decision.
                 None,
             ) => result,
         }
+    }
+
+    async fn approval_hint(&self, model_name: &str) -> Option<&'static str> {
+        crate::mcp::mcp_tool_approval_hint(model_name).map(|hint| match hint {
+            McpToolApprovalHint::TrustedReadOnly => "trusted_read_only",
+            McpToolApprovalHint::Destructive => "destructive",
+        })
     }
 
     async fn shutdown(&self) {
@@ -157,206 +210,255 @@ impl McpDispatchUnderTest for McpPoolDispatch {
     }
 }
 
-// === The transcript server ===
-
-struct TranscriptServer {
-    url: String,
-    addr: String,
-    received: Arc<Mutex<Vec<Value>>>,
-    held: Arc<Notify>,
-    task: tokio::task::JoinHandle<()>,
+/// The selected production Host pool, not a semantic fake. The sandbox
+/// already seals CODEWHALE_HOME; manager materialization and native child
+/// launch use that same root. Guards live through shutdown on this runner's
+/// current-thread runtime, so host workers never inherit another case's policy.
+struct HostMcpDispatch {
+    inner: McpPoolDispatch,
+    manager: Arc<crate::extension_host::ExtensionHostManager>,
+    _manager: crate::extension_host::TestManagerGuard,
+    _policy: crate::plugins::activation::TestPolicyGuard,
 }
-
-impl Drop for TranscriptServer {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-impl TranscriptServer {
-    async fn start(spec: Value) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind transcript server");
-        let addr = listener.local_addr().expect("addr").to_string();
-        let url = format!("http://{addr}/mcp");
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let held = Arc::new(Notify::new());
-        let spec = Arc::new(spec);
-        let (log, notify) = (Arc::clone(&received), Arc::clone(&held));
-        let task = tokio::spawn(async move {
-            let mut connections = tokio::task::JoinSet::new();
-            loop {
-                let accepted = tokio::select! {
-                    accepted = listener.accept() => accepted,
-                    _ = connections.join_next(), if !connections.is_empty() => continue,
-                };
-                let Ok((socket, _)) = accepted else {
-                    break;
-                };
-                let (spec, log, notify) =
-                    (Arc::clone(&spec), Arc::clone(&log), Arc::clone(&notify));
-                connections.spawn(async move {
-                    answer(socket, &spec, &log, &notify).await;
-                });
-            }
-        });
-        Self {
-            url,
-            addr,
-            received,
-            held,
-            task,
-        }
-    }
-}
-
-async fn answer(
-    socket: tokio::net::TcpStream,
-    spec: &Value,
-    log: &Mutex<Vec<Value>>,
-    held: &Notify,
-) {
-    let mut reader = BufReader::new(socket);
-    let mut line = String::new();
-    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
-        return;
-    }
-    let method = line
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    let mut content_length = 0usize;
-    loop {
-        line.clear();
-        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
-            return;
-        }
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            content_length = value.trim().parse().unwrap_or(0);
-        }
-    }
-    let mut body = vec![0u8; content_length];
-    if reader.read_exact(&mut body).await.is_err() {
-        return;
-    }
-    let mut socket = reader.into_inner();
-    if method != "POST" {
-        // No server-initiated stream: the spec's answer for a GET.
-        let _ = socket
-            .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nAllow: POST\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .await;
-        return;
-    }
-    let Ok(message) = serde_json::from_slice::<Value>(&body) else {
-        let _ = socket
-            .write_all(
-                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )
-            .await;
-        return;
-    };
-    let rpc_method = message["method"].as_str().unwrap_or_default().to_string();
-    let params = message.get("params").cloned().unwrap_or(Value::Null);
-    let Some(id) = message.get("id").cloned() else {
-        // Notifications (initialized, cancelled, progress) are accepted.
-        let _ = socket
-            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .await;
-        return;
-    };
-    match rpc_method.as_str() {
-        "tools/call" => log.lock().expect("log").push(json!({
-            "method": "tools/call",
-            "name": params["name"],
-            "arguments": params.get("arguments").cloned().unwrap_or(Value::Null),
-        })),
-        "resources/read" => log
-            .lock()
-            .expect("log")
-            .push(json!({ "method": "resources/read", "uri": params["uri"] })),
-        "prompts/get" => log
-            .lock()
-            .expect("log")
-            .push(json!({ "method": "prompts/get", "name": params["name"] })),
-        _ => {}
-    }
-
-    let entry = scripted_entry(spec, &rpc_method, &params);
-    if entry.get("hold").and_then(Value::as_bool) == Some(true) {
-        held.notify_one();
-        // Answer nothing until the client goes away (or the hold limit).
-        let mut byte = [0u8; 1];
-        let _ = tokio::time::timeout(HOLD_LIMIT, socket.read(&mut byte)).await;
-        return;
-    }
-    let reply = match entry.get("error") {
-        Some(error) => json!({ "jsonrpc": "2.0", "id": id, "error": error }),
-        None => json!({ "jsonrpc": "2.0", "id": id, "result": entry["result"] }),
-    };
-    let session = if rpc_method == "initialize" {
-        "Mcp-Session-Id: conformance-session\r\n"
-    } else {
-        ""
-    };
-    let progress = entry.get("progress").and_then(Value::as_array);
-    let (content_type, payload) = match progress {
-        Some(steps) => {
-            let token = params
-                .pointer("/_meta/progressToken")
-                .cloned()
-                .unwrap_or_else(|| json!("conformance"));
-            let mut sse = String::new();
-            for step in steps {
-                let notification = json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/progress",
-                    "params": { "progressToken": token, "progress": step["progress"], "total": step["total"] },
-                });
-                sse.push_str(&format!("event: message\ndata: {notification}\n\n"));
-            }
-            sse.push_str(&format!("event: message\ndata: {reply}\n\n"));
-            ("text/event-stream", sse)
-        }
-        None => ("application/json", reply.to_string()),
-    };
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{session}Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-        payload.len()
-    );
-    let _ = socket.write_all(response.as_bytes()).await;
-    let _ = socket.shutdown().await;
-}
-
-/// The transcript's answer for one request: a fixed entry per list method,
-/// or the first `match`ing entry for calls. Unknown methods get -32601.
-fn scripted_entry(spec: &Value, method: &str, params: &Value) -> Value {
-    let not_found =
-        || json!({ "error": { "code": -32601, "message": format!("method not found: {method}") } });
-    let Some(entry) = spec.get(method) else {
-        return not_found();
-    };
-    let Some(candidates) = entry.as_array() else {
-        return entry.clone();
-    };
-    candidates
-        .iter()
-        .find(|candidate| {
-            candidate["match"]
-                .as_object()
-                .is_none_or(|fields| fields.iter().all(|(key, value)| params.get(key) == Some(value)))
+impl HostMcpDispatch {
+    fn boxed(setup: DispatchSetup) -> Box<dyn McpDispatchUnderTest> {
+        let node = crate::extension_host::tests::node_for_tests("recorded MCP Host SDK parity")
+            .expect("recorded Host SDK parity requires a supported local Node runtime");
+        let root =
+            PathBuf::from(std::env::var_os("CODEWHALE_HOME").expect("sealed conformance home"));
+        let manager = Arc::new(crate::extension_host::ExtensionHostManager::new(
+            crate::extension_host::ExtensionHostOptions {
+                node_override: Some(node),
+                root: Some(root),
+                ..Default::default()
+            },
+        ));
+        let policy = crate::plugins::activation::TestPolicyGuard::extension_host(true);
+        let manager_guard = crate::extension_host::TestManagerGuard::install(Arc::clone(&manager));
+        let (tx_event, rx_event) = mpsc::channel(64);
+        let pool = McpPool::new(setup.config)
+            .with_disallowed_tools(setup.disallowed_tools.clone())
+            .with_backend(crate::mcp::McpBackend::Host);
+        Box::new(Self {
+            inner: McpPoolDispatch {
+                pool: Arc::new(AsyncMutex::new(pool)),
+                tx_event,
+                disallowed_tools: setup.disallowed_tools,
+                _rx_event: Mutex::new(rx_event),
+            },
+            manager,
+            _manager: manager_guard,
+            _policy: policy,
         })
-        .cloned()
-        .unwrap_or_else(|| json!({ "error": { "code": -32602, "message": format!("no scripted {method} answer for {params}") } }))
+    }
+}
+#[async_trait::async_trait]
+impl McpDispatchUnderTest for HostMcpDispatch {
+    async fn boot(&self) -> Result<(), String> {
+        self.inner.boot().await
+    }
+    async fn catalog(&self) -> Vec<codewhale_models::Tool> {
+        self.inner.catalog().await
+    }
+    async fn call(
+        &self,
+        name: &str,
+        input: Value,
+        cancel: CancellationToken,
+    ) -> Result<RichToolResult, ToolError> {
+        self.inner.call(name, input, cancel).await
+    }
+    async fn approval_hint(&self, name: &str) -> Option<&'static str> {
+        self.inner.approval_hint(name).await
+    }
+    async fn shutdown(&self) {
+        self.inner.shutdown().await;
+        self.manager.shutdown().await;
+    }
+}
+
+// === The server a case runs against ===
+
+struct Backend {
+    server: Option<TranscriptServer>,
+    sink: Option<TranscriptServer>,
+    stdio_dir: Option<PathBuf>,
+}
+
+impl Backend {
+    /// Start what the case scripts and return it with the `McpServerConfig`
+    /// the dispatch connects with.
+    async fn start(case: &Value, workspace: &Path) -> (Self, Value) {
+        let mut config = if case["transport"].as_str() == Some("stdio") {
+            let dir = workspace.join("stdio_server");
+            write_stdio_server(&dir, &case["server"]);
+            let script = dir.join("stdio_server.sh");
+            let config = json!({
+                "command": "sh",
+                "args": [script, dir],
+                "connect_timeout": 10,
+                "execute_timeout": 10,
+            });
+            return (
+                Self {
+                    server: None,
+                    sink: None,
+                    stdio_dir: Some(dir),
+                },
+                merged(config, &case["config"]),
+            );
+        } else {
+            json!({ "connect_timeout": 10, "execute_timeout": 10 })
+        };
+        let sink = if case["sink"].as_bool() == Some(true) {
+            Some(TranscriptServer::start(json!({}), ServerOptions::default()).await)
+        } else {
+            None
+        };
+        // The sink's URL is not known until it is listening; the spec names
+        // it as `{{sink_url}}`.
+        let spec = match &sink {
+            Some(sink) => serde_json::from_str(
+                &case["server"]
+                    .to_string()
+                    .replace("{{sink_url}}", &sink.url),
+            )
+            .expect("spec with sink url"),
+            None => case["server"].clone(),
+        };
+        let secret = case["bearer_secret"].as_str();
+        let options = ServerOptions {
+            numbered_sessions: case["server_options"]["numbered_sessions"].as_bool() == Some(true),
+            require_bearer: case["server_options"]["require_bearer"]
+                .as_bool()
+                .filter(|required| *required)
+                .and_then(|_| secret.map(str::to_string)),
+        };
+        let server = TranscriptServer::start(spec, options).await;
+        config["url"] = json!(server.url);
+        if secret.is_some() {
+            config["bearer_token_env_var"] = json!(BEARER_ENV);
+        }
+        (
+            Self {
+                server: Some(server),
+                sink,
+                stdio_dir: None,
+            },
+            merged(config, &case["config"]),
+        )
+    }
+
+    /// Server URL/port literals the golden masks.
+    fn literals(&self) -> Vec<(String, String)> {
+        let mut literals = Vec::new();
+        for (server, url_label, addr_label) in [
+            (&self.server, "<SERVER_URL>", "<SERVER_ADDR>"),
+            (&self.sink, "<SINK_URL>", "<SINK_ADDR>"),
+        ] {
+            if let Some(server) = server {
+                literals.push((server.url.clone(), url_label.to_string()));
+                literals.push((server.addr.clone(), addr_label.to_string()));
+            }
+        }
+        literals
+    }
+
+    /// Side-effecting requests the server was asked to run.
+    fn received(&self) -> Vec<Value> {
+        if let Some(server) = &self.server {
+            return server.received();
+        }
+        let dir = self.stdio_dir.as_ref().expect("a backend has a server");
+        std::fs::read_to_string(dir.join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let request: Value = serde_json::from_str(line).expect("logged request");
+                json!({
+                    "method": "tools/call",
+                    "name": request["params"]["name"],
+                    "arguments": request["params"].get("arguments").cloned().unwrap_or(Value::Null),
+                })
+            })
+            .collect()
+    }
+}
+
+fn merged(mut base: Value, extra: &Value) -> Value {
+    if let Some(extra) = extra.as_object() {
+        for (key, value) in extra {
+            base[key] = value.clone();
+        }
+    }
+    base
+}
+
+/// Materialize a transcript for `stdio_server.sh.fixture`: the script itself plus one
+/// reply file per scripted answer (see the script's header).
+fn write_stdio_server(dir: &Path, spec: &Value) {
+    std::fs::create_dir_all(dir).expect("stdio server dir");
+    std::fs::copy(
+        golden::family_dir(FAMILY).join("stdio_server.sh.fixture"),
+        dir.join("stdio_server.sh"),
+    )
+    .expect("copy stdio_server.sh.fixture");
+    // `"result":{…}` / `"error":{…}`: a JSON-RPC reply minus its id.
+    let fragment = |entry: &Value| match entry.get("error") {
+        Some(error) => format!("\"error\":{error}"),
+        None => format!("\"result\":{}", entry["result"]),
+    };
+    for (method, file) in [
+        ("initialize", "initialize.reply"),
+        ("tools/list", "tools_list.reply"),
+    ] {
+        let entry = spec
+            .get(method)
+            .unwrap_or_else(|| panic!("a stdio case scripts `{method}`"));
+        std::fs::write(dir.join(file), fragment(entry)).expect("write reply");
+    }
+    for call in spec["tools/call"].as_array().into_iter().flatten() {
+        let tool = call["match"]["name"]
+            .as_str()
+            .expect("tools/call match.name");
+        if call["exit"].as_bool() == Some(true) {
+            std::fs::write(dir.join(format!("call.{tool}.exit")), "").expect("write exit");
+        } else {
+            std::fs::write(dir.join(format!("call.{tool}.reply")), fragment(call))
+                .expect("write reply");
+        }
+    }
 }
 
 // === Running a transcript ===
+
+#[test]
+fn harness_timeout_rejects_a_real_unanswered_mcp_call() {
+    let mut case = golden::read_case(FAMILY, "tools_resources_prompts");
+    let held = case["steps"]
+        .as_array()
+        .expect("steps")
+        .iter()
+        .find(|step| step["cancel"] == "after_server_holds")
+        .expect("held-call fixture")
+        .clone();
+    let mut held = held;
+    held.as_object_mut().expect("step").remove("cancel");
+    case["steps"] = json!([held]);
+    let outcome = run_case(
+        "unanswered_call",
+        &case,
+        McpPoolDispatch::boxed,
+        Duration::from_secs(1),
+        true,
+    );
+    let mut failures = Failures::default();
+    match outcome {
+        Err(error) => failures.push("unanswered_call", error),
+        Ok(()) => panic!("an unanswered MCP call became recordable output"),
+    }
+    assert!(failures.contains("harness timeout: MCP call"));
+}
 
 fn normalize_call(result: &Result<RichToolResult, ToolError>) -> Value {
     match result {
@@ -376,33 +478,35 @@ fn normalize_call(result: &Result<RichToolResult, ToolError>) -> Value {
 async fn run_transcript(
     case: &Value,
     factory: DispatchFactory,
-) -> Result<(Value, TranscriptServer), String> {
-    run_transcript_with_deadline(case, factory, CALL_DEADLINE).await
-}
-
-async fn run_transcript_with_deadline(
-    case: &Value,
-    factory: DispatchFactory,
+    workspace: &Path,
     deadline: Duration,
-) -> Result<(Value, TranscriptServer), String> {
+) -> Result<(Value, Vec<(String, String)>), String> {
     let scripted_steps = case["steps"].as_array().expect("case.steps");
     if scripted_steps.is_empty() {
         return Err("MCP transcript has no host steps".to_string());
     }
-    let server = TranscriptServer::start(case["server"].clone()).await;
+    let (backend, server_config) = Backend::start(case, workspace).await;
     let server_name = case["server_name"].as_str().unwrap_or("conformance");
-    let config: McpConfig = serde_json::from_value(json!({
-        "servers": { server_name: {
-            "url": server.url,
-            "connect_timeout": 10,
-            "execute_timeout": 10,
-        } }
-    }))
-    .expect("transcript MCP config");
-    let dispatch = factory(config);
+    let config: McpConfig =
+        serde_json::from_value(json!({ "servers": { server_name: server_config } }))
+            .expect("transcript MCP config");
+    let dispatch = factory(DispatchSetup {
+        config,
+        disallowed_tools: case["disallowed_tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|rule| rule.as_str().expect("deny rule").to_string())
+            .collect(),
+    });
     let mut steps = Vec::new();
+    let expect_boot_error = case["expect_boot"].as_str() == Some("error");
     let boot = match golden::complete_within("MCP boot", deadline, dispatch.boot()).await? {
+        Ok(()) if expect_boot_error => {
+            return Err("MCP transcript expected boot to fail but it connected".to_string());
+        }
         Ok(()) => json!("ok"),
+        Err(detail) if expect_boot_error => json!({ "err": detail }),
         Err(detail) => return Err(format!("MCP transcript could not boot: {detail}")),
     };
     steps.push(json!({ "op": "boot", "outcome": boot }));
@@ -415,14 +519,35 @@ async fn run_transcript_with_deadline(
                 .expect("catalog");
                 steps.push(json!({ "op": "catalog", "tools": catalog }));
             }
+            "approval_hints" => {
+                let mut hints = serde_json::Map::new();
+                for tool in step["tools"].as_array().expect("step.tools") {
+                    let tool = tool.as_str().expect("tool name");
+                    let hint = golden::complete_within(
+                        "MCP approval hint",
+                        deadline,
+                        dispatch.approval_hint(tool),
+                    )
+                    .await?;
+                    hints.insert(tool.to_string(), json!(hint));
+                }
+                steps.push(json!({ "op": "approval_hints", "hints": hints }));
+            }
             "call" => {
                 let tool = step["tool"].as_str().expect("step.tool");
                 let cancel = CancellationToken::new();
                 let canceller =
                     (step["cancel"].as_str() == Some("after_server_holds")).then(|| {
-                        let (held, cancel) = (Arc::clone(&server.held), cancel.clone());
+                        let state = Arc::clone(
+                            &backend
+                                .server
+                                .as_ref()
+                                .expect("only an HTTP case can hold a call")
+                                .state,
+                        );
+                        let cancel = cancel.clone();
                         tokio::spawn(async move {
-                            held.notified().await;
+                            state.held.notified().await;
                             cancel.cancel();
                         })
                     });
@@ -442,47 +567,117 @@ async fn run_transcript_with_deadline(
         }
     }
     golden::complete_within("MCP shutdown", deadline, dispatch.shutdown()).await?;
-    let received = server.received.lock().expect("log").clone();
-    Ok((
-        json!({ "steps": steps, "server_received": received }),
-        server,
-    ))
+    let mut outcome = json!({ "steps": steps, "server_received": backend.received() });
+    let requests = backend
+        .server
+        .as_ref()
+        .map(TranscriptServer::requests)
+        .unwrap_or_default();
+    match case["record_requests"].as_str() {
+        Some("full") => outcome["requests"] = Value::Array(requests),
+        Some("summary") => outcome["requests_summary"] = summarize_requests(&requests),
+        Some(other) => panic!("unknown record_requests `{other}`"),
+        None => {}
+    }
+    if let Some(sink) = &backend.sink {
+        outcome["sink_requests"] = json!(sink.requests().len());
+    }
+    Ok((outcome, backend.literals()))
+}
+
+/// The distinct RPC methods, `Authorization` shapes and HTTP statuses the
+/// server saw, without their order or count. For cases where *that* a request
+/// carried a credential (or never got past `initialize`) is the contract, but
+/// how often a client retries a connect is its own business.
+fn summarize_requests(requests: &[Value]) -> Value {
+    let distinct = |field: &str| {
+        let mut values: Vec<Value> = Vec::new();
+        for request in requests {
+            if !values.contains(&request[field]) {
+                values.push(request[field].clone());
+            }
+        }
+        values.sort_by_key(Value::to_string);
+        Value::Array(values)
+    };
+    json!({
+        "rpcs": distinct("rpc"),
+        "authorization_shapes": distinct("authorization"),
+        "statuses": distinct("status"),
+    })
+}
+
+/// No recorded byte may carry a credential. The needle is the secret itself,
+/// so a bearer header, a URL, a JSON string or an error detail all trip it.
+fn assert_no_secret(secret: &str, recorded: &str) -> Result<(), String> {
+    if recorded.contains(secret) {
+        return Err(format!(
+            "secret leak: the case's bearer secret appears in the recorded output:\n{}",
+            recorded
+                .lines()
+                .filter(|line| line.contains(secret))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    Ok(())
+}
+
+/// Run one case through one dispatch and compare with its golden.
+///
+/// `compare_only` forces compare mode even under `CODEWHALE_CONFORMANCE_UPDATE`:
+/// the negative controls feed deliberately changed cases through here and must
+/// never rewrite a golden.
+fn run_case(
+    name: &str,
+    case: &Value,
+    factory: DispatchFactory,
+    deadline: Duration,
+    compare_only: bool,
+) -> Result<(), String> {
+    if case["transport"].as_str() == Some("stdio") && !cfg!(unix) {
+        eprintln!("conformance: `{name}` needs a POSIX shell; skipped on this platform");
+        return Ok(());
+    }
+    // The pool may touch its state directory; keep that hermetic. Guards are
+    // declared after the sandbox so they restore the environment before the
+    // sandbox releases the lock.
+    let sandbox = Sandbox::new(&Value::Null);
+    let _compare_only = compare_only.then(|| EnvVarGuard::set(golden::UPDATE_ENV, "0"));
+    let secret = case["bearer_secret"].as_str();
+    let _bearer = secret.map(|secret| EnvVarGuard::set(BEARER_ENV, secret));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (mut outcome, literals) =
+        runtime.block_on(run_transcript(case, factory, &sandbox.workspace, deadline))?;
+    drop(runtime);
+    let mut masker = sandbox.masker(&[]);
+    for (literal, label) in literals {
+        masker = masker.literal(&literal, &label);
+    }
+    masker.value(&mut outcome);
+    let recorded = golden::pretty(&golden::canonical(&outcome));
+    if let Some(secret) = secret {
+        assert_no_secret(secret, &recorded)?;
+    }
+    golden::check_golden(
+        &golden::family_dir(FAMILY).join(format!("{name}.golden.json")),
+        &recorded,
+    )
 }
 
 #[test]
 fn mcp_transcripts_match_goldens_for_every_dispatch() {
-    let dir = golden::family_dir(FAMILY);
     let names = golden::case_names(FAMILY);
     let mut failures = Failures::default();
     for name in &names {
         let case = golden::read_case(FAMILY, name);
         for (dispatch, factory) in DISPATCHES {
-            // The pool may touch its state directory; keep that hermetic.
-            let sandbox = Sandbox::new(&Value::Null);
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("runtime");
-            let (mut outcome, server) = match runtime.block_on(run_transcript(&case, *factory)) {
-                Ok(completed) => completed,
-                Err(error) => {
-                    failures.push(&format!("{name} via {dispatch}"), error);
-                    continue;
-                }
-            };
-            let mut masker = sandbox
-                .masker(&[])
-                .literal(&server.url, "<SERVER_URL>")
-                .literal(&server.addr, "<SERVER_ADDR>");
-            drop(server);
-            drop(runtime);
-            masker.value(&mut outcome);
             failures.record(
                 &format!("{name} via {dispatch}"),
-                golden::check_golden(
-                    &dir.join(format!("{name}.golden.json")),
-                    &golden::pretty(&golden::canonical(&outcome)),
-                ),
+                run_case(name, &case, *factory, CALL_DEADLINE, false),
             );
         }
     }

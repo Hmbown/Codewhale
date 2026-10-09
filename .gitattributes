@@ -59,7 +59,10 @@ scripts/fixtures/dsh-web-app/** text eol=lf
 # include_bytes!()'d and digest-checked at launch; a CRLF Windows checkout
 # failed the former and would embed different bytes.
 crates/tui/extension-host/src/protocol.generated.ts text eol=lf
-crates/tui/extension-host/dist/* text eol=lf
+crates/tui/extension-host/dist/** text eol=lf
+# Reviewed extension-host fixtures carry exact source SHA-256 receipts.
+# A Windows checkout must not rewrite their admitted source closure to CRLF.
+crates/tui/tests/fixtures/extension_host/** text eol=lf
 
 # Rustfmt writes LF; keep Rust sources stable across Windows/Linux/macOS.
 *.rs text eol=lf

@@ -244,6 +244,110 @@ class RatchetTests(unittest.TestCase):
             ["test core|tui: 0 -> 1 (new pair)"],
         )
 
+    def test_same_scope_split_preserves_original_test_and_production_counts(self) -> None:
+        original = self.report({
+            "lib.rs": 'mod client; mod tui;',
+            "client.rs": 'fn run() { crate::tui::real(); } #[cfg(test)] mod suite { fn probe() { crate::tui::one(); crate::tui::two(); } }',
+            "tui.rs": '',
+        })
+        split = self.report({
+            "lib.rs": 'mod client; mod tui;',
+            "client.rs": 'fn run() { crate::tui::real(); } #[cfg(test)] mod suite { include!("client/first.rs"); }',
+            "client/first.rs": 'fn probe() { crate::tui::one(); crate::tui::two(); }',
+            "tui.rs": '',
+        })
+        self.assertEqual(split.counts, original.counts)
+        self.assertEqual(split.closure, original.closure)
+        self.assertEqual(split.counts["prod"], {"client|tui": 1})
+        self.assertEqual(split.counts["test"], {"client|tui": 2})
+
+    def test_literal_path_and_recursive_raw_includes_reuse_test_scope(self) -> None:
+        report = self.report({
+            "lib.rs": 'mod session_manager; mod tui;',
+            "session_manager.rs": '#[cfg(test)] #[path="pieces/suite.rs"] mod verification;',
+            "pieces/suite.rs": 'include!(r"first.rs");',
+            "pieces/first.rs": 'include!("second.rs");',
+            "pieces/second.rs": 'fn probe() { crate::tui::one(); }',
+            "tui.rs": '',
+        })
+        # The graph knows these are test-only even though none has a test name.
+        crate = self.graph.load_crate("fixture", Path("/not-a-crate"))
+        self.assertEqual(report.counts["prod"], {})
+        # Independent top-level pieces are outside the runtime closure; inspect
+        # the actual graph for scope below rather than manufacturing a seed.
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "src"
+            write_tree(source, {
+                "lib.rs": 'mod client;',
+                "client.rs": '#[cfg(test)] #[path="pieces/suite.rs"] mod verification;',
+                "pieces/suite.rs": 'include!(r"first.rs");',
+                "pieces/first.rs": 'include!("second.rs");',
+                "pieces/second.rs": 'fn probe() {}',
+            })
+            crate = self.graph.load_crate("fixture", source)
+            exact, prefixes = self.graph.test_file_set(crate)
+            self.assertEqual(exact, {"pieces/suite.rs", "pieces/first.rs", "pieces/second.rs"})
+            self.assertEqual(prefixes, set())
+
+    def test_shared_production_includes_override_test_filename_and_descendants(self) -> None:
+        report = self.report({
+            "lib.rs": 'mod client; mod tui;',
+            "client.rs": 'include!("client/shared_tests.rs"); #[cfg(test)] mod suite { include!("client/shared_tests.rs"); }',
+            "client/shared_tests.rs": 'fn real() { crate::tui::one(); } include!("child_test.rs");',
+            "client/child_test.rs": 'fn real_child() { crate::tui::two(); }',
+            "tui.rs": '',
+        })
+        self.assertEqual(report.counts["prod"], {"client|tui": 2})
+        self.assertEqual(report.counts["test"], {})
+
+    def test_cfg_test_module_does_not_exempt_a_guessed_directory_prefix(self) -> None:
+        report = self.report({
+            "lib.rs": 'mod client; mod tui;',
+            "client.rs": '#[cfg(test)] mod suite; #[path="client/suite/shipping.rs"] mod shipping;',
+            "client/suite.rs": 'fn test_only() {}',
+            "client/suite/shipping.rs": 'fn real() { crate::tui::one(); }',
+            "tui.rs": '',
+        })
+        self.assertEqual(report.counts["prod"], {"client|tui": 1})
+        self.assertEqual(report.counts["test"], {})
+
+    def test_comment_dynamic_and_mixed_cfg_cannot_exempt_production_fragments(self) -> None:
+        report = self.report({
+            "lib.rs": 'mod client; mod tui;',
+            "client.rs": '// #[cfg(test)] mod fake { include!("client/part.rs"); }\n'
+                '#[cfg(test)] mod suite { include!(concat!("client/", "part.rs")); }'
+                '#[cfg(any(test, feature="shipping"))] mod shipped { include!("client/part.rs"); }',
+            "client/part.rs": 'fn real() { crate::tui::one(); }',
+            "tui.rs": '',
+        })
+        self.assertEqual(report.counts["prod"], {"client|tui": 1})
+        self.assertEqual(report.counts["test"], {})
+
+    def test_real_custom_cargo_root_outside_src_keeps_test_named_child_production(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            crate_root = Path(tmp) / "demo"
+            source = crate_root / "src"
+            write_tree(crate_root, {
+                "Cargo.toml": '[package]\nname="demo"\nversion="0.1.0"\n[lib]\npath="front/entry.rs"\n',
+                "src/lib.rs": '#[cfg(test)] mod suite { include!("../front/entry.rs"); }',
+                "front/entry.rs": 'include!("../src/entry_tests.rs");',
+                "src/entry_tests.rs": 'fn real() { crate::tui::one(); }',
+            })
+            crate = self.graph.load_crate("fixture", source)
+            exact, prefixes = self.graph.test_file_set(crate)
+            self.assertFalse(self.graph.file_is_test("entry_tests.rs", exact, prefixes, crate.production_files))
+            self.assertIn("entry_tests.rs", crate.production_files)
+
+    def test_scan_roots_do_not_consult_a_neighboring_crates_test_edges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            left = Path(tmp) / "left"
+            right = Path(tmp) / "right"
+            write_tree(left, {"lib.rs": 'mod client;', "client.rs": 'fn real() {}'})
+            write_tree(right, {"lib.rs": '#[cfg(test)] mod suite { include!("../left/client.rs"); }'})
+            crate = self.graph.load_crate("fixture", left)
+            exact, _prefixes = self.graph.test_file_set(crate)
+            self.assertNotIn("client.rs", exact)
+
     def test_checked_in_baseline_holds(self) -> None:
         self.assertEqual(self.graph.check(), [])
 

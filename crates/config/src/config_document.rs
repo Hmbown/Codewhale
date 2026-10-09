@@ -52,6 +52,19 @@ where
     mutate_locked(path, |doc, _| mutate(doc))
 }
 
+/// The undoable write, also retaining the migration performed under this same
+/// lock. The caller can validate a captured route against the freshly moved
+/// document before writing its delta; undo still compares the exact written bytes.
+pub fn mutate_config_document_undoable_with_migration<T, F>(
+    path: &Path,
+    mutate: F,
+) -> Result<(T, ConfigDocumentUndo)>
+where
+    F: FnOnce(&mut toml_edit::DocumentMut, &crate::legacy_root::LegacyRootMigration) -> Result<T>,
+{
+    mutate_locked(path, mutate)
+}
+
 fn mutate_locked<T, F>(path: &Path, mutate: F) -> Result<(T, ConfigDocumentUndo)>
 where
     F: FnOnce(&mut toml_edit::DocumentMut, &crate::legacy_root::LegacyRootMigration) -> Result<T>,

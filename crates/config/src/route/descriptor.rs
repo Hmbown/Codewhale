@@ -186,17 +186,7 @@ impl TransportKind {
 /// `select` whose option value **is a route id**.
 #[must_use]
 pub fn family_for(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic => "deepseek",
-        ProviderKind::Minimax | ProviderKind::MinimaxAnthropic => "minimax",
-        ProviderKind::ModelstudioTokenPlan
-        | ProviderKind::ModelstudioTokenPlanAnthropic
-        | ProviderKind::ModelstudioCodingPlan
-        | ProviderKind::ModelstudioCodingPlanAnthropic => "alibaba-modelstudio",
-        ProviderKind::Siliconflow | ProviderKind::SiliconflowCN => "siliconflow",
-        ProviderKind::Ollama | ProviderKind::OllamaCloud => "ollama",
-        other => other.as_str(),
-    }
+    crate::descriptors::builtin_provider_descriptor(kind).family
 }
 
 /// Auth methods declared for a provider kind. OAuth is a type, not an adapter.

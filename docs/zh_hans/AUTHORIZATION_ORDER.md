@@ -118,7 +118,7 @@ Codewhale 把工具（tool）可用性、钩子（hook）、带类型的权限�
 
 ```bash
 cargo test -p codewhale-execpolicy --test authorization_order --locked
-cargo test -p codewhale-tui --bin codewhale-tui --locked full_access_permission_allow_cannot_bypass
+cargo test -p codewhale-tui --lib --locked full_access_permission_allow_cannot_bypass
 cargo test -p codewhale-config --locked project_merge_only_tightens_approval_and_sandbox_policy
 ```
 

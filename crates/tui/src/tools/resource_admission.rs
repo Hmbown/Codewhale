@@ -178,15 +178,20 @@ fn segment_is_heavy(segment: &str) -> bool {
         // Wrapper options and their values (`-u user`, `600`, `-n1`) sit
         // between the wrapper and the wrapped command; take the first
         // compiler that follows.
-        let Some(offset) = tokens[index + 1..]
-            .iter()
-            .position(|token| matches!(stem(token).as_str(), "cargo" | "rustc"))
-        else {
+        let Some(offset) = tokens[index + 1..].iter().position(|token| {
+            matches!(
+                stem(token).as_str(),
+                "cargo" | "rustc" | "dev-test" | "dev-cargo"
+            )
+        }) else {
             return false;
         };
         index += 1 + offset;
     }
     let executable = stem(&tokens[index]);
+    if matches!(executable.as_str(), "dev-test" | "dev-cargo") {
+        return true;
+    }
     if !matches!(executable.as_str(), "cargo" | "rustc") {
         return false;
     }
@@ -196,7 +201,7 @@ fn segment_is_heavy(segment: &str) -> bool {
     tokens[index + 1..]
         .iter()
         .map(|arg| arg.trim().to_ascii_lowercase())
-        .find(|arg| !arg.is_empty() && !arg.starts_with('-') && !arg.contains('='))
+        .find(|arg| !arg.is_empty() && !arg.starts_with(['-', '+']) && !arg.contains('='))
         .is_some_and(|subcommand| {
             matches!(
                 subcommand.as_str(),

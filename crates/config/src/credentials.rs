@@ -60,16 +60,14 @@ pub fn prepare_provider_api_key_metadata(store: &mut ConfigStore, provider: Prov
     let provider_config = store.config.providers.for_provider_mut(provider);
     provider_config.auth_mode = Some("api_key".to_string());
     provider_config.external_credentials = None;
-    if provider == ProviderKind::Xai {
+    if matches!(provider, ProviderKind::Xai | ProviderKind::Anthropic) {
         provider_config.oauth_credential_generation = None;
     }
 }
 
-/// Why no writer stores an API key for OpenAI Codex. The route authenticates
-/// through OAuth or an external read-only consent and never reads the secret
-/// store, so a saved key would be unused while its metadata write replaced
-/// the consent.
-pub const OPENAI_CODEX_API_KEY_REFUSAL: &str = "OpenAI Codex uses OAuth. Sign in with ChatGPT via `codewhale auth chatgpt` (subscription billing, Codewhale-owned tokens). The openai API-key route is a different billing owner. Alternatively run `codex login`, then grant exact read-only access with `codewhale auth external-consent --provider openai-codex --mode read-only`, or set OPENAI_CODEX_ACCESS_TOKEN for this process; Codewhale does not store an API key for this provider.";
+/// ChatGPT plan access uses Codewhale's issued OAuth registration. A saved
+/// API key would belong to a different billing route.
+pub const OPENAI_CODEX_API_KEY_REFUSAL: &str = "Sign in with ChatGPT via `codewhale auth chatgpt` to use your plan allowance with Codewhale-owned credentials. Use the openai provider for a separately billed API key. Codewhale does not store an API key for this provider.";
 
 /// Persist a provider credential to the durable secret store without silently
 /// downgrading a backend failure to plaintext config storage.
@@ -93,6 +91,15 @@ pub fn set_provider_api_key(
     if provider == ProviderKind::Xai {
         return crate::with_xai_oauth_revocation_transaction(|| {
             set_provider_api_key_unlocked(store, secrets, provider, api_key)
+        });
+    }
+    if provider == ProviderKind::Anthropic {
+        return crate::with_xai_oauth_lifecycle_lock(|_| {
+            let saved = set_provider_api_key_unlocked(store, secrets, provider, api_key)?;
+            crate::clear_all_claude_oauth_credentials_locked().context(
+                "API-key billing was selected and saved, but old Claude sign-in cleanup failed",
+            )?;
+            Ok(saved)
         });
     }
     set_provider_api_key_unlocked(store, secrets, provider, api_key)
@@ -341,7 +348,7 @@ mod tests {
             .expect_err("openai-codex keys are not stored");
 
         assert!(
-            error.to_string().contains("OpenAI Codex uses OAuth"),
+            error.to_string().contains("Sign in with ChatGPT"),
             "{error}"
         );
         assert_eq!(

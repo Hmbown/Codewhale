@@ -1096,3 +1096,41 @@ async fn contract_edit_rejects_oversized_intermediate_replacement_even_if_later_
     assert!(error.to_string().contains("16 MiB processing cap"));
     assert_eq!(fs::read(&path).unwrap(), b"ab");
 }
+
+#[tokio::test]
+async fn contract_read_admits_only_an_image_the_user_attached_from_outside_the_workspace() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let outside = tempfile::tempdir().expect("outside");
+    let shot = outside.path().join("Screenshot 2026-10-04 at 22.25.47.png");
+    std::fs::write(&shot, crate::image_attach::tests::PNG_1X1).expect("fixture");
+    let stray = outside.path().join("stray.png");
+    std::fs::write(&stray, crate::image_attach::tests::PNG_1X1).expect("fixture");
+    let prompt = codewhale_models::Message {
+        role: codewhale_models::Role::User,
+        content: vec![codewhale_models::ContentBlock::Text {
+            text: format!("what is this?\n[Attached image: {}]", shot.display()),
+            cache_control: None,
+        }],
+    };
+    let context = ToolContext::new(workspace.path()).with_session_objects(
+        crate::rlm::session::SessionObjectSnapshot::new(
+            "session".to_string(),
+            "model".to_string(),
+            workspace.path().to_path_buf(),
+            None,
+            vec![prompt],
+        ),
+    );
+
+    let image =
+        ReadFileTool::execute_contract_read(json!({"path": shot.display().to_string()}), &context)
+            .await
+            .expect("the attached screenshot is readable");
+    assert_eq!(image.content_blocks.len(), 1);
+
+    let error =
+        ReadFileTool::execute_contract_read(json!({"path": stray.display().to_string()}), &context)
+            .await
+            .expect_err("an outside image the user never attached stays refused");
+    assert!(matches!(error, ToolError::PathEscape { .. }), "{error:?}");
+}

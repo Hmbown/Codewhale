@@ -62,7 +62,7 @@ LEGACY_FILE="$(mktemp)"
 TAP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TAP_DIR}" "${FORMULA_FILE}" "${LEGACY_FILE}"' EXIT
 
-readonly BASE_URL="https://github.com/Hmbown/CodeWhale/releases/download/${TAG}"
+readonly BASE_URL="https://github.com/codewhale-hq/CodeWhale/releases/download/${TAG}"
 
 render_formula() {
   local class_name="${1:?}"
@@ -70,7 +70,7 @@ render_formula() {
   cat << EOF
 class ${class_name} < Formula
   desc "Agentic terminal for open-source and open-weight coding models"
-  homepage "https://github.com/Hmbown/CodeWhale"
+  homepage "https://github.com/codewhale-hq/CodeWhale"
   version "${VERSION}"
   license "MIT"
   depends_on "node"

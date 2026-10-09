@@ -29,7 +29,7 @@ function resolveRepo() {
     process.env.CODEWHALE_GITHUB_REPO ||
     process.env.DEEPSEEK_TUI_GITHUB_REPO ||
     process.env.DEEPSEEK_GITHUB_REPO ||
-    "Hmbown/CodeWhale"
+    "codewhale-hq/CodeWhale"
   );
 }
 
@@ -62,6 +62,38 @@ function assertPackageVersionMatchesBinaryVersion(version) {
   );
 }
 
+// Every request is bounded: `idleMs` covers connecting and any stall (it is
+// the socket timeout, which starts before the socket connects), `totalMs` is a
+// hard ceiling for one request including a body that keeps trickling, and a
+// body larger than `maxBodyBytes` is cut off. Redirects are limited to ten, so
+// a chain is bounded too. Tests shrink these through the exported object.
+const limits = {
+  idleMs: 30_000,
+  totalMs: 120_000,
+  maxBodyBytes: 8 * 1024 * 1024,
+};
+
+// Reject first, then tear the request down: an error passed to `destroy()` can
+// surface on an emitter nobody listens to once a response has started.
+function armTotalTimeout(req, url, reject) {
+  const fail = (error) => {
+    reject(error);
+    req.destroy();
+  };
+  const timer = setTimeout(
+    () => fail(new Error(`Request exceeded ${limits.totalMs} ms: ${url}`)),
+    limits.totalMs,
+  );
+  timer.unref();
+  const clear = () => clearTimeout(timer);
+  req.on("close", clear);
+  req.on("error", clear);
+  req.on("timeout", () =>
+    fail(new Error(`Request timed out after ${limits.idleMs} ms without data: ${url}`)),
+  );
+  return { clear, fail };
+}
+
 function requestStatus(url, method = "HEAD", redirects = 0) {
   if (redirects > 10) {
     throw new Error(`Too many redirects while checking ${url}`);
@@ -72,6 +104,7 @@ function requestStatus(url, method = "HEAD", redirects = 0) {
       url,
       {
         method,
+        timeout: limits.idleMs,
         headers: {
           "User-Agent": "codewhale-npm-release-check",
         },
@@ -80,6 +113,7 @@ function requestStatus(url, method = "HEAD", redirects = 0) {
         const status = res.statusCode || 0;
         const location = res.headers.location;
         res.resume();
+        clear();
         if (status >= 300 && status < 400 && location) {
           const next = new URL(location, url).toString();
           resolve(requestStatus(next, method, redirects + 1));
@@ -88,6 +122,7 @@ function requestStatus(url, method = "HEAD", redirects = 0) {
         resolve(status);
       },
     );
+    const { clear } = armTotalTimeout(req, url, reject);
     req.on("error", reject);
     req.end();
   });
@@ -109,34 +144,44 @@ async function downloadText(url, redirects = 0) {
   }
   const client = url.startsWith("https:") ? https : http;
   return new Promise((resolve, reject) => {
-    client
-      .get(
-        url,
-        {
-          headers: {
-            "User-Agent": "codewhale-npm-release-check",
-          },
+    const req = client.get(
+      url,
+      {
+        timeout: limits.idleMs,
+        headers: {
+          "User-Agent": "codewhale-npm-release-check",
         },
-        (res) => {
-          const status = res.statusCode || 0;
-          if (status >= 300 && status < 400 && res.headers.location) {
-            const next = new URL(res.headers.location, url).toString();
-            res.resume();
-            resolve(downloadText(next, redirects + 1));
+      },
+      (res) => {
+        const status = res.statusCode || 0;
+        if (status >= 300 && status < 400 && res.headers.location) {
+          const next = new URL(res.headers.location, url).toString();
+          res.resume();
+          resolve(downloadText(next, redirects + 1));
+          return;
+        }
+        if (status !== 200) {
+          reject(new Error(`Request failed with status ${status}: ${url}`));
+          res.resume();
+          return;
+        }
+        const chunks = [];
+        let size = 0;
+        res.setEncoding("utf8");
+        res.on("error", reject);
+        res.on("data", (chunk) => {
+          size += Buffer.byteLength(chunk);
+          if (size > limits.maxBodyBytes) {
+            guard.fail(new Error(`Response exceeds ${limits.maxBodyBytes} bytes: ${url}`));
             return;
           }
-          if (status !== 200) {
-            reject(new Error(`Request failed with status ${status}: ${url}`));
-            res.resume();
-            return;
-          }
-          const chunks = [];
-          res.setEncoding("utf8");
-          res.on("data", (chunk) => chunks.push(chunk));
-          res.on("end", () => resolve(chunks.join("")));
-        },
-      )
-      .on("error", reject);
+          chunks.push(chunk);
+        });
+        res.on("end", () => resolve(chunks.join("")));
+      },
+    );
+    const guard = armTotalTimeout(req, url, reject);
+    req.on("error", reject);
   });
 }
 
@@ -158,8 +203,8 @@ async function downloadJson(url, redirects = 0) {
     if (token && parsedUrl.origin === "https://api.github.com") {
       headers.Authorization = `Bearer ${token}`;
     }
-    https
-      .get(url, { headers }, (res) => {
+    const req = https
+      .get(url, { headers, timeout: limits.idleMs }, (res) => {
         const status = res.statusCode || 0;
         if (status >= 300 && status < 400 && res.headers.location) {
           const next = new URL(res.headers.location, url).toString();
@@ -168,8 +213,17 @@ async function downloadJson(url, redirects = 0) {
           return;
         }
         const chunks = [];
+        let size = 0;
         res.setEncoding("utf8");
-        res.on("data", (chunk) => chunks.push(chunk));
+        res.on("error", reject);
+        res.on("data", (chunk) => {
+          size += Buffer.byteLength(chunk);
+          if (size > limits.maxBodyBytes) {
+            guard.fail(new Error(`Response exceeds ${limits.maxBodyBytes} bytes: ${url}`));
+            return;
+          }
+          chunks.push(chunk);
+        });
         res.on("end", () => {
           const body = chunks.join("");
           let parsed;
@@ -186,8 +240,9 @@ async function downloadJson(url, redirects = 0) {
           }
           resolve(parsed);
         });
-      })
-      .on("error", reject);
+      });
+    const guard = armTotalTimeout(req, url, reject);
+    req.on("error", reject);
   });
 }
 
@@ -333,11 +388,21 @@ function assertChecksumManifestIncludes(checksums, expectedAssets, label) {
   }
 }
 
+const compiledHosts = require("./compiled-hosts");
+
 async function run() {
   const version = resolveBinaryVersion();
   const repo = resolveRepo();
   const cnbMirror = usesCnbMirror();
-  const assets = cnbMirror ? CNB_RELEASE_ASSET_NAMES : allReleaseAssetNames();
+  const checksums = parseChecksumManifest(await downloadText(checksumManifestUrl(version, repo)));
+  let catalog;
+  if (checksums.has(compiledHosts.HOST_CATALOG)) {
+    const text = await downloadText(releaseAssetUrl(compiledHosts.HOST_CATALOG, version, repo));
+    compiledHosts.verifyBytes(Buffer.from(text), checksums.get(compiledHosts.HOST_CATALOG), compiledHosts.HOST_CATALOG);
+    catalog = compiledHosts.parseCatalog(text, version);
+  }
+  if (compiledHosts.requested() && !catalog) throw new Error("compiled host requested but this source has no qualified catalog");
+  const assets = cnbMirror ? [...CNB_RELEASE_ASSET_NAMES, ...compiledHosts.assets(catalog)] : allReleaseAssetNames(catalog);
 
   assertPackageVersionMatchesBinaryVersion(version);
 
@@ -352,12 +417,9 @@ async function run() {
     await verifyAsset(url, asset);
     console.log(`  ok ${asset}`);
   }
-  const checksums = parseChecksumManifest(
-    await downloadText(checksumManifestUrl(version, repo)),
-  );
   assertChecksumManifestIncludes(
     checksums,
-    cnbMirror ? CNB_BINARY_ASSET_NAMES : checksummedReleaseAssetNames(),
+    cnbMirror ? [...CNB_BINARY_ASSET_NAMES, ...compiledHosts.assets(catalog)] : checksummedReleaseAssetNames(catalog),
     "Canonical checksum manifest",
   );
   if (!cnbMirror) {
@@ -382,6 +444,9 @@ if (require.main === module) {
 
 module.exports = {
   downloadJson,
+  downloadText,
+  limits,
+  requestStatus,
   assertChecksumManifestIncludes,
   assertPackageVersionMatchesBinaryVersion,
   assertReleaseAssetsFresh,

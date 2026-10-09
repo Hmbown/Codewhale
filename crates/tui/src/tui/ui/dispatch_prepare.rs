@@ -196,21 +196,14 @@ pub(crate) fn clear_paused_command_state(app: &mut App, engine_handle: &EngineHa
     engine_handle.set_paused(false);
 }
 
-pub(crate) fn app_scoped_runtime_config(app: &App, config: &Config) -> (ProviderIdentity, Config) {
-    let identity = config
-        .resolve_persisted_provider_identity(
-            Some(app.api_provider.as_str()),
-            app.provider_id_for_persistence(),
-        )
-        .unwrap_or_else(|_| ProviderIdentity {
-            provider: app.api_provider,
-            key: app.provider_identity_for_persistence().to_string(),
-            exact_id: app.provider_id_for_persistence().map(str::to_string),
-            migrated_legacy_ollama_cloud_route: false,
-        });
+pub(crate) fn app_scoped_runtime_config(
+    app: &App,
+    config: &Config,
+) -> Result<(ProviderIdentity, Config), String> {
+    let identity = app.admitted_provider_identity()?.clone();
     let mut scoped = config.clone();
-    scoped.scope_to_provider_identity(&identity);
-    (identity, scoped)
+    scoped.scope_to_provider_identity(&identity)?;
+    Ok((identity, scoped))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -237,7 +230,6 @@ pub(crate) struct UserDispatchSnapshot {
     pub(crate) tool_evidence: Vec<ToolEvidence>,
     pub(crate) history_len: usize,
     pub(crate) history_revisions_len: usize,
-    pub(crate) history_version: u64,
     pub(crate) api_messages_len: usize,
     pub(crate) last_send_at: Option<Instant>,
 }
@@ -257,7 +249,7 @@ pub(crate) struct UserDispatchPrepare {
     pub(super) goal_status: GoalStatus,
     pub(super) goal_token_budget: Option<u32>,
     pub(super) mode: AppMode,
-    pub(super) api_provider: ApiProvider,
+    pub(super) api_provider: ProviderKind,
     pub(super) app_model: String,
     pub(super) auto_model: bool,
     pub(super) reasoning_effort: ReasoningEffort,

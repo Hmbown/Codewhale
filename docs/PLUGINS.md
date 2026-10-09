@@ -41,9 +41,11 @@ Codewhale is helpful about plugins, not pushy. The rules:
   marketplace's `check-marketplace.mjs` share one stoplist.
 - **Only what runs here.** Plugins whose `when.os` excludes this OS are not
   offered.
-- **The true next step.** A model-requested review row says Install, Review
-  trust, or Enable to match what the plugin needs. Only that button acts, and
-  it opens `/plugin show <name>`; it never installs, trusts, or enables.
+- **Review before acting.** A model-requested row offers Review. Its button
+  opens the existing Extensions inventory: Plugins for an installed bundle,
+  Marketplace for a suggestion that is not installed. Nothing is installed,
+  trusted, or enabled by that click. Choose the inventory's explicit action;
+  trust still reviews the exact installed content before activation.
 - **Reversible dismissal.** Esc clears a non-empty draft first, then hides the
   row for this session only. "Don't suggest again" is the explicit,
   persisted choice. `/plugin dismissals` lists both kinds, and
@@ -65,7 +67,7 @@ what it can see.
 | `chrome-devtools` MCP (`/mcp recommendations`) | A Chrome it drives, which can include signed-in pages | DevTools-level inspection and performance work |
 | Playwright MCP (`/mcp recommendations`) | A fresh, isolated profile with `--isolated` | Scripted flows and testing without your identity |
 | Computer Use `browser_*` tools (bundled, off until reviewed) | One it launches, in a profile of its own | Browser steps inside a wider desktop task |
-| Chromewhale (developer preview, `Hmbown/codewhale-plugin-marketplace`) | Yours, already open, in your own Chrome profile; load unpacked | Reading or acting on the tab you are looking at, one granted site at a time |
+| Chromewhale (developer preview, `codewhale-hq/codewhale-plugin-marketplace`) | Yours, already open, in your own Chrome profile; load unpacked | Reading or acting on the tab you are looking at, one granted site at a time |
 
 None of these is offered to you proactively. Add the one that fits the job.
 

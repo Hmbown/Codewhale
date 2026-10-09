@@ -49,10 +49,34 @@ pub(crate) fn parse_usage(usage: Option<&Value>) -> Usage {
         .and_then(Value::as_u64)
         .or(cached_tokens)
         .map(saturating_u32);
+    // Keep reported cache creation separate so pricing can apply its write
+    // rate. Fall back per field: a details object without this field must not
+    // hide the alternate dialect's value.
+    let nested_cache_write_tokens = usage.and_then(|u| {
+        u.pointer("/prompt_tokens_details/cache_write_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                u.pointer("/input_tokens_details/cache_write_tokens")
+                    .and_then(Value::as_u64)
+            })
+    });
+    let prompt_cache_write_tokens = usage
+        .and_then(|u| u.get("prompt_cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .or(nested_cache_write_tokens)
+        .map(saturating_u32);
     let prompt_cache_miss_tokens = usage
         .and_then(|u| u.get("prompt_cache_miss_tokens"))
         .and_then(Value::as_u64)
-        .or_else(|| prompt_cache_hit_tokens.map(|hit| input_tokens.saturating_sub(u64::from(hit))))
+        .or_else(|| {
+            // No cache report means unknown, including when usage is absent.
+            // A reported zero is still a report and permits derivation.
+            (prompt_cache_hit_tokens.is_some() || prompt_cache_write_tokens.is_some()).then(|| {
+                let accounted = u64::from(prompt_cache_hit_tokens.unwrap_or(0))
+                    .saturating_add(u64::from(prompt_cache_write_tokens.unwrap_or(0)));
+                input_tokens.saturating_sub(accounted)
+            })
+        })
         .map(saturating_u32);
     // Reasoning tokens are a *subset* of the completion count every provider
     // bills, so they are never added to output. A payload claiming more
@@ -83,7 +107,7 @@ pub(crate) fn parse_usage(usage: Option<&Value>) -> Usage {
         output_tokens: saturating_u32(output_tokens),
         prompt_cache_hit_tokens,
         prompt_cache_miss_tokens,
-        prompt_cache_write_tokens: None,
+        prompt_cache_write_tokens,
         reasoning_tokens,
         reasoning_replay_tokens: None,
         server_tool_use,
@@ -302,6 +326,98 @@ mod tests {
     }
 
     #[test]
+    fn parse_usage_preserves_absent_cache_telemetry_and_explicit_zero() {
+        for payload in [
+            None,
+            Some(json!({})),
+            Some(json!({"prompt_tokens": 100, "completion_tokens": 20})),
+        ] {
+            let usage = parse_usage(payload.as_ref());
+            assert_eq!(usage.prompt_cache_hit_tokens, None);
+            assert_eq!(usage.prompt_cache_miss_tokens, None);
+            assert_eq!(usage.prompt_cache_write_tokens, None);
+        }
+        let zero = parse_usage(Some(&json!({
+            "prompt_tokens": 100,
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_write_tokens": 0,
+            "prompt_tokens_details": {"cache_write_tokens": 75}
+        })));
+        assert_eq!(zero.prompt_cache_hit_tokens, Some(0));
+        assert_eq!(zero.prompt_cache_write_tokens, Some(0));
+        assert_eq!(zero.prompt_cache_miss_tokens, Some(100));
+        let explicit_miss = parse_usage(Some(&json!({
+            "prompt_tokens": 100,
+            "prompt_cache_miss_tokens": 0
+        })));
+        assert_eq!(explicit_miss.prompt_cache_miss_tokens, Some(0));
+    }
+
+    #[test]
+    fn parse_usage_cache_write_dialects_partition_the_input_total() {
+        for payload in [
+            json!({
+                "input_tokens": 1000,
+                "prompt_cache_hit_tokens": 600,
+                "prompt_cache_write_tokens": 200
+            }),
+            json!({
+                "prompt_tokens": 1000,
+                "prompt_tokens_details": {"cached_tokens": 600, "cache_write_tokens": 200}
+            }),
+            json!({
+                "input_tokens": 1000,
+                "prompt_cache_hit_tokens": 600,
+                "input_tokens_details": {"cache_write_tokens": 200}
+            }),
+            // Both objects can exist; the first lacks the write field.
+            json!({
+                "prompt_tokens": 1000,
+                "prompt_tokens_details": {"cached_tokens": 600},
+                "input_tokens_details": {"cache_write_tokens": 200}
+            }),
+        ] {
+            let usage = parse_usage(Some(&payload));
+            assert_eq!(usage.input_tokens, 1000);
+            assert_eq!(usage.prompt_cache_hit_tokens, Some(600));
+            assert_eq!(usage.prompt_cache_write_tokens, Some(200));
+            assert_eq!(usage.prompt_cache_miss_tokens, Some(200));
+            let priced = crate::pricing::token_usage_for_pricing(&usage);
+            assert_eq!(priced.cache_read, 600);
+            assert_eq!(priced.cache_write, 200);
+            assert_eq!(priced.input, 200);
+            assert_eq!(priced.input + priced.cache_read + priced.cache_write, 1000);
+        }
+        let write_only = parse_usage(Some(&json!({
+            "prompt_tokens": 1000,
+            "input_tokens_details": {"cache_write_tokens": 200}
+        })));
+        assert_eq!(write_only.prompt_cache_hit_tokens, None);
+        assert_eq!(write_only.prompt_cache_write_tokens, Some(200));
+        assert_eq!(write_only.prompt_cache_miss_tokens, Some(800));
+    }
+
+    #[test]
+    fn parse_usage_cache_write_saturates_and_keeps_explicit_miss() {
+        let excessive = parse_usage(Some(&json!({
+            "prompt_tokens": 100,
+            "prompt_cache_hit_tokens": 60,
+            "prompt_cache_write_tokens": u64::MAX
+        })));
+        assert_eq!(excessive.input_tokens, 100);
+        assert_eq!(excessive.prompt_cache_write_tokens, Some(u32::MAX));
+        assert_eq!(excessive.prompt_cache_miss_tokens, Some(0));
+        let explicit = parse_usage(Some(&json!({
+            "prompt_tokens": 100,
+            "prompt_cache_hit_tokens": 60,
+            "prompt_cache_write_tokens": 20,
+            "prompt_cache_miss_tokens": 10
+        })));
+        assert_eq!(explicit.prompt_cache_write_tokens, Some(20));
+        assert_eq!(explicit.prompt_cache_miss_tokens, Some(10));
+    }
+
+    #[test]
     fn parse_usage_scenario() {
         // Scenario consolidation of: parse_usage_reads_deepseek_cache_and_reasoning_tokens, parse_usage_saturates_every_u64_token_field, parse_usage_counts_reasoning_tokens_when_completion_tokens_are_zero, parse_usage_derives_completion_tokens_from_total_tokens_when_needed, parse_usage_reads_v4_prompt_tokens_details_cached_tokens, parse_usage_infers_cache_miss_from_selected_hit_source
         // from parse_usage_reads_deepseek_cache_and_reasoning_tokens
@@ -417,14 +533,14 @@ mod tests {
     /// field entirely must not change the cost by a single cent.
     #[test]
     fn reasoning_parser_fixtures_never_exceed_or_add_to_billable_output() {
-        use crate::config::ApiProvider;
+        use crate::config::ProviderKind;
         use crate::pricing::{calculate_turn_cost_estimate_for_provider, token_usage_for_pricing};
 
         // (label, provider, model, payload)
-        let fixtures: [(&str, ApiProvider, &str, serde_json::Value); 3] = [
+        let fixtures: [(&str, ProviderKind, &str, serde_json::Value); 3] = [
             (
                 "moonshot",
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 "kimi-k2.7-code",
                 json!({
                     "prompt_tokens": 30_000,
@@ -436,7 +552,7 @@ mod tests {
             ),
             (
                 "minimax",
-                ApiProvider::Minimax,
+                ProviderKind::Minimax,
                 "minimax-m3",
                 json!({
                     "prompt_tokens": 12_000,
@@ -448,7 +564,7 @@ mod tests {
             ),
             (
                 "openrouter",
-                ApiProvider::Openrouter,
+                ProviderKind::Openrouter,
                 "qwen/qwen3.7-plus",
                 json!({
                     "prompt_tokens": 8_000,

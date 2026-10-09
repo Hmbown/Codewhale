@@ -37,38 +37,32 @@ describe("the whale", () => {
     // The Codwhale poster is the 404 joke, restored on purpose (site merge plan R4).
     expect(existsSync(new URL("../public/codwhale-404.webp", import.meta.url))).toBe(true);
     expect(web("components/route-state.tsx")).toContain('src="/codwhale-404.webp"');
-    // Seals and the strata water are back, re-inked in the ombre (R2, R3, R5).
-    for (const kept of ["strata", "seal"]) {
-      expect(existsSync(new URL(`../components/${kept}.tsx`, import.meta.url)), kept).toBe(true);
-    }
-    expect(web("components/strata.tsx")).not.toMatch(/#[0-9a-f]{6}/i);
+    // Seals stay. The blurred strata bands were retired on 2026-10-04 for
+    // paper above, sea below: one horizon and the tide ombré, no wave art.
+    expect(existsSync(new URL("../components/seal.tsx", import.meta.url))).toBe(true);
+    expect(existsSync(new URL("../components/strata.tsx", import.meta.url))).toBe(false);
     expect(existsSync(new URL("../components/install-binary.tsx", import.meta.url))).toBe(false);
   });
 });
 
 describe("the horizon", () => {
-  it("descends into the footer through one waterline band, then the sea under one horizon", () => {
+  it("ends every page on one horizon line, then the sea", () => {
     const footer = web("components/footer.tsx");
-    expect(footer).toContain('<div className="waterline" aria-hidden="true">');
-    expect(footer).toContain('<Strata variant="band" />');
     expect(footer).toContain('className="horizon"');
+    expect(footer).not.toContain("Strata");
     expect(CSS).toMatch(/\.site-footer-sea \{[^}]*background: var\(--sea\)/);
-    // The band stands on the page ground, or on the home's deep water.
-    expect(CSS).toMatch(/\.site-footer > \.waterline \{ background: var\(--page-ground\); \}/);
-    expect(CSS).toMatch(/main:has\(\.sea-continues:last-child\) \+ \.site-footer > \.waterline/);
+    // A page already ending in the sea (home) runs on without a second line.
+    expect(CSS).toMatch(/main:has\(\.sea-continues:last-child\) \+ \.site-footer \.site-footer-sea > \.horizon \{ display: none; \}/);
     const home = web("app/[locale]/page.tsx");
     expect(home).toContain("sea-continues");
-    expect(home).toContain('<Strata variant="hero" />');
   });
 
   it("paints the stage with the dark set in both appearances", () => {
     expect(CSS).toMatch(/\.stage,\s*\.site-footer\s*\{[^}]*--ring: var\(--gpui-dark-primary\);[^}]*color-scheme: dark;/);
   });
 
-  it("keeps the texture and the water static and out of forced colours", () => {
-    expect(CSS).toMatch(/@media \(forced-colors: active\) \{[\s\S]*?\.sea-texture \{ display: none; \}/);
-    expect(CSS).toMatch(/@media \(forced-colors: active\) \{\s*\.strata \{ display: none; \}/);
-    expect(web("components/strata.tsx")).not.toMatch(/<animate|@keyframes/);
+  it("keeps the horizon visible in forced colours", () => {
+    expect(CSS).toMatch(/@media \(forced-colors: active\) \{\s*\.horizon \{ background: CanvasText; \}/);
   });
 });
 

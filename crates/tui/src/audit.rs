@@ -82,11 +82,12 @@ fn append_event(path: &Path, event: &str, details: Value) -> anyhow::Result<()> 
 }
 
 fn default_audit_path() -> anyhow::Result<PathBuf> {
-    // A test process without an explicit CODEWHALE_HOME must never append to
-    // the developer's real ~/.codewhale/audit.log (#6534); it gets a
-    // per-process scratch log instead.
+    // A test that has not sealed its own home must never append to the
+    // developer's real ~/.codewhale/audit.log (#6534); it gets a per-process
+    // scratch log instead. An *ambient* CODEWHALE_HOME is not a seal: it names
+    // somebody's real profile just as `~/.codewhale` does.
     #[cfg(test)]
-    if !codewhale_config::codewhale_home_is_explicit() {
+    if !crate::test_support::home_is_sealed() {
         return Ok(std::env::temp_dir()
             .join(format!("codewhale-test-audit-{}", std::process::id()))
             .join("audit.log"));

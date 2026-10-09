@@ -13,8 +13,8 @@ use super::task_projection::{
 };
 use super::*;
 use crate::config::{
-    ApiProvider, Config, DEFAULT_OPENROUTER_MODEL, DEFAULT_TEXT_MODEL, DEFAULT_ZAI_MODEL,
-    ProviderConfig, ProvidersConfig,
+    Config, DEFAULT_OPENROUTER_MODEL, DEFAULT_TEXT_MODEL, DEFAULT_ZAI_MODEL, ProviderConfig,
+    ProviderKind, ProvidersConfig,
 };
 use crate::core::engine::mock_engine_handle;
 use crate::core::ops::TurnSpec;
@@ -59,6 +59,7 @@ use tempfile::TempDir;
 
 mod conversation_undo;
 mod model_picker_actions;
+mod plan_handoff;
 mod runtime_store_binding;
 
 #[test]
@@ -66,10 +67,10 @@ fn failed_engine_channel_settles_classifier_batch_once() {
     let _cost_scope = crate::cost_status::test_scope();
     let route = crate::cost_status::EffectiveRouteEnvelope::capture(
         None,
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "deepseek",
         "classifier-model",
-        Some(ApiProvider::Deepseek.default_base_url()),
+        Some(ProviderKind::Deepseek.provider().default_base_url()),
         chrono::Utc::now(),
     );
     let batch = crate::cost_status::RuntimeUsageBatch {
@@ -86,6 +87,7 @@ fn failed_engine_channel_settles_classifier_batch_once() {
             },
         }],
         drop_records: vec![crate::cost_status::RuntimeUsageDropRecord {
+            reason: crate::cost_status::RuntimeUsageMissingReason::default(),
             source_id: "auto-router:dispatch-drop".to_string(),
             route,
         }],
@@ -684,7 +686,7 @@ async fn stale_remote_control_turn_never_cancels_the_current_engine_turn() {
 }
 
 fn test_mailbox_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     model: &str,
 ) -> crate::cost_status::EffectiveRouteEnvelope {
     crate::cost_status::EffectiveRouteEnvelope::capture(
@@ -692,7 +694,7 @@ fn test_mailbox_route(
         provider,
         provider.as_str(),
         model,
-        Some(provider.default_base_url()),
+        Some(provider.provider().default_base_url()),
         chrono::Utc::now(),
     )
 }
@@ -709,7 +711,7 @@ fn completed_turn_cost_receipt_uses_the_captured_effective_route() {
         ..Default::default()
     };
     let audit = crate::pricing::audit_turn_cost_for_route_at(
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "deepseek-v4-flash",
         Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE),
         &usage,
@@ -719,7 +721,7 @@ fn completed_turn_cost_receipt_uses_the_captured_effective_route() {
         turn_id: "completed-deepseek".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Deepseek,
+            provider: ProviderKind::Deepseek,
             provider_identity: "deepseek-cn".to_string(),
             model: "deepseek-v4-flash".to_string(),
             auto_model: false,
@@ -735,7 +737,10 @@ fn completed_turn_cost_receipt_uses_the_captured_effective_route() {
                 billing_mode: crate::cost_status::RouteBillingMode::Metered,
                 dispatched_at: chrono::Utc::now(),
             }),
-            base_url: ApiProvider::Deepseek.default_base_url().to_string(),
+            base_url: ProviderKind::Deepseek
+                .provider()
+                .default_base_url()
+                .to_string(),
             billing_product: crate::route_billing::RouteProduct::Unproven,
         }),
         auto_route_receipt: None,
@@ -882,15 +887,25 @@ fn bracketed_paste_returns_dock_focus_to_the_visible_composer() {
 /// One representative terminal encoding per shell binding.
 fn shell_binding_probe(id: ShellBindingId) -> KeyEvent {
     match id {
+        ShellBindingId::TerminalNew => KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        ShellBindingId::TerminalNext => KeyEvent::new(KeyCode::Down, KeyModifiers::ALT),
+        ShellBindingId::TerminalPrevious => KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
+        ShellBindingId::TerminalDetach => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
         ShellBindingId::ElevationUp => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
         ShellBindingId::ElevationDown => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
         ShellBindingId::ElevationConfirm => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         ShellBindingId::ElevationAbort => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        ShellBindingId::PetInspect => KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE),
         ShellBindingId::PetResultUp => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
         ShellBindingId::PetResultDown => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
         ShellBindingId::PetResultPageUp => KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
         ShellBindingId::PetResultPageDown => KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
         ShellBindingId::PetBack => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        ShellBindingId::PetResultStart => KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+        ShellBindingId::PetResultEnd => KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+        ShellBindingId::PetFocusAgents => KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        ShellBindingId::PetOpenAgent => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ShellBindingId::PetCopyReply => KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
         ShellBindingId::PetSound => KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
         ShellBindingId::PetBrowser => KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE),
         ShellBindingId::PetWindow => KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
@@ -958,9 +973,13 @@ fn no_shell_binding_changes_meaning_once_the_composer_has_text() {
             .focus
             .admits(crate::tui::shell_key_routing::Focus::Composer)
         {
-            assert_eq!(
-                on_typed, None,
-                "exclusive view keys must not act on a draft"
+            // A chord may serve a different owner: Tab cycles the composer's
+            // mode and switches panes inside pet mode. The modal binding
+            // itself must never act on the composer draft.
+            assert_ne!(
+                on_typed,
+                Some(binding.id),
+                "exclusive view bindings must not act on a draft"
             );
             continue;
         }
@@ -1172,7 +1191,7 @@ fn launch_help_uses_the_same_toggle_and_shortcut_ordering_as_the_live_shell() {
 #[test]
 fn ctrl_t_key_event_reaches_reasoning_effort_cycle() {
     let mut app = create_test_app();
-    app.api_provider = crate::config::ApiProvider::Deepseek;
+    app.api_provider = crate::config::ProviderKind::Deepseek;
     app.auto_model = false;
     app.reasoning_effort = ReasoningEffort::Off;
 
@@ -1198,7 +1217,7 @@ fn ctrl_t_key_event_reaches_reasoning_effort_cycle() {
 #[test]
 fn ctrl_t_cycles_reasoning_effort_under_auto_model() {
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.auto_model = true;
     app.reasoning_effort = ReasoningEffort::Auto;
 
@@ -2659,7 +2678,11 @@ impl SettingsHomeGuard {
     fn new() -> Self {
         let lock = crate::test_support::lock_test_env();
         let tmp = TempDir::new().expect("settings tempdir");
-        let codewhale_home = tmp.path().join(".codewhale");
+        let codewhale_home = tmp
+            .path()
+            .canonicalize()
+            .expect("canonical settings home")
+            .join(".codewhale");
         Self {
             _home: crate::test_support::EnvVarGuard::set("HOME", tmp.path()),
             _userprofile: crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path()),
@@ -4444,13 +4467,13 @@ fn selection_to_text_copies_rendered_transcript_block() {
 
     // The same stored body becomes selectable when the reader expands it.
     // This distinguishes correct folding from losing reasoning altogether.
-    app.thinking_folds.insert(2, ThinkingFold::Expanded);
+    app.cell_folds.insert(2, TranscriptFold::Expanded);
     app.viewport.transcript_cache.ensure_split(
         &[&app.history],
         &app.history_revisions,
         80,
         app.transcript_render_options(),
-        &app.thinking_folds,
+        &app.cell_folds,
         None,
         None,
     );
@@ -4882,6 +4905,81 @@ fn jump_to_latest_button_click_scrolls_to_tail() {
     assert!(app.viewport.jump_to_latest_button_area.is_none());
     assert!(!app.user_scrolled_during_stream);
     assert!(!app.viewport.transcript_selection.dragging);
+}
+
+/// Clicking the pinned prompt header returns the viewport to the user
+/// message the header names, resolved against the current layout.
+#[test]
+fn pinned_prompt_click_jumps_to_the_message_it_names() {
+    let mut app = create_test_app();
+    app.history = vec![HistoryCell::User {
+        content: "jump target".to_string(),
+    }];
+    app.resync_history_revisions();
+    app.viewport.transcript_cache.ensure(
+        &app.history,
+        &app.history_revisions,
+        80,
+        app.transcript_render_options(),
+    );
+    app.collapsed_cell_map = vec![0];
+    app.viewport.transcript_scroll = TranscriptScroll::at_line(5);
+    app.viewport.pinned_prompt_area = Some(Rect {
+        x: 4,
+        y: 3,
+        width: 40,
+        height: 1,
+    });
+    app.viewport.pinned_prompt_message = Some(0);
+
+    let events = handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 8,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(events.is_empty());
+    assert_eq!(
+        app.viewport.transcript_scroll,
+        TranscriptScroll::at_line(0),
+        "the click must pin the viewport to the resolved message's first line"
+    );
+    assert_eq!(app.viewport.pending_scroll_delta, 0);
+    assert!(app.user_scrolled_during_stream);
+    assert!(!app.viewport.transcript_selection.dragging);
+}
+
+/// A click outside the header's row must not be captured by its hit box.
+#[test]
+fn pinned_prompt_click_only_claims_the_header_row() {
+    let mut app = create_test_app();
+    app.viewport.transcript_scroll = TranscriptScroll::to_bottom();
+    app.viewport.pinned_prompt_area = Some(Rect {
+        x: 4,
+        y: 3,
+        width: 40,
+        height: 1,
+    });
+    app.viewport.pinned_prompt_message = Some(12);
+
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 8,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        app.viewport.transcript_scroll.is_at_tail(),
+        "a click below the header must not trigger the jump"
+    );
 }
 
 /// Clicking the transcript scrollbar gutter starts a scrollbar drag (not
@@ -5852,21 +5950,21 @@ fn credential_paste_content_never_enters_traces_or_rendered_status() {
     let secret = credential_paste_sentinel();
 
     let setup = ProviderPickerView::new_for_setup(
-        ApiProvider::Deepseek,
-        Some(ApiProvider::Anthropic),
+        ProviderKind::Deepseek,
+        Some(ProviderKind::Anthropic.as_str().into()),
         &config,
         None,
     );
     let missing_auth = ProviderPickerView::new_for_missing_auth(
-        ApiProvider::Deepseek,
-        ApiProvider::Anthropic,
+        ProviderKind::Deepseek,
+        &(config).test_identity_for_kind(ProviderKind::Anthropic),
         &config,
         None,
     )
     .expect("Anthropic missing-auth editor");
     let mut onboarding = ProviderPickerView::new_for_onboarding(
-        ApiProvider::Deepseek,
-        Some(ApiProvider::Anthropic),
+        ProviderKind::Deepseek,
+        Some(ProviderKind::Anthropic.as_str().into()),
         &config,
         None,
     );
@@ -5917,8 +6015,8 @@ fn ordinary_clipboard_text_routes_to_provider_picker_without_typing_shortcut_or_
     let config = Config::default();
     let secret = credential_paste_sentinel();
     let picker = ProviderPickerView::new_for_missing_auth(
-        ApiProvider::Deepseek,
-        ApiProvider::Openrouter,
+        ProviderKind::Deepseek,
+        &(config).test_identity_for_kind(ProviderKind::Openrouter),
         &config,
         None,
     )
@@ -5987,21 +6085,21 @@ fn cache_warmup_resolves_the_last_concrete_auto_route() {
     let mut app = create_test_app();
     app.model = "auto".to_string();
     app.auto_model = true;
-    app.last_effective_provider = Some(ApiProvider::Vllm);
-    app.last_effective_provider_identity = Some(ApiProvider::Vllm.as_str().to_string());
+    app.last_effective_provider = Some(ProviderKind::Vllm);
+    app.last_effective_provider_identity = Some(ProviderKind::Vllm.as_str().to_string());
     app.last_effective_model = Some("auto-cache-model".to_string());
 
     let route = resolve_cache_replay_route(&app, &config).expect("last Auto route should resolve");
 
-    assert_eq!(route.identity.provider, ApiProvider::Vllm);
-    assert_eq!(route.identity.key, ApiProvider::Vllm.as_str());
+    assert_eq!(route.identity.provider, ProviderKind::Vllm);
+    assert_eq!(route.identity.key.as_str(), ProviderKind::Vllm.as_str());
     assert_eq!(route.model, "auto-cache-model");
     assert_eq!(
         route.candidate.endpoint().base_url,
         "http://127.0.0.1:18191/v1"
     );
 
-    app.last_effective_provider_identity = Some(ApiProvider::Openrouter.as_str().to_string());
+    app.last_effective_provider_identity = Some(ProviderKind::Openrouter.as_str().to_string());
     let error = resolve_cache_replay_route(&app, &config)
         .expect_err("a mismatched persisted identity must fail closed");
     assert!(
@@ -6027,13 +6125,13 @@ fn cache_warmup_rejects_an_auto_route_whose_endpoint_changed() {
     let mut app = create_test_app();
     app.model = "auto".to_string();
     app.auto_model = true;
-    app.last_effective_provider = Some(ApiProvider::Vllm);
-    app.last_effective_provider_identity = Some(ApiProvider::Vllm.as_str().to_string());
+    app.last_effective_provider = Some(ProviderKind::Vllm);
+    app.last_effective_provider_identity = Some(ProviderKind::Vllm.as_str().to_string());
     app.last_effective_model = Some("auto-cache-model".to_string());
     app.session.last_base_url = Some("http://127.0.0.1:18191/v1".to_string());
     app.push_turn_cache_record(crate::tui::app::TurnCacheRecord {
-        provider: Some(ApiProvider::Vllm),
-        provider_identity: Some(ApiProvider::Vllm.as_str().to_string()),
+        provider: Some(ProviderKind::Vllm),
+        provider_identity: Some(ProviderKind::Vllm.as_str().to_string()),
         model: Some("auto-cache-model".to_string()),
         auto_model: true,
         input_tokens: 1,
@@ -6582,12 +6680,15 @@ fn running_exec_cell() -> HistoryCell {
 }
 
 #[test]
-fn completed_answer_clears_stale_reasoning_expand_hint() {
+fn completed_answer_space_round_trip_keeps_its_owner_and_clears_reasoning_hint() {
     let mut app = create_test_app();
     app.history = vec![
         long_reasoning("reasoning", false),
         HistoryCell::Assistant {
-            content: "The answer is complete.".to_string(),
+            content: (1..=8)
+                .map(|line| format!("answer line {line:02}"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
             streaming: false,
         },
     ];
@@ -6605,7 +6706,136 @@ fn completed_answer_clears_stale_reasoning_expand_hint() {
         "a reasoning cell must not advertise Space while cell 1 owns the key: {surface}"
     );
     assert!(handle_transcript_space(&mut app));
-    assert!(app.collapsed_cells.contains(&1));
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Collapsed));
+    assert!(app.collapsed_cells.is_empty());
+    let folded = render_underwater_test_app(&mut app, 100, 32);
+    assert!(folded.contains("answer line 01"), "{folded}");
+    assert!(!folded.contains("answer line 08"), "{folded}");
+    assert!(folded.contains("Space:expand"), "{folded}");
+    assert_eq!(
+        app.viewport
+            .transcript_cache
+            .fold_action_target()
+            .map(|target| target.owner.cell_index),
+        Some(1)
+    );
+
+    // Hiding reasoning must not disable an ordinary answer's expand control.
+    app.show_thinking = false;
+    let _ = render_underwater_test_app(&mut app, 100, 32);
+    assert!(handle_transcript_space(&mut app));
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Expanded));
+    assert!(!app.cell_folds.contains_key(&0));
+    assert!(
+        !handle_transcript_space(&mut app),
+        "a rendered action is single-use"
+    );
+    let expanded = render_underwater_test_app(&mut app, 100, 32);
+    assert!(expanded.contains("answer line 08"), "{expanded}");
+    assert!(!expanded.contains("Space:expand"), "{expanded}");
+    assert!(app.collapsed_cells.is_empty());
+    let HistoryCell::Assistant { content, .. } = &app.history[1] else {
+        panic!("answer retained");
+    };
+    assert!(content.contains("answer line 08"));
+}
+
+#[test]
+fn answer_fold_survives_hidden_index_mapping_and_keeps_copy_boundaries() {
+    use crate::tui::mouse_ui::apply_context_menu_action;
+    use crate::tui::views::ContextMenuAction;
+
+    let mut app = create_test_app();
+    app.history = vec![
+        HistoryCell::User {
+            content: "EXPLICITLY_HIDDEN".into(),
+        },
+        HistoryCell::Assistant {
+            content: "preview_word ".repeat(120),
+            streaming: false,
+        },
+        HistoryCell::Assistant {
+            content: "NEXT_MESSAGE".into(),
+            streaming: false,
+        },
+    ];
+    app.resync_history_revisions();
+    let _ = apply_context_menu_action(&mut app, ContextMenuAction::HideCell { cell_index: 0 });
+    let full = render_underwater_test_app(&mut app, 60, 32);
+    assert!(!full.contains("EXPLICITLY_HIDDEN"));
+    assert_eq!(app.collapsed_cell_map, vec![1, 2]);
+    select_original_cell(&mut app, 1);
+    let middle = TranscriptSelectionPoint {
+        line_index: app.viewport.transcript_selection.anchor.unwrap().line_index + 8,
+        column: 5,
+    };
+    app.viewport.transcript_selection.anchor = Some(middle);
+    app.viewport.transcript_selection.head = Some(middle);
+    let _ = render_underwater_test_app(&mut app, 60, 32);
+    assert!(handle_transcript_space(&mut app));
+    let folded = render_underwater_test_app(&mut app, 60, 32);
+    assert!(folded.contains("Space:expand"), "{folded}");
+    assert_eq!(app.collapsed_cell_map, vec![1, 2]);
+    assert_eq!(
+        app.transcript_action_owner().map(|owner| owner.cell_index),
+        Some(1)
+    );
+    assert!(
+        handle_transcript_space(&mut app),
+        "second Space needs no reselection"
+    );
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Expanded));
+    assert!(
+        !app.cell_folds.contains_key(&2),
+        "newer answer stays untouched"
+    );
+    let _ = render_underwater_test_app(&mut app, 60, 32);
+    assert!(handle_transcript_space(&mut app));
+    let _ = render_underwater_test_app(&mut app, 60, 32);
+    app.viewport.transcript_selection.anchor = Some(TranscriptSelectionPoint {
+        line_index: 0,
+        column: 0,
+    });
+    app.viewport.transcript_selection.head = Some(TranscriptSelectionPoint {
+        line_index: app
+            .viewport
+            .transcript_cache
+            .total_lines()
+            .saturating_sub(1),
+        column: 60,
+    });
+    let copied = selection_to_text(&app).expect("folded selection");
+    let next = copied
+        .lines()
+        .find(|line| line.contains("NEXT_MESSAGE"))
+        .expect("next message retained");
+    assert!(
+        !next.contains("preview_word"),
+        "truncation must not join separate messages: {copied}"
+    );
+    assert!(
+        !copied.contains("Space:") && !copied.contains('…'),
+        "control row is not body: {copied}"
+    );
+
+    let _ = apply_context_menu_action(&mut app, ContextMenuAction::HideCell { cell_index: 1 });
+    let hidden = render_underwater_test_app(&mut app, 60, 32);
+    assert!(
+        !hidden.contains("preview_word"),
+        "explicit Hide removes the preview too"
+    );
+    assert_eq!(app.collapsed_cell_map, vec![2]);
+    let _ = apply_context_menu_action(&mut app, ContextMenuAction::ShowCell { cell_index: 1 });
+    let _ = render_underwater_test_app(&mut app, 60, 32);
+    assert_eq!(app.collapsed_cell_map, vec![1, 2]);
+    select_original_cell(&mut app, 1);
+    let _ = render_underwater_test_app(&mut app, 60, 32);
+    assert!(handle_transcript_space(&mut app));
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Expanded));
+    assert_eq!(app.collapsed_cells, HashSet::from([0]));
+    let _ = apply_context_menu_action(&mut app, ContextMenuAction::ShowAllHidden);
+    let _ = render_underwater_test_app(&mut app, 60, 32);
+    assert!(app.collapsed_cells.is_empty());
 }
 
 #[test]
@@ -6639,14 +6869,14 @@ fn selected_reasoning_hint_and_space_share_one_owner() {
     );
     assert!(handle_transcript_space(&mut app));
     assert_eq!(
-        app.thinking_folds.get(&0),
-        Some(&ThinkingFold::Expanded),
+        app.cell_folds.get(&0),
+        Some(&TranscriptFold::Expanded),
         "Space on a collapsed cell records an explicit expand"
     );
     assert!(!handle_transcript_space(&mut app));
     assert_eq!(
-        app.thinking_folds.get(&0),
-        Some(&ThinkingFold::Expanded),
+        app.cell_folds.get(&0),
+        Some(&TranscriptFold::Expanded),
         "rendered action is single-use"
     );
 
@@ -6655,20 +6885,20 @@ fn selected_reasoning_hint_and_space_share_one_owner() {
     assert!(!expanded.contains("Space:expand"));
     assert!(!expanded.contains("Space:collapse"));
     assert_eq!(
-        app.viewport.transcript_cache.reasoning_action_target(),
-        Some(crate::tui::history::ReasoningActionTarget {
+        app.viewport.transcript_cache.fold_action_target(),
+        Some(crate::tui::history::CellFoldActionTarget {
             owner: crate::tui::history::TranscriptActionOwner {
                 cell_index: 0,
                 identity_epoch: app.transcript_identity_epoch,
             },
-            action: crate::tui::history::ReasoningAction::Collapse,
+            action: crate::tui::history::CellFoldAction::Collapse,
         })
     );
 
     app.history[0] = oversized_reasoning("selected", false);
     app.bump_history_cell(0);
     let _ = render_underwater_test_app(&mut app, 100, 32);
-    assert_eq!(app.thinking_folds.get(&0), Some(&ThinkingFold::Expanded));
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Expanded));
     assert!(
         app.viewport
             .transcript_cache
@@ -6680,8 +6910,8 @@ fn selected_reasoning_hint_and_space_share_one_owner() {
 
     assert!(handle_transcript_space(&mut app));
     assert_eq!(
-        app.thinking_folds.get(&0),
-        Some(&ThinkingFold::Collapsed),
+        app.cell_folds.get(&0),
+        Some(&TranscriptFold::Collapsed),
         "Space on an expanded cell records an explicit collapse"
     );
     let collapsed_again = render_underwater_test_app(&mut app, 100, 32);
@@ -6690,14 +6920,14 @@ fn selected_reasoning_hint_and_space_share_one_owner() {
 
 #[test]
 fn selected_reasoning_actions_roundtrip_for_every_expansion_baseline() {
-    use crate::tui::history::ReasoningAction;
+    use crate::tui::history::CellFoldAction;
 
     for verbose in [false, true] {
         for default_expanded in [false, true] {
             for initial_fold in [
                 None,
-                Some(ThinkingFold::Expanded),
-                Some(ThinkingFold::Collapsed),
+                Some(TranscriptFold::Expanded),
+                Some(TranscriptFold::Collapsed),
             ] {
                 let mut app = create_test_app();
                 app.verbose_transcript = verbose;
@@ -6705,7 +6935,7 @@ fn selected_reasoning_actions_roundtrip_for_every_expansion_baseline() {
                 app.thinking_preview_lines = 4;
                 app.history = vec![oversized_reasoning("baseline", false)];
                 if let Some(fold) = initial_fold {
-                    app.thinking_folds.insert(0, fold);
+                    app.cell_folds.insert(0, fold);
                 }
                 app.resync_history_revisions();
                 // Keep a long body so expanded and collapsed states are
@@ -6714,8 +6944,8 @@ fn selected_reasoning_actions_roundtrip_for_every_expansion_baseline() {
                 select_original_cell(&mut app, 0);
 
                 let initially_expanded = match initial_fold {
-                    Some(ThinkingFold::Expanded) => true,
-                    Some(ThinkingFold::Collapsed) => false,
+                    Some(TranscriptFold::Expanded) => true,
+                    Some(TranscriptFold::Collapsed) => false,
                     None => verbose || default_expanded,
                 };
                 for (step, expanded) in
@@ -6740,15 +6970,15 @@ fn selected_reasoning_actions_roundtrip_for_every_expansion_baseline() {
                     let target = app
                         .viewport
                         .transcript_cache
-                        .reasoning_action_target()
+                        .fold_action_target()
                         .expect("selected reasoning has a rendered action");
                     assert_eq!(target.owner.cell_index, 0);
                     assert_eq!(
                         target.action,
                         if expanded {
-                            ReasoningAction::Collapse
+                            CellFoldAction::Collapse
                         } else {
-                            ReasoningAction::Expand
+                            CellFoldAction::Expand
                         }
                     );
                     if step < 2 {
@@ -6758,11 +6988,11 @@ fn selected_reasoning_actions_roundtrip_for_every_expansion_baseline() {
                 // Two toggles land back on the state the cell started in —
                 // now recorded outright rather than inferred from a baseline.
                 assert_eq!(
-                    app.thinking_folds.get(&0),
+                    app.cell_folds.get(&0),
                     Some(&if initially_expanded {
-                        ThinkingFold::Expanded
+                        TranscriptFold::Expanded
                     } else {
-                        ThinkingFold::Collapsed
+                        TranscriptFold::Collapsed
                     }),
                 );
             }
@@ -6871,7 +7101,7 @@ fn mouse_selection_redraws_and_retargets_reasoning_with_unchanged_revisions() {
     let _ = render_underwater_test_app(&mut app, 100, 32);
     assert_eq!(reasoning_hint_cells(&app), vec![0]);
     assert!(handle_transcript_space(&mut app));
-    assert_eq!(app.thinking_folds.get(&0), Some(&ThinkingFold::Expanded));
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Expanded));
 }
 
 #[test]
@@ -6904,8 +7134,16 @@ fn mouse_up_preserves_the_single_click_action_and_detail_owner() {
     assert_eq!(detail_target_cell_index(&app), Some(0));
     let _ = render_underwater_test_app(&mut app, 100, 32);
     assert!(handle_transcript_space(&mut app));
-    assert!(app.collapsed_cells.contains(&0));
-    assert!(!app.collapsed_cells.contains(&1));
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Collapsed));
+    assert!(!app.cell_folds.contains_key(&1));
+    assert!(app.collapsed_cells.is_empty());
+    let _ = render_underwater_test_app(&mut app, 100, 32);
+    assert_eq!(
+        app.transcript_action_owner().map(|owner| owner.cell_index),
+        Some(0)
+    );
+    assert!(handle_transcript_space(&mut app));
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Expanded));
 }
 
 #[test]
@@ -6947,13 +7185,13 @@ fn calm1_reasoning_frames_keep_fixed_budgets_and_explicit_expansion() {
             app.history = vec![reasoning_with_lines("fixture", 20, streaming)];
             app.resync_history_revisions();
             if expanded {
-                app.thinking_folds.insert(0, ThinkingFold::Expanded);
+                app.cell_folds.insert(0, TranscriptFold::Expanded);
             }
             let surface = render_underwater_test_app(&mut app, width, height);
             let rows = app.viewport.last_transcript_total;
             if expanded {
                 assert!(rows >= 21);
-                assert_eq!(app.thinking_folds.get(&0), Some(&ThinkingFold::Expanded));
+                assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Expanded));
                 assert!(surface.contains("fixture line 20"), "{surface}");
             } else {
                 assert_eq!(rows, if streaming { 4 } else { 1 }, "{surface}");
@@ -6987,7 +7225,7 @@ fn advertised_reasoning_space_dispatches_after_first_char_paste_hold() {
     let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
     assert!(handle_plain_key_before_composer(&mut app, &space, now));
     assert!(
-        app.thinking_folds.is_empty(),
+        app.cell_folds.is_empty(),
         "Space remains ambiguous until the first-character hold expires"
     );
     assert!(app.input.is_empty(), "Space must not enter the composer");
@@ -7000,8 +7238,8 @@ fn advertised_reasoning_space_dispatches_after_first_char_paste_hold() {
         now + crate::tui::paste_burst::PasteBurst::recommended_flush_delay()
     ));
     assert_eq!(
-        app.thinking_folds.get(&0),
-        Some(&ThinkingFold::Expanded),
+        app.cell_folds.get(&0),
+        Some(&TranscriptFold::Expanded),
         "a lone Space must dispatch the rendered transcript action after the hold"
     );
     assert!(
@@ -7041,7 +7279,7 @@ fn raw_paste_beginning_with_space_preserves_payload_over_reasoning_action() {
         now + Duration::from_millis(1),
     ));
     assert!(
-        app.thinking_folds.is_empty(),
+        app.cell_folds.is_empty(),
         "a leading-space raw paste must not trigger transcript actions"
     );
     assert!(flush_paste_burst_before_composer(
@@ -7130,7 +7368,7 @@ fn active_raw_paste_keeps_space_as_payload_over_reasoning_action() {
         now + Duration::from_millis(1),
     ));
     assert!(
-        app.thinking_folds.is_empty(),
+        app.cell_folds.is_empty(),
         "an in-flight raw paste must not trigger transcript actions"
     );
     assert!(app.flush_paste_burst_if_due(
@@ -7284,7 +7522,7 @@ fn active_streaming_reasoning_keeps_its_visible_owner_across_a_delta() {
     assert_ne!(app.history_version, rendered_version);
     assert_eq!(app.transcript_identity_epoch, rendered_epoch);
     assert!(handle_transcript_space(&mut app));
-    assert_eq!(app.thinking_folds.get(&1), Some(&ThinkingFold::Expanded));
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Expanded));
 }
 
 #[test]
@@ -7307,7 +7545,7 @@ fn interrupted_active_reasoning_remains_actionable_after_flush() {
     assert!(app.active_cell.is_none());
     assert_eq!(app.transcript_identity_epoch, epoch);
     assert!(handle_transcript_space(&mut app));
-    assert_eq!(app.thinking_folds.get(&0), Some(&ThinkingFold::Expanded));
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Expanded));
     let _ = render_underwater_test_app(&mut app, 60, 16);
 }
 
@@ -7343,7 +7581,7 @@ fn pending_scroll_retargets_reasoning_in_the_same_frame() {
     assert_eq!(
         app.viewport
             .transcript_cache
-            .reasoning_action_target()
+            .fold_action_target()
             .map(|target| target.owner.cell_index),
         Some(0)
     );
@@ -7375,7 +7613,7 @@ fn visible_older_reasoning_owns_space_over_a_newer_offscreen_tool() {
     );
     assert_eq!(detail_target_cell_index(&app), Some(1));
     assert!(handle_transcript_space(&mut app));
-    assert_eq!(app.thinking_folds.get(&0), Some(&ThinkingFold::Expanded));
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Expanded));
     assert!(!app.collapsed_cells.contains(&1) && app.expanded_tool_runs.is_empty());
 }
 
@@ -7391,21 +7629,16 @@ fn hidden_reasoning_is_unhidden_instead_of_folded() {
     app.collapsed_cells.insert(0);
     assert!(handle_transcript_space(&mut app));
     assert!(!app.collapsed_cells.contains(&0));
-    assert!(!app.thinking_folds.contains_key(&0));
+    assert!(!app.cell_folds.contains_key(&0));
 
     app.collapsed_cells.insert(0);
     let surface = render_underwater_test_app(&mut app, 60, 16);
     assert!(!surface.contains("Space:expand"));
-    assert!(
-        app.viewport
-            .transcript_cache
-            .reasoning_action_target()
-            .is_none()
-    );
+    assert!(app.viewport.transcript_cache.fold_action_target().is_none());
 
     assert!(handle_transcript_space(&mut app));
     assert!(!app.collapsed_cells.contains(&0));
-    assert!(!app.thinking_folds.contains_key(&0));
+    assert!(!app.cell_folds.contains_key(&0));
     let visible = render_underwater_test_app(&mut app, 60, 16);
     assert!(visible.contains("Space:expand"));
 }
@@ -7421,11 +7654,11 @@ fn stale_rendered_reasoning_owner_cannot_toggle_replacement() {
     app.push_history_cell(long_reasoning("replacement", false));
     assert_ne!(app.transcript_identity_epoch, rendered_epoch);
     assert!(!handle_transcript_space(&mut app));
-    assert!(app.thinking_folds.is_empty());
+    assert!(app.cell_folds.is_empty());
 
     let _ = render_underwater_test_app(&mut app, 80, 24);
     assert!(handle_transcript_space(&mut app));
-    assert_eq!(app.thinking_folds.get(&0), Some(&ThinkingFold::Expanded));
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Expanded));
 }
 
 #[test]
@@ -7443,10 +7676,10 @@ fn pop_and_truncate_prune_index_state_before_replacement() {
     for set in [&mut app.collapsed_cells, &mut app.expanded_tool_runs] {
         set.insert(1);
     }
-    app.thinking_folds.insert(1, ThinkingFold::Expanded);
+    app.cell_folds.insert(1, TranscriptFold::Expanded);
     app.collapsed_cell_map = vec![0, 1];
     app.pop_history();
-    assert!(app.collapsed_cells.is_empty() && app.thinking_folds.is_empty());
+    assert!(app.collapsed_cells.is_empty() && app.cell_folds.is_empty());
     assert!(app.expanded_tool_runs.is_empty() && app.collapsed_cell_map.is_empty());
     app.push_history_cell(HistoryCell::Assistant {
         content: "after pop".into(),
@@ -7459,14 +7692,14 @@ fn pop_and_truncate_prune_index_state_before_replacement() {
     for set in [&mut app.collapsed_cells, &mut app.expanded_tool_runs] {
         set.insert(1);
     }
-    app.thinking_folds.insert(1, ThinkingFold::Expanded);
+    app.cell_folds.insert(1, TranscriptFold::Expanded);
     app.truncate_history_to(1);
     app.push_history_cell(HistoryCell::Assistant {
         content: "after truncate".into(),
         streaming: false,
     });
     assert!(!handle_transcript_space(&mut app));
-    assert!(app.collapsed_cells.is_empty() && app.thinking_folds.is_empty());
+    assert!(app.collapsed_cells.is_empty() && app.cell_folds.is_empty());
     assert!(render_underwater_test_app(&mut app, 60, 16).contains("after truncate"));
 }
 
@@ -7474,6 +7707,7 @@ fn pop_and_truncate_prune_index_state_before_replacement() {
 fn dispatch_rollback_prunes_tail_state_and_keeps_revisions_monotonic() {
     let mut app = create_test_app();
     let config = Config::default();
+    let version_before_echo = app.history_version;
     let prepare = prepare_user_dispatch(
         &mut app,
         &config,
@@ -7482,7 +7716,7 @@ fn dispatch_rollback_prunes_tail_state_and_keeps_revisions_monotonic() {
     .expect("prepare");
     let _ = render_underwater_test_app(&mut app, 60, 16);
     app.collapsed_cells.insert(0);
-    app.thinking_folds.insert(0, ThinkingFold::Expanded);
+    app.cell_folds.insert(0, TranscriptFold::Expanded);
     app.expanded_tool_runs.insert(0);
     app.collapsed_cell_map.push(0);
     let next_revision = app.next_history_revision;
@@ -7491,7 +7725,11 @@ fn dispatch_rollback_prunes_tail_state_and_keeps_revisions_monotonic() {
     let error = apply(&mut app, &engine.handle, &config).expect_err("dispatch fails");
     assert_eq!(error.to_string(), "failed");
     assert_eq!(app.next_history_revision, next_revision);
-    assert!(app.collapsed_cells.is_empty() && app.thinking_folds.is_empty());
+    // The history version feeds cache keys; rolling the echo back to the
+    // version it had before would let a later cell reuse a key a frame has
+    // already seen.
+    assert_ne!(app.history_version, version_before_echo);
+    assert!(app.collapsed_cells.is_empty() && app.cell_folds.is_empty());
     assert!(app.expanded_tool_runs.is_empty() && app.collapsed_cell_map.is_empty());
     app.push_history_cell(HistoryCell::Assistant {
         content: "replacement".into(),
@@ -7515,7 +7753,7 @@ fn dispatch_rollback_prunes_tail_state_and_keeps_revisions_monotonic() {
 fn restored_reasoning_and_answer_clear_prior_fold_ownership() {
     let mut app = create_test_app();
     app.push_history_cell(long_reasoning("old session", false));
-    app.thinking_folds.insert(0, ThinkingFold::Expanded);
+    app.cell_folds.insert(0, TranscriptFold::Expanded);
     let _ = render_underwater_test_app(&mut app, 80, 24);
     let old_epoch = app.transcript_identity_epoch;
     let session = saved_session_with_messages(vec![codewhale_models::Message {
@@ -7537,7 +7775,7 @@ fn restored_reasoning_and_answer_clear_prior_fold_ownership() {
     }]);
 
     apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
-    assert!(app.thinking_folds.is_empty());
+    assert!(app.cell_folds.is_empty());
     assert_ne!(app.transcript_identity_epoch, old_epoch);
     assert!(matches!(
         app.history.first(),
@@ -7601,8 +7839,8 @@ fn filtered_selection_toggles_the_original_reasoning_index() {
     let _ = render_underwater_test_app(&mut app, 60, 16);
     assert_eq!(reasoning_hint_cells(&app), vec![1]);
     assert!(handle_transcript_space(&mut app));
-    assert_eq!(app.thinking_folds.get(&1), Some(&ThinkingFold::Expanded));
-    assert!(!app.thinking_folds.contains_key(&0));
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Expanded));
+    assert!(!app.cell_folds.contains_key(&0));
 }
 
 #[test]
@@ -8312,6 +8550,56 @@ fn child_approval_card_hides_always_allow_in_repo() {
             matches!(action, ViewAction::EmitAndClose(_)),
             expect_repo_rule,
             "only the parent card offers Always allow in this repo"
+        );
+    }
+}
+
+/// Lesson 1: the same edit asked in a plain folder and ran unasked in a
+/// repository, and nothing on screen said why.
+#[test]
+fn file_edit_card_says_when_it_asks_for_lack_of_a_git_repository() {
+    let plain = tempfile::tempdir().expect("plain folder");
+    let repo = tempfile::tempdir().expect("repository");
+    std::fs::create_dir(repo.path().join(".git")).expect("git marker");
+    let edit = serde_json::json!({"path": "duration.mjs", "search": "a", "replace": "b"});
+    let shell = serde_json::json!({"command": "npm test"});
+    for (workspace, tool, input, expected) in [
+        (plain.path(), "edit_file", &edit, true),
+        // A card that still opens in a repository asks for another reason.
+        (repo.path(), "edit_file", &edit, false),
+        // Git never changes whether a command asks.
+        (plain.path(), "exec_shell", &shell, false),
+    ] {
+        let mut app = create_test_app();
+        app.mode = AppMode::Agent;
+        app.approval_mode = ApprovalMode::Suggest;
+        app.workspace = workspace.to_path_buf();
+        push_approval_request_view(
+            &mut app,
+            "call-1",
+            tool,
+            "Needs approval",
+            input,
+            "approval-key",
+            "",
+            None,
+            crate::config::ApprovalDefaultSelection::Deny,
+            None,
+        );
+        let mut view = app.view_stack.pop().expect("approval view");
+        let approval = view
+            .as_any_mut()
+            .downcast_mut::<ApprovalView>()
+            .expect("approval view");
+        let area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        approval.render(area, &mut buf);
+        let text: String = buf.content.iter().map(|cell| cell.symbol()).collect();
+        assert_eq!(
+            text.contains("No Git repository here, so edits ask first."),
+            expected,
+            "{tool} in {}:\n{text}",
+            workspace.display()
         );
     }
 }
@@ -9525,10 +9813,10 @@ fn apply_loaded_session_replaces_cost_coverage_with_the_loaded_total() {
         "subagent:agent-reload:step:1:response:late",
         &crate::cost_status::EffectiveRouteEnvelope::capture(
             None,
-            ApiProvider::Anthropic,
+            ProviderKind::Anthropic,
             "anthropic-direct",
             "claude-sonnet-4-5",
-            Some(ApiProvider::Anthropic.default_base_url()),
+            Some(ProviderKind::Anthropic.provider().default_base_url()),
             chrono::Utc::now(),
         ),
         &Usage {
@@ -9721,6 +10009,11 @@ fn backtrack_prefill_rehydrates_attachment_rows() {
 
     assert_eq!(app.input, user_text);
     assert_eq!(app.composer_attachment_count(), 1);
+    // The rewind leaves files alone: the footer says so and names `/undo`.
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Files not changed. /undo puts them back. Conversation rewound.")
+    );
 }
 
 #[test]
@@ -10151,7 +10444,7 @@ fn persisted_queued_plugin_skill_is_denied_after_cross_process_revocation() {
         "finish it".to_string(),
         Some("Do the queued work.".to_string()),
     )
-    .with_skill_provenance(Some(authority));
+    .with_skill_provenance(Some(authority.into()));
     let serialized = serde_json::to_string(&queued_ui_to_session(&queued)).unwrap();
     let persisted: QueuedSessionMessage = serde_json::from_str(&serialized).unwrap();
     let restored = queued_session_to_ui(persisted);
@@ -10429,11 +10722,7 @@ async fn operate_rejected_attach_does_not_reactivate_saved_keepalive() {
     let mut app = create_test_app();
     app.workspace = root.path().to_path_buf();
     app.runtime_services.automations = Some(automations.clone());
-    app.set_provider_identity_record(
-        config
-            .active_provider_identity(ApiProvider::Custom)
-            .expect("identity"),
-    );
+    app.set_provider_identity_record(config.active_provider_identity().expect("identity"));
     app.set_model_selection("startup-model".into());
     let engine = mock_engine_handle();
     apply_mode_update(&mut app, &engine.handle, &config, AppMode::Operate).await;
@@ -10521,20 +10810,26 @@ fn saved_default_provider_syncs_back_to_runtime_config() {
     settings.save().expect("save settings");
 
     let mut config = Config::default();
-    assert_eq!(config.api_provider(), ApiProvider::Deepseek);
+    assert_eq!(
+        config.active_provider_identity().unwrap().provider,
+        ProviderKind::Deepseek
+    );
 
     let app = App::new(create_test_options(), &config);
-    assert_eq!(app.api_provider, ApiProvider::Ollama);
+    assert_eq!(app.api_provider, ProviderKind::Ollama);
 
     sync_config_provider_from_app(&mut config, &app);
 
-    assert_eq!(config.api_provider(), ApiProvider::Ollama);
+    assert_eq!(
+        config.active_provider_identity().unwrap().provider,
+        ProviderKind::Ollama
+    );
 }
 
 #[test]
 fn provider_picker_reselecting_active_provider_preserves_current_model() {
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Ollama, "ollama");
+    app.set_provider_identity(ProviderKind::Ollama, "ollama");
     app.model = "deepseek-coder-v2:16b".to_string();
     let config = Config {
         provider: Some("ollama".to_string()),
@@ -10542,11 +10837,20 @@ fn provider_picker_reselecting_active_provider_preserves_current_model() {
     };
 
     assert_eq!(
-        provider_picker_model_override(&app, &config, ApiProvider::Ollama).as_deref(),
+        provider_picker_model_override(
+            &app,
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Ollama)
+        )
+        .as_deref(),
         Some("deepseek-coder-v2:16b")
     );
     assert_eq!(
-        provider_picker_model_override(&app, &config, ApiProvider::Deepseek),
+        provider_picker_model_override(
+            &app,
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Deepseek)
+        ),
         None
     );
 }
@@ -10578,16 +10882,19 @@ async fn provider_switch_clears_turn_cache_history() {
     let mut engine = mock_engine_handle();
     let mut config = Config::default();
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Ollama,
-        Some("fixture-local:tag".to_string()),
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Ollama);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            Some("fixture-local:tag".to_string()),
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Ollama);
+    assert_eq!(app.api_provider, ProviderKind::Ollama);
     assert!(app.session.turn_cache_history.is_empty());
 }
 
@@ -10597,7 +10904,7 @@ async fn provider_switch_clears_turn_cache_history() {
 async fn reselecting_the_same_provider_says_connected_not_switched() {
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     let mut engine = mock_engine_handle();
     let mut config = Config {
         provider: Some("deepseek".to_string()),
@@ -10605,13 +10912,16 @@ async fn reselecting_the_same_provider_says_connected_not_switched() {
     }
     .with_legacy_root(Some("test-key".to_string()), None);
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Deepseek,
-        None,
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Deepseek);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            None,
+        )
+    }
     .await;
 
     let summary = app
@@ -10642,7 +10952,7 @@ async fn adopting_a_local_model_closes_the_connect_picker_and_names_it() {
     app.onboarding = crate::tui::app::OnboardingState::Provider;
     app.onboarding_needs_api_key = true;
     app.view_stack
-        .push(ProviderPickerView::new(ApiProvider::Deepseek, &config));
+        .push(ProviderPickerView::new(ProviderKind::Deepseek, &config));
     let catalog = crate::local_ollama::LiveLocalOllamaCatalog {
         endpoint_v1: "http://localhost:11434/v1".to_string(),
         tags: vec!["fixture-local:tag".to_string()],
@@ -10657,7 +10967,7 @@ async fn adopting_a_local_model_closes_the_connect_picker_and_names_it() {
     )
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Ollama);
+    assert_eq!(app.api_provider, ProviderKind::Ollama);
     assert_eq!(app.onboarding, crate::tui::app::OnboardingState::None);
     assert_ne!(
         app.view_stack.top_kind(),
@@ -10698,18 +11008,19 @@ fn first_run_route_starts_with_configured_provider_and_model() {
         let _provider = from_env.then(|| EnvVarGuard::set("CODEWHALE_PROVIDER", "openai"));
         let _model = from_env.then(|| EnvVarGuard::set("CODEWHALE_MODEL", "gpui-fixture"));
         let config = Config::load(None, None).expect("load fresh home config");
-        assert_eq!(config.api_provider(), ApiProvider::Openai);
+        assert_eq!(
+            config.active_provider_identity().unwrap().provider,
+            ProviderKind::Openai
+        );
         assert_eq!(config.default_model(), "gpui-fixture");
 
         // An options default must not replace the resolved config's model.
         let mut options = create_test_options();
         options.model = DEFAULT_TEXT_MODEL.to_string();
         let mut app = App::new(options, &config);
-        assert_eq!(app.api_provider, ApiProvider::Openai);
+        assert_eq!(app.api_provider, ProviderKind::Openai);
         assert_eq!(app.model, "gpui-fixture");
-        assert!(!crate::local_ollama::should_adopt_live_local_ollama(
-            &mut app
-        ));
+        assert!(!app.should_adopt_live_local_ollama());
         assert!(codewhale_config::SetupState::load().unwrap().is_none());
         assert_eq!(
             Config::load(None, None).unwrap().default_model(),
@@ -10728,7 +11039,7 @@ async fn first_run_route_keeps_explicit_choice_when_credentials_are_missing() {
         "[providers.deepseek]\nmodel = 'deepseek-v4-flash'\n",
     ] {
         let mut config = Config::from_saved_document(document, None).unwrap();
-        let provider = config.api_provider();
+        let provider = config.active_provider_identity().unwrap().provider;
         let model = config.default_model();
         let mut options = create_test_options();
         options.model = model.clone();
@@ -10737,9 +11048,7 @@ async fn first_run_route_keeps_explicit_choice_when_credentials_are_missing() {
         app.onboarding_needs_api_key = true;
         app.onboarding_missing_key_recovery = true;
         sync_config_provider_from_app(&mut config, &app);
-        assert!(!crate::local_ollama::should_adopt_live_local_ollama(
-            &mut app
-        ));
+        assert!(!app.should_adopt_live_local_ollama());
 
         let mut engine = mock_engine_handle();
         super::event_loop::adopt_live_local_ollama_catalog(
@@ -10756,7 +11065,10 @@ async fn first_run_route_keeps_explicit_choice_when_credentials_are_missing() {
 
         assert_eq!(app.api_provider, provider);
         assert_eq!(app.model, model);
-        assert_eq!(config.api_provider(), provider);
+        assert_eq!(
+            config.active_provider_identity().unwrap().provider,
+            provider
+        );
         assert!(codewhale_config::SetupState::load().unwrap().is_none());
     }
 }
@@ -10764,7 +11076,7 @@ async fn first_run_route_keeps_explicit_choice_when_credentials_are_missing() {
 #[test]
 fn first_run_route_context_is_empty_until_conversation_starts() {
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Ollama, "ollama");
+    app.set_provider_identity(ProviderKind::Ollama, "ollama");
     app.set_model_selection("qwen3:4b".into());
     app.active_route_limits = Some(codewhale_config::route::RouteLimits {
         context_tokens: Some(8192),
@@ -10859,10 +11171,7 @@ async fn first_run_route_generated_config_restart_keeps_local_discovery() {
         app.onboarding_needs_api_key = true;
         sync_config_provider_from_app(&mut config, &app);
         assert!(!app.startup_route_configured, "launch {launch}");
-        assert!(
-            crate::local_ollama::should_adopt_live_local_ollama(&mut app),
-            "launch {launch}"
-        );
+        assert!(app.should_adopt_live_local_ollama(), "launch {launch}");
         if launch == 1 {
             let mut engine = mock_engine_handle();
             super::event_loop::adopt_live_local_ollama_catalog(
@@ -10872,7 +11181,7 @@ async fn first_run_route_generated_config_restart_keeps_local_discovery() {
                 first_run_route_catalog(),
             )
             .await;
-            assert_eq!(app.api_provider, ApiProvider::Ollama);
+            assert_eq!(app.api_provider, ProviderKind::Ollama);
             assert_eq!(app.model, "qwen3:4b");
         }
     }
@@ -10901,16 +11210,14 @@ async fn first_run_route_endpoint_only_keeps_route_when_credentials_are_missing(
         std::fs::write(&path, document).unwrap();
         let mut config = Config::load(None, None).expect("load endpoint-only config");
         assert!(config.active_route_endpoint_configured(), "{document:?}");
-        let provider = config.api_provider();
+        let provider = config.active_provider_identity().unwrap().provider;
         let mut options = create_test_options();
         options.model = config.default_model();
         let mut app = App::new(options, &config);
         app.onboarding_needs_api_key = true;
         app.onboarding_missing_key_recovery = true;
         assert!(app.startup_route_configured, "{document:?}");
-        assert!(!crate::local_ollama::should_adopt_live_local_ollama(
-            &mut app
-        ));
+        assert!(!app.should_adopt_live_local_ollama());
         let mut engine = mock_engine_handle();
         super::event_loop::adopt_live_local_ollama_catalog(
             &mut app,
@@ -10920,7 +11227,11 @@ async fn first_run_route_endpoint_only_keeps_route_when_credentials_are_missing(
         )
         .await;
         assert_eq!(app.api_provider, provider, "{document:?}");
-        assert_eq!(config.api_provider(), provider, "{document:?}");
+        assert_eq!(
+            config.active_provider_identity().unwrap().provider,
+            provider,
+            "{document:?}"
+        );
     }
 }
 
@@ -10953,7 +11264,7 @@ async fn first_run_switch_to_keyed_route_clears_launch_missing_key_state() {
     let mut options = create_test_options();
     options.model = config.default_model();
     let mut app = App::new(options, &config);
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert!(app.onboarding_needs_api_key);
     assert!(app.onboarding_missing_key_recovery);
     assert_eq!(app.onboarding, OnboardingState::Provider);
@@ -10961,22 +11272,23 @@ async fn first_run_switch_to_keyed_route_clears_launch_missing_key_state() {
 
     let mut engine = mock_engine_handle();
     assert!(
-        switch_provider(
-            &mut app,
-            &mut engine.handle,
-            &mut config,
-            ApiProvider::Openai,
-            None,
-        )
+        {
+            let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Openai);
+            switch_provider(
+                &mut app,
+                &mut engine.handle,
+                &mut config,
+                captured_fixture_identity,
+                None,
+            )
+        }
         .await
     );
 
-    assert_eq!(app.api_provider, ApiProvider::Openai);
+    assert_eq!(app.api_provider, ProviderKind::Openai);
     assert!(!app.onboarding_needs_api_key);
     assert!(!app.onboarding_missing_key_recovery);
-    assert!(!crate::local_ollama::should_adopt_live_local_ollama(
-        &mut app
-    ));
+    assert!(!app.should_adopt_live_local_ollama());
 }
 
 /// A key supplied only through the environment is a working hosted route:
@@ -10997,17 +11309,15 @@ fn first_run_route_env_key_only_is_not_replaced() {
     let mut app = App::new(options, &config);
     assert!(!app.onboarding_needs_api_key);
     assert!(!app.onboarding_missing_key_recovery);
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
-    assert!(!crate::local_ollama::should_adopt_live_local_ollama(
-        &mut app
-    ));
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
+    assert!(!app.should_adopt_live_local_ollama());
 }
 
 #[tokio::test]
 async fn provider_switch_to_deepseek_canonicalizes_openrouter_default_model() {
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Openrouter;
+    app.api_provider = ProviderKind::Openrouter;
     app.model = DEFAULT_OPENROUTER_MODEL.to_string();
     let mut engine = mock_engine_handle();
     let mut config = Config {
@@ -11017,16 +11327,19 @@ async fn provider_switch_to_deepseek_canonicalizes_openrouter_default_model() {
     }
     .with_legacy_root(Some("test-key".to_string()), None);
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Deepseek,
-        None,
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Deepseek);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            None,
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert!(!app.model_ids_passthrough);
     assert_eq!(app.model, DEFAULT_TEXT_MODEL);
 }
@@ -11035,7 +11348,7 @@ async fn provider_switch_to_deepseek_canonicalizes_openrouter_default_model() {
 async fn provider_switch_to_deepseek_drops_stale_xiaomi_root_base_url() {
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::XiaomiMimo;
+    app.api_provider = ProviderKind::XiaomiMimo;
     app.model = "mimo-v2.5-pro".to_string();
     app.model_ids_passthrough = true;
     let mut engine = mock_engine_handle();
@@ -11057,16 +11370,19 @@ async fn provider_switch_to_deepseek_drops_stale_xiaomi_root_base_url() {
         Some("https://token-plan-sgp.xiaomimimo.com/v1".to_string()),
     );
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Deepseek,
-        None,
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Deepseek);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            None,
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert!(!app.model_ids_passthrough);
     assert_eq!(app.model, DEFAULT_TEXT_MODEL);
     assert_eq!(config.provider.as_deref(), Some("deepseek"));
@@ -11078,7 +11394,7 @@ async fn provider_switch_from_mimo_to_openrouter_without_key_fails_before_dispat
     let _home = SettingsHomeGuard::new();
     let _openrouter_key = crate::test_support::EnvVarGuard::remove("OPENROUTER_API_KEY");
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::XiaomiMimo;
+    app.api_provider = ProviderKind::XiaomiMimo;
     app.model = "mimo-v2.5-pro".to_string();
     app.model_ids_passthrough = true;
     let mut engine = mock_engine_handle();
@@ -11100,16 +11416,20 @@ async fn provider_switch_from_mimo_to_openrouter_without_key_fails_before_dispat
         Some("https://token-plan-sgp.xiaomimimo.com/v1".to_string()),
     );
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Openrouter,
-        Some(crate::config::OPENROUTER_NEMOTRON_3_ULTRA_MODEL.to_string()),
-    )
+    app.set_provider_identity_record(config.active_provider_identity().unwrap());
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Openrouter);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            Some(crate::config::OPENROUTER_NEMOTRON_3_ULTRA_MODEL.to_string()),
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::XiaomiMimo);
+    assert_eq!(app.api_provider, ProviderKind::XiaomiMimo);
     assert_eq!(app.model, "mimo-v2.5-pro");
     assert!(app.model_ids_passthrough);
     assert_eq!(config.provider.as_deref(), Some("xiaomi-mimo"));
@@ -11157,9 +11477,9 @@ async fn successful_custom_provider_activation_completes_onboarding() {
     )
     .await;
     assert!(switched);
-    complete_provider_picker_onboarding_if_switched(&mut app, ApiProvider::Custom, switched);
+    complete_provider_picker_onboarding_if_switched(&mut app, ProviderKind::Custom, switched);
 
-    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.api_provider, ProviderKind::Custom);
     let fixture_home = config_env._tmp.path().join(".codewhale");
     let fixture_settings = config_env
         .config_path()
@@ -11201,11 +11521,11 @@ async fn failed_custom_provider_activation_stays_in_onboarding_recovery() {
         None,
     )
     .await;
-    complete_provider_picker_onboarding_if_switched(&mut app, ApiProvider::Custom, switched);
+    complete_provider_picker_onboarding_if_switched(&mut app, ProviderKind::Custom, switched);
 
     assert!(!switched);
     assert_eq!(app.onboarding, OnboardingState::Provider);
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(std::fs::read(global_config).ok(), startup_before);
     assert_eq!(
         crate::settings::Settings::load()
@@ -11248,20 +11568,20 @@ async fn successful_native_xai_oauth_activation_completes_onboarding() {
         "fixture xAI login complete",
     )
     .await;
-    complete_provider_picker_onboarding_if_switched(&mut app, ApiProvider::Xai, switched);
+    complete_provider_picker_onboarding_if_switched(&mut app, ProviderKind::Xai, switched);
 
     assert!(
         switched,
         "xAI switch failed: status={:?}, history={:?}, config={:?}, saved={:?}",
         app.status_message,
         app.history,
-        config.provider_config_for(ApiProvider::Xai),
+        config.provider_config_for(&config.test_identity_for_kind(ProviderKind::Xai)),
         std::fs::read_to_string(config_env.config_path())
     );
-    assert_eq!(app.api_provider, ApiProvider::Xai);
+    assert_eq!(app.api_provider, ProviderKind::Xai);
     assert_ne!(app.onboarding, OnboardingState::Provider);
     let xai = config
-        .provider_config_for(ApiProvider::Xai)
+        .provider_config_for(&config.test_identity_for_kind(ProviderKind::Xai))
         .expect("activated xAI slot");
     assert_eq!(xai.auth_mode.as_deref(), Some("oauth"));
     assert!(
@@ -11300,11 +11620,11 @@ async fn failed_native_xai_oauth_activation_stays_in_onboarding_recovery() {
         "fixture xAI login complete",
     )
     .await;
-    complete_provider_picker_onboarding_if_switched(&mut app, ApiProvider::Xai, switched);
+    complete_provider_picker_onboarding_if_switched(&mut app, ProviderKind::Xai, switched);
 
     assert!(!switched);
     assert_eq!(app.onboarding, OnboardingState::Provider);
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
 }
 
 #[tokio::test]
@@ -11317,7 +11637,8 @@ async fn xai_api_key_confirmation_saves_only_the_selected_xai_slot() {
     app.config_path = Some(config_env.config_path());
     let mut engine = mock_engine_handle();
     let mut config = Config::default();
-    let identity = picker_provider_identity(&config, ApiProvider::Xai, None).expect("xAI identity");
+    let identity =
+        picker_provider_identity(&config, ProviderKind::Xai, None).expect("xAI identity");
 
     let switched = apply_provider_picker_setup_confirmed(
         &mut app,
@@ -11333,7 +11654,7 @@ async fn xai_api_key_confirmation_saves_only_the_selected_xai_slot() {
 
     assert!(switched, "provider switch failed: {:?}", app.history);
     let xai = config
-        .provider_config_for(ApiProvider::Xai)
+        .provider_config_for(&config.test_identity_for_kind(ProviderKind::Xai))
         .expect("saved xAI slot");
     assert_eq!(xai.auth_mode.as_deref(), Some("api_key"));
     assert_eq!(xai.api_key.as_deref(), Some("violet-otter-key"));
@@ -11381,8 +11702,9 @@ fn setup_confirm_toast_names_secret_store_and_global_scope() {
                     let mut app = create_test_app();
                     let mut engine = mock_engine_handle();
                     let mut config = Config::default();
-                    let identity = picker_provider_identity(&config, ApiProvider::Openrouter, None)
-                        .expect("OpenRouter identity");
+                    let identity =
+                        picker_provider_identity(&config, ProviderKind::Openrouter, None)
+                            .expect("OpenRouter identity");
 
                     let switched = apply_provider_picker_setup_confirmed(
                         &mut app,
@@ -11440,23 +11762,26 @@ api_key = "arcee-key"
     .expect("write config");
 
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Arcee;
+    app.api_provider = ProviderKind::Arcee;
     app.model = "auto".to_string();
     app.config_path = Some(config_path.clone());
 
     let mut engine = mock_engine_handle();
     let mut config = Config::load(Some(config_path.clone()), None).expect("load config");
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::XiaomiMimo,
-        None,
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::XiaomiMimo);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            None,
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::XiaomiMimo);
+    assert_eq!(app.api_provider, ProviderKind::XiaomiMimo);
     assert_eq!(config.provider.as_deref(), Some("xiaomi-mimo"));
 
     // The live session moved, but NOTHING was written: the config file on
@@ -11466,7 +11791,10 @@ api_key = "arcee-key"
     let reloaded = Config::load(Some(config_path.clone()), None).expect("reload config");
     // The on-disk config still resolves to the OLD provider's endpoint —
     // nothing changed for a restart or another folder.
-    assert_eq!(reloaded.api_provider(), ApiProvider::Arcee);
+    assert_eq!(
+        reloaded.active_provider_identity().unwrap().provider,
+        ProviderKind::Arcee
+    );
     assert_eq!(
         reloaded.active_route_base_url(),
         "https://api.arcee.ai/api/v1"
@@ -11489,17 +11817,17 @@ api_key = "arcee-key"
 fn local_ollama_probe_leaves_a_picker_the_person_is_using_alone() {
     let config = Config::default();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.onboarding_needs_api_key = true;
     app.onboarding = OnboardingState::Provider;
     app.view_stack.push(ProviderPickerView::new_for_onboarding(
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         None,
         &config,
         None,
     ));
     assert!(
-        crate::local_ollama::should_adopt_live_local_ollama(&mut app),
+        app.should_adopt_live_local_ollama(),
         "an untouched first-run picker still adopts a live local model"
     );
 
@@ -11507,7 +11835,7 @@ fn local_ollama_probe_leaves_a_picker_the_person_is_using_alone() {
         .view_stack
         .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     assert!(
-        !crate::local_ollama::should_adopt_live_local_ollama(&mut app),
+        !app.should_adopt_live_local_ollama(),
         "a picker the person has used is not closed by the background probe"
     );
     assert_eq!(app.view_stack.top_kind(), Some(ModalKind::ProviderPicker));
@@ -11537,17 +11865,17 @@ fn first_run_ollama_choice_survives_restart_from_canonical_config() {
     // `switch_provider` already has focused session-local coverage above.
     // Recreate its successful live-route result here so this regression stays
     // centered on the missing onboarding completion write and restart load.
-    app.set_provider_identity(ApiProvider::Ollama, ApiProvider::Ollama.as_str());
+    app.set_provider_identity(ProviderKind::Ollama, ProviderKind::Ollama.as_str());
     app.set_model_selection(crate::config::DEFAULT_OLLAMA_MODEL.to_string());
     app.note_session_route_change(
-        ApiProvider::Ollama.as_str(),
+        ProviderKind::Ollama.as_str(),
         crate::config::DEFAULT_OLLAMA_MODEL,
     );
     record_provider_model_setup_progress(&mut app, &config);
-    assert_eq!(app.api_provider, ApiProvider::Ollama);
+    assert_eq!(app.api_provider, ProviderKind::Ollama);
     assert_eq!(app.model, crate::config::DEFAULT_OLLAMA_MODEL);
 
-    complete_provider_picker_onboarding(&mut app, ApiProvider::Ollama);
+    complete_provider_picker_onboarding(&mut app, ProviderKind::Ollama);
 
     let saved = assert_saved_startup_route("ollama", "ollama", crate::config::DEFAULT_OLLAMA_MODEL);
     assert!(app.pending_route_save.is_none());
@@ -11611,7 +11939,7 @@ fn first_run_ollama_choice_survives_restart_from_canonical_config() {
     };
     assert_eq!(options.model, crate::config::DEFAULT_OLLAMA_MODEL);
     let restarted = Box::new(App::new(options, &restart_config));
-    assert_eq!(restarted.api_provider, ApiProvider::Ollama);
+    assert_eq!(restarted.api_provider, ProviderKind::Ollama);
     assert_eq!(restarted.model, crate::config::DEFAULT_OLLAMA_MODEL);
     assert_ne!(
         restarted.onboarding,
@@ -11639,17 +11967,17 @@ fn failed_first_run_route_persistence_keeps_provider_setup_active() {
     let mut app = Box::new(create_test_app());
     app.onboarding = OnboardingState::Provider;
     app.onboarding_needs_api_key = true;
-    app.set_provider_identity(ApiProvider::Ollama, ApiProvider::Ollama.as_str());
+    app.set_provider_identity(ProviderKind::Ollama, ProviderKind::Ollama.as_str());
     app.set_model_selection(crate::config::DEFAULT_OLLAMA_MODEL.to_string());
     app.note_session_route_change(
-        ApiProvider::Ollama.as_str(),
+        ProviderKind::Ollama.as_str(),
         crate::config::DEFAULT_OLLAMA_MODEL,
     );
 
-    complete_provider_picker_onboarding(&mut app, ApiProvider::Ollama);
+    complete_provider_picker_onboarding(&mut app, ProviderKind::Ollama);
 
     assert_eq!(app.onboarding, OnboardingState::Provider);
-    assert_eq!(app.onboarding_provider, ApiProvider::Ollama);
+    assert_eq!(app.onboarding_provider, ProviderKind::Ollama);
     assert!(app.onboarding_needs_api_key);
     assert!(
         app.pending_route_save.is_some(),
@@ -11668,7 +11996,7 @@ fn failed_first_run_route_persistence_keeps_provider_setup_active() {
 async fn provider_switch_model_override_updates_target_provider_model_slot() {
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::XiaomiMimo;
+    app.api_provider = ProviderKind::XiaomiMimo;
     app.model = "mimo-v2.5-pro".to_string();
     let mut engine = mock_engine_handle();
     let mut config = Config {
@@ -11686,16 +12014,19 @@ async fn provider_switch_model_override_updates_target_provider_model_slot() {
     }
     .with_legacy_root(Some("deepseek-key".to_string()), None);
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Deepseek,
-        Some("deepseek-v4-flash".to_string()),
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Deepseek);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            Some("deepseek-v4-flash".to_string()),
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.model, "deepseek-v4-flash");
     assert_eq!(
         config
@@ -11736,7 +12067,7 @@ async fn provider_switch_succeeds_without_writing_when_config_is_unwritable() {
     let _home = SettingsHomeGuard::new();
     let tmp = TempDir::new().expect("config tempdir");
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::XiaomiMimo;
+    app.api_provider = ProviderKind::XiaomiMimo;
     app.model = "mimo-v2.5-pro".to_string();
     app.config_path = Some(tmp.path().to_path_buf());
     let mut engine = mock_engine_handle();
@@ -11755,16 +12086,19 @@ async fn provider_switch_succeeds_without_writing_when_config_is_unwritable() {
     }
     .with_legacy_root(Some("deepseek-key".to_string()), None);
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Deepseek,
-        Some("deepseek-v4-flash".to_string()),
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Deepseek);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            Some("deepseek-v4-flash".to_string()),
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.model, "deepseek-v4-flash");
     // The switch writes nothing, so an unwritable config path cannot fail a
     // switch, and the receipt must not claim a partial persistence that never
@@ -11796,7 +12130,7 @@ async fn provider_switch_succeeds_without_writing_when_config_is_unwritable() {
 async fn provider_switch_without_model_uses_target_default_not_previous_provider_model() {
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Openrouter;
+    app.api_provider = ProviderKind::Openrouter;
     app.model = "deepseek/deepseek-v4-pro".to_string();
     app.model_ids_passthrough = true;
     let mut engine = mock_engine_handle();
@@ -11818,16 +12152,19 @@ async fn provider_switch_without_model_uses_target_default_not_previous_provider
     }
     .with_legacy_root(Some("deepseek-key".to_string()), None);
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Zai,
-        None,
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Zai);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            None,
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Zai);
+    assert_eq!(app.api_provider, ProviderKind::Zai);
     assert_eq!(app.model, DEFAULT_ZAI_MODEL);
     assert_eq!(config.provider.as_deref(), Some("zai"));
     assert_eq!(
@@ -11850,7 +12187,7 @@ async fn provider_switch_without_model_uses_target_default_not_previous_provider
 async fn provider_switch_foreign_direct_model_rejected_before_mutation() {
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = DEFAULT_TEXT_MODEL.to_string();
     let mut engine = mock_engine_handle();
     let mut config = Config {
@@ -11871,16 +12208,19 @@ async fn provider_switch_foreign_direct_model_rejected_before_mutation() {
     }
     .with_legacy_root(Some("deepseek-key".to_string()), None);
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Zai,
-        Some("deepseek-v4-pro".to_string()),
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Zai);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            Some("deepseek-v4-pro".to_string()),
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.model, DEFAULT_TEXT_MODEL);
     assert_eq!(config.provider.as_deref(), Some("deepseek"));
     assert_eq!(
@@ -11904,7 +12244,7 @@ async fn provider_switch_to_openai_codex_normalizes_deepseek_off_effort() {
     let _home = SettingsHomeGuard::new();
     let _token = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = DEFAULT_TEXT_MODEL.to_string();
     app.reasoning_effort = ReasoningEffort::Off;
     app.reasoning_effort_preference = Some(ReasoningEffort::Off);
@@ -11922,16 +12262,25 @@ async fn provider_switch_to_openai_codex_normalizes_deepseek_off_effort() {
         ..Default::default()
     };
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::OpenaiCodex,
-        None,
+    crate::oauth::install_test_chatgpt_registration(&mut config).unwrap();
+    crate::codex_model_cache::install_test_chatgpt_roster(
+        &config,
+        &[crate::config::DEFAULT_OPENAI_CODEX_MODEL],
     )
+    .unwrap();
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::OpenaiCodex);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            None,
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::OpenaiCodex);
+    assert_eq!(app.api_provider, ProviderKind::OpenaiCodex);
     assert_eq!(app.model, crate::config::DEFAULT_OPENAI_CODEX_MODEL);
     assert_eq!(app.reasoning_effort, ReasoningEffort::Low);
     assert_eq!(app.reasoning_effort_preference, Some(ReasoningEffort::Off));
@@ -11942,7 +12291,7 @@ async fn provider_switch_to_openai_codex_normalizes_deepseek_off_effort() {
 async fn provider_switch_to_openrouter_canonicalizes_deepseek_default_model() {
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = DEFAULT_TEXT_MODEL.to_string();
     let mut engine = mock_engine_handle();
     let mut config = Config {
@@ -11958,16 +12307,19 @@ async fn provider_switch_to_openrouter_canonicalizes_deepseek_default_model() {
         ..Default::default()
     };
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Openrouter,
-        None,
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Openrouter);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            None,
+        )
+    }
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Openrouter);
+    assert_eq!(app.api_provider, ProviderKind::Openrouter);
     assert_eq!(app.model, DEFAULT_OPENROUTER_MODEL);
 }
 
@@ -12009,7 +12361,7 @@ async fn auto_dispatch_keeps_last_and_pending_receipts_aligned() {
     let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
     let _zai = crate::test_support::EnvVarGuard::set("ZAI_API_KEY", "zai-test-key");
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Zai, "zai");
+    app.set_provider_identity(ProviderKind::Zai, "zai");
     app.reasoning_effort = ReasoningEffort::Low;
     app.reasoning_effort_preference = Some(ReasoningEffort::Low);
     app.set_model_selection("auto".to_string());
@@ -12033,7 +12385,7 @@ async fn auto_dispatch_keeps_last_and_pending_receipts_aligned() {
         app.pending_turn_route
             .as_ref()
             .map(|(provider, model, auto)| (*provider, model.as_str(), *auto)),
-        Some((ApiProvider::Zai, crate::config::DEFAULT_ZAI_MODEL, true,))
+        Some((ProviderKind::Zai, crate::config::DEFAULT_ZAI_MODEL, true,))
     );
     assert_eq!(
         app.last_auto_route_receipt, app.pending_auto_route_receipt,
@@ -12176,7 +12528,7 @@ async fn real_engine_client_preflight_failure_leaves_dispatch_state_atomic() {
         .expect("lm-studio")
         .insecure_skip_tls_verify = Some(true);
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_provider_identity(ProviderKind::Custom, "lm-studio");
     app.set_model_selection("local-model".to_string());
     let (_engine, handle) = crate::core::engine::Engine::new(EngineConfig::default(), &config);
 
@@ -12259,7 +12611,7 @@ async fn immediate_submit_custom_provider_preflight_restores_exact_message() {
         .expect("lm-studio")
         .insecure_skip_tls_verify = Some(true);
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_provider_identity(ProviderKind::Custom, "lm-studio");
     app.set_model_selection("local-model".to_string());
     app.input = "preserve 用户 input".to_string();
     app.cursor_position = app.input.chars().count();
@@ -12323,7 +12675,7 @@ async fn remote_preflight_failure_releases_the_account_owned_run() {
         .expect("lm-studio")
         .insecure_skip_tls_verify = Some(true);
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_provider_identity(ProviderKind::Custom, "lm-studio");
     app.set_model_selection("local-model".to_string());
     let journal_root = tempfile::tempdir().expect("remote dispatch journal root");
     app.remote_control
@@ -12372,7 +12724,7 @@ async fn immediate_submit_custom_provider_missing_key_preflight_shows_auth_next_
     let mut app = create_test_app();
     // A returning user: the saved route lost its key.
     app.onboarding_had_provider_step = false;
-    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_provider_identity(ProviderKind::Custom, "lm-studio");
     app.set_model_selection("local-model".to_string());
     app.input = "preserve 用户 input".to_string();
     app.cursor_position = app.input.chars().count();
@@ -12463,7 +12815,7 @@ async fn dispatch_uses_app_owned_exact_custom_identity_when_config_selector_drif
         ..Default::default()
     };
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_provider_identity(ProviderKind::Custom, "custom-a");
     app.set_model_selection("model-a".to_string());
     let mut engine = mock_engine_handle();
 
@@ -12478,9 +12830,9 @@ async fn dispatch_uses_app_owned_exact_custom_identity_when_config_selector_drif
 
     match engine.rx_op.recv().await.expect("send message op") {
         Op::SendMessage(TurnSpec { route, .. }) => {
-            assert_eq!(route.identity.provider, ApiProvider::Custom);
-            assert_eq!(route.identity.key, "custom-a");
-            assert_eq!(route.identity.exact_id.as_deref(), Some("custom-a"));
+            assert_eq!(route.identity.provider, ProviderKind::Custom);
+            assert_eq!(route.identity.key.as_str(), "custom-a");
+            assert_eq!(route.identity.persisted_id(), Some("custom-a"));
             assert_eq!(route.model, "model-a");
             assert_eq!(
                 route.config.active_route_base_url(),
@@ -12493,7 +12845,63 @@ async fn dispatch_uses_app_owned_exact_custom_identity_when_config_selector_drif
 }
 
 #[tokio::test]
-async fn dispatch_idless_custom_identity_uses_the_literal_table() {
+async fn dispatch_captured_root_identity_keeps_absent_id_and_rejects_replaced_table() {
+    let root = Config::from_saved_document(
+        "provider = 'custom'\nbase_url = 'http://127.0.0.1:18180/v1'\ndefault_text_model = 'root-model'\n", None
+    ).unwrap();
+    let captured = root.active_provider_identity().unwrap();
+    assert!(captured.persisted_id().is_none());
+    let mut app = create_test_app();
+    app.set_provider_identity_record(captured.clone());
+    app.set_model_selection("root-model".into());
+    let mut engine = mock_engine_handle();
+    dispatch_user_message(
+        &mut app,
+        &root,
+        &engine.handle,
+        QueuedMessage::new("same captured root".into(), None),
+    )
+    .await
+    .unwrap();
+    match engine.rx_op.recv().await.unwrap() {
+        Op::SendMessage(TurnSpec { route, .. }) => {
+            assert!(route.identity.persisted_id().is_none());
+            assert_eq!(route.identity.key.as_str(), "custom");
+            route
+                .config
+                .verify_provider_identity(&route.identity)
+                .unwrap();
+            assert_eq!(
+                route.config.base_url_for_route(&route.identity),
+                "http://127.0.0.1:18180/v1"
+            );
+        }
+        other => panic!("expected captured root send, got {other:?}"),
+    }
+    let mut replaced = root.clone();
+    replaced
+        .providers
+        .as_mut()
+        .unwrap()
+        .custom
+        .get_mut("custom")
+        .unwrap()
+        .base_url = Some("http://127.0.0.1:19191/v1".into());
+    assert!(
+        dispatch_user_message(
+            &mut app,
+            &replaced,
+            &engine.handle,
+            QueuedMessage::new("must not retarget".into(), None)
+        )
+        .await
+        .is_err()
+    );
+    assert!(engine.rx_op.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn dispatch_requires_exact_selection_when_root_conflicts_with_table() {
     let config = Config {
         provider: Some("custom".to_string()),
         default_text_model: Some("legacy-root-model".to_string()),
@@ -12517,8 +12925,13 @@ async fn dispatch_idless_custom_identity_uses_the_literal_table() {
         Some("http://127.0.0.1:18180/v1".to_string()),
     );
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "custom");
-    app.set_model_selection("legacy-root-model".to_string());
+    let absent = config.resolve_persisted_provider_identity(Some("custom"), None);
+    assert!(
+        absent.is_err(),
+        "conflicting root cannot supply missing-id authority"
+    );
+    app.set_provider_identity_record(config.resolve_provider_pin_identity("custom").unwrap());
+    app.set_model_selection("literal-table-model".to_string());
     let mut engine = mock_engine_handle();
 
     dispatch_user_message(
@@ -12532,12 +12945,11 @@ async fn dispatch_idless_custom_identity_uses_the_literal_table() {
 
     match engine.rx_op.recv().await.expect("send message op") {
         Op::SendMessage(TurnSpec { route, .. }) => {
-            // Beside a literal `[providers.custom]` table, the older
-            // top-level endpoint is DeepSeek's (#6394); the literal route is
-            // the table.
-            assert_eq!(route.identity.provider, ApiProvider::Custom);
-            assert_eq!(route.identity.key, "custom");
-            assert_eq!(route.identity.exact_id.as_deref(), Some("custom"));
+            // Explicit exact selection admits the literal table despite the
+            // conflicting root; missing-id replay was refused above.
+            assert_eq!(route.identity.provider, ProviderKind::Custom);
+            assert_eq!(route.identity.key.as_str(), "custom");
+            assert_eq!(route.identity.persisted_id(), Some("custom"));
             assert_eq!(
                 route.config.active_route_base_url(),
                 "http://127.0.0.1:18181/v1"
@@ -12560,7 +12972,7 @@ async fn failed_real_preflight_preserves_paused_command_state_and_engine_gate() 
         .expect("lm-studio")
         .insecure_skip_tls_verify = Some(true);
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_provider_identity(ProviderKind::Custom, "lm-studio");
     app.set_model_selection("local-model".to_string());
     app.paused = true;
     app.pausable = true;
@@ -12599,7 +13011,7 @@ async fn failed_real_preflight_preserves_paused_command_state_and_engine_gate() 
 #[test]
 fn logout_memory_clear_respects_named_and_legacy_custom_scopes() {
     let mut named_app = create_test_app();
-    named_app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    named_app.set_provider_identity(ProviderKind::Custom, "lm-studio");
     let mut named_config = Config {
         provider: Some("lm-studio".to_string()),
         providers: Some(ProvidersConfig {
@@ -12619,7 +13031,9 @@ fn logout_memory_clear_respects_named_and_legacy_custom_scopes() {
     }
     .with_legacy_root(Some("deepseek-root-key".to_string()), None);
 
-    clear_active_provider_api_key_from_memory(&named_app, &mut named_config);
+    named_app.set_provider_identity_record(named_config.active_provider_identity().unwrap());
+    clear_active_provider_api_key_from_memory(&named_app, &mut named_config)
+        .expect("exact named route");
 
     assert_eq!(
         named_config.deepseek_table_api_key(),
@@ -12635,7 +13049,7 @@ fn logout_memory_clear_respects_named_and_legacy_custom_scopes() {
     );
 
     let mut legacy_app = create_test_app();
-    legacy_app.set_provider_identity(ApiProvider::Custom, "custom");
+    legacy_app.set_provider_identity(ProviderKind::Custom, "custom");
     let mut legacy_config = Config {
         provider: Some("custom".to_string()),
         default_text_model: Some("legacy-model".to_string()),
@@ -12646,7 +13060,9 @@ fn logout_memory_clear_respects_named_and_legacy_custom_scopes() {
         Some("http://127.0.0.1:18180/v1".to_string()),
     );
 
-    clear_active_provider_api_key_from_memory(&legacy_app, &mut legacy_config);
+    legacy_app.set_provider_identity_record(legacy_config.active_provider_identity().unwrap());
+    clear_active_provider_api_key_from_memory(&legacy_app, &mut legacy_config)
+        .expect("captured legacy root route");
 
     // The literal route's key lives in `[providers.custom]` (#6394); the
     // memory clear empties exactly that slot.
@@ -12666,7 +13082,7 @@ fn auto_routed_turn_compaction_uses_selected_route_not_stale_app_route() {
     let mut app = create_test_app();
     app.auto_model = true;
     app.model = "auto".to_string();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.active_route_limits = Some(codewhale_config::route::RouteLimits {
         context_tokens: Some(32_000),
         ..Default::default()
@@ -12686,7 +13102,7 @@ fn auto_routed_turn_compaction_uses_selected_route_not_stale_app_route() {
         }),
         ..Default::default()
     };
-    let route = resolve_runtime_route(&config, ApiProvider::Openrouter, Some("vendor/model-b"))
+    let route = resolve_runtime_route(&config, ProviderKind::Openrouter, Some("vendor/model-b"))
         .expect("resolve auto-selected route")
         .validate()
         .expect("preflight auto-selected route");
@@ -12700,7 +13116,7 @@ fn auto_routed_turn_compaction_uses_selected_route_not_stale_app_route() {
     assert_eq!(
         compaction.token_threshold,
         crate::route_budget::compaction_threshold_for_route_at_percent(
-            ApiProvider::Openrouter,
+            ProviderKind::Openrouter,
             "vendor/model-b",
             route_limits,
             75.0,
@@ -12717,7 +13133,7 @@ fn auto_routed_turn_compaction_uses_selected_route_not_stale_app_route() {
         crate::core::ops::Op::CompactContext {
             route, compaction, ..
         } => {
-            assert_eq!(route.identity.provider, ApiProvider::Openrouter);
+            assert_eq!(route.identity.provider, ProviderKind::Openrouter);
             assert_eq!(route.model, "vendor/model-b");
             assert_eq!(compaction.model, "vendor/model-b");
             assert_eq!(compaction.effective_context_window, Some(196_000));
@@ -12727,7 +13143,7 @@ fn auto_routed_turn_compaction_uses_selected_route_not_stale_app_route() {
 }
 
 fn configure_manual_compaction_test_route(app: &mut App) -> Config {
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = DEFAULT_TEXT_MODEL.to_string();
     Config {
         provider: Some("deepseek".to_string()),
@@ -12983,17 +13399,19 @@ fn context_override_drives_compaction_meter_and_preflight_budget() {
         }),
         ..Config::default()
     };
-    let route = resolve_runtime_route(&config, ApiProvider::Moonshot, Some("kimi-k3"))
+    let route = resolve_runtime_route(&config, ProviderKind::Moonshot, Some("kimi-k3"))
         .expect("resolve configured 256K route");
     let override_limits = crate::route_budget::known_route_limits(route.candidate.limits())
         .expect("configured route limits");
     assert_eq!(
-        config.context_window_for_provider_config(ApiProvider::Moonshot),
+        config.context_window_for_provider_config(
+            &config.test_identity_for_kind(ProviderKind::Moonshot)
+        ),
         Some(262_144)
     );
 
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Moonshot;
+    app.api_provider = ProviderKind::Moonshot;
     app.model = "kimi-k3".to_string();
     app.auto_model = false;
     app.auto_compact_threshold_percent = 80.0;
@@ -13006,7 +13424,7 @@ fn context_override_drives_compaction_meter_and_preflight_budget() {
     assert_eq!(
         compaction.token_threshold,
         crate::route_budget::compaction_threshold_for_route_at_percent(
-            ApiProvider::Moonshot,
+            ProviderKind::Moonshot,
             "kimi-k3",
             Some(override_limits),
             80.0,
@@ -13015,7 +13433,7 @@ fn context_override_drives_compaction_meter_and_preflight_budget() {
     assert!(
         compaction.token_threshold
             < crate::route_budget::compaction_threshold_for_route_at_percent(
-                ApiProvider::Moonshot,
+                ProviderKind::Moonshot,
                 "kimi-k3",
                 None,
                 80.0,
@@ -13033,14 +13451,14 @@ fn context_override_drives_compaction_meter_and_preflight_budget() {
     assert_eq!(meter_window, 262_144);
 
     let override_budget = crate::route_budget::route_context_budget(
-        ApiProvider::Moonshot,
+        ProviderKind::Moonshot,
         "kimi-k3",
         Some(override_limits),
         0,
     )
     .expect("override preflight budget");
     let catalog_budget =
-        crate::route_budget::route_context_budget(ApiProvider::Moonshot, "kimi-k3", None, 0)
+        crate::route_budget::route_context_budget(ProviderKind::Moonshot, "kimi-k3", None, 0)
             .expect("catalog preflight budget");
     assert_eq!(override_budget.window_tokens, 262_144);
     assert!(override_budget.input_budget_ceiling < catalog_budget.input_budget_ceiling);
@@ -13054,7 +13472,7 @@ fn context_override_drives_compaction_meter_and_preflight_budget() {
 #[test]
 fn compaction_trigger_meter_and_ladder_share_the_resolved_window() {
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Custom;
+    app.api_provider = ProviderKind::Custom;
     app.model = "qwen3-32b-256k".to_string();
     app.auto_model = false;
     app.active_route_limits = None;
@@ -13063,7 +13481,7 @@ fn compaction_trigger_meter_and_ladder_share_the_resolved_window() {
 
     // Every budget surface resolves the same number from the same chokepoint.
     let ladder = crate::route_runtime::resolve_context_window(
-        ApiProvider::Custom,
+        ProviderKind::Custom,
         "qwen3-32b-256k",
         None,
         None,
@@ -13080,7 +13498,7 @@ fn compaction_trigger_meter_and_ladder_share_the_resolved_window() {
     assert_eq!(
         compaction.token_threshold,
         crate::route_budget::compaction_threshold_for_route_at_percent(
-            ApiProvider::Custom,
+            ProviderKind::Custom,
             "qwen3-32b-256k",
             None,
             app.auto_compact_threshold_percent,
@@ -13778,6 +14196,62 @@ async fn reserved_dispatch_cancel_before_acceptance_keeps_prompt_and_next_dispat
             assert!(engine.rx_op.try_recv().is_err());
         }
     }
+
+    // #6800: a dispatch parked on engine admission (op mailbox full) must not
+    // hold input hostage for its 60 s bound once the turn is cancelled locally.
+    // The accepted dispatch above left a turn running; start this one idle.
+    app.is_loading = false;
+    app.suppress_stream_events_until_turn_complete = false;
+    while engine
+        .handle
+        .tx_op
+        .try_send(crate::core::ops::Op::Shutdown)
+        .is_ok()
+    {}
+    start_user_dispatch(
+        &mut app,
+        &config,
+        &engine.handle,
+        QueuedMessage::new("parked behind a full mailbox".to_string(), None),
+        DispatchRecovery::Immediate,
+    )
+    .expect("start parked dispatch");
+    assert!(app.dispatch_in_flight);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(rx.try_recv().is_err(), "still waiting for engine admission");
+
+    let cancelled_at = Instant::now();
+    mark_active_turn_cancelled_locally(&mut app);
+    let apply = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("cancelled dispatch must call back within 1 s, not the 60 s bound")
+        .expect("dispatch callback");
+    assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+    assert!(apply(&mut app, &engine.handle, &config).is_err());
+    assert!(!app.dispatch_in_flight);
+    assert!(!app.is_loading);
+    assert_eq!(app.input, "parked behind a full mailbox");
+    assert!(!app.suppress_stream_events_until_turn_complete);
+
+    // The next dispatch proceeds once the mailbox has room again.
+    while engine.rx_op.try_recv().is_ok() {}
+    start_user_dispatch(
+        &mut app,
+        &config,
+        &engine.handle,
+        QueuedMessage::new("parked behind a full mailbox".to_string(), None),
+        DispatchRecovery::Immediate,
+    )
+    .expect("start next dispatch");
+    let apply = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .expect("next dispatch callback timeout")
+        .expect("next dispatch callback");
+    apply(&mut app, &engine.handle, &config).expect("next dispatch accepted");
+    assert!(matches!(
+        engine.rx_op.try_recv(),
+        Ok(crate::core::ops::Op::SendMessage(TurnSpec { .. }))
+    ));
 }
 
 #[tokio::test]
@@ -14176,7 +14650,7 @@ printf '%s\n' '{"text":"after soft failure"}'
 #[tokio::test]
 async fn dispatch_route_failure_leaves_loading_and_transcript_unchanged() {
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "lm-studio");
+    app.set_provider_identity(ProviderKind::Custom, "lm-studio");
     app.set_model_selection("local-model".to_string());
     app.api_messages_mut()
         .push(text_message("assistant", "existing conversation"));
@@ -14370,6 +14844,7 @@ async fn dispatch_non_resume_message_preserves_paused_command_state() {
     assert!(!engine.handle.is_paused());
     match engine.rx_op.recv().await.expect("send message op") {
         crate::core::ops::Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             content,
             goal_objective,
             ..
@@ -14411,6 +14886,7 @@ async fn dispatch_resume_message_restores_paused_command_goal() {
     assert!(!engine.handle.is_paused());
     match engine.rx_op.recv().await.expect("send message op") {
         crate::core::ops::Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             content,
             goal_objective,
             ..
@@ -14918,7 +15394,7 @@ fn turn_liveness_watchdog_clears_stale_dispatch() {
     app.dispatch_started_at =
         Some(Instant::now() - DISPATCH_WATCHDOG_TIMEOUT - Duration::from_millis(1));
     app.turn_started_at = Some(Instant::now());
-    app.pending_turn_route = Some((ApiProvider::Deepseek, "pending-model".to_string(), false));
+    app.pending_turn_route = Some((ProviderKind::Deepseek, "pending-model".to_string(), false));
     app.suppress_stream_events_until_turn_complete = true;
 
     let recovered = reconcile_turn_liveness(&mut app, Instant::now(), false);
@@ -15386,6 +15862,7 @@ async fn stall_dispatch_task_overrun_reports_and_restores_message() {
             prepare,
             DispatchRecovery::Immediate,
             bound,
+            tokio_util::sync::CancellationToken::new(),
             |_prepare, _recovery| std::future::pending(),
         ),
     )
@@ -15422,6 +15899,7 @@ async fn stall_dispatch_task_panic_still_reports_back() {
         prepare,
         DispatchRecovery::Immediate,
         Duration::from_secs(60),
+        tokio_util::sync::CancellationToken::new(),
         |_prepare, _recovery| async { panic!("route planner exploded") },
     )
     .await;
@@ -15434,6 +15912,216 @@ async fn stall_dispatch_task_panic_still_reports_back() {
     );
     assert!(!app.dispatch_in_flight);
     assert_eq!(app.input, "panicking dispatch");
+}
+
+#[test]
+fn turn_liveness_preserves_pending_user_input_beyond_tool_timeout() {
+    // The outstanding request owns the wait independently of its tool cell
+    // or modal presentation. Code Mode currently refuses nested questions.
+    for tool_name in [None, Some("request_user_input"), Some("execute_tools")] {
+        let mut app = create_test_app();
+        let now = Instant::now();
+        let started_at = now - TOOL_HANG_WATCHDOG_TIMEOUT - Duration::from_secs(3600);
+        app.is_loading = true;
+        app.runtime_turn_status = Some("in_progress".into());
+        app.turn_started_at = Some(started_at);
+        app.turn_last_activity_at = Some(started_at);
+        app.pending_user_input_prompt = Some((
+            "question-1".into(),
+            crate::tools::user_input::UserInputRequest {
+                questions: Vec::new(),
+            },
+        ));
+        app.view_stack.push(UserInputView::new(
+            "question-1",
+            crate::tools::user_input::UserInputRequest {
+                questions: Vec::new(),
+            },
+        ));
+        // A hidden modal is not an answer or a cancellation. Engine still
+        // owns an indefinite wait; the UI must not manufacture a timeout.
+        app.view_stack.pop();
+        if let Some(name) = tool_name {
+            let mut active = ActiveCell::new();
+            active.push_tool(
+                "question-1",
+                HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+                    name: name.into(),
+                    status: ToolStatus::Running,
+                    input_summary: None,
+                    output: None,
+                    prompts: None,
+                    spillover_path: None,
+                    output_summary: None,
+                    is_diff: false,
+                })),
+            );
+            app.active_cell = Some(active);
+        }
+
+        assert!(
+            !reconcile_turn_liveness(&mut app, now, false),
+            "{tool_name:?}"
+        );
+        assert!(app.is_loading);
+        assert!(app.pending_user_input_prompt.is_some());
+        assert!(app.status_toasts.is_empty());
+
+        // Delivery retires the exemption and gives resumed work a fresh
+        // window, even before the next Engine event reaches this frame.
+        apply_user_input_submission_result(&mut app, "question-1", Ok(()));
+        assert!(app.pending_user_input_prompt.is_none());
+        let resumed_at = app.turn_last_activity_at.expect("answer is activity");
+        assert!(resumed_at >= now);
+        assert!(
+            !reconcile_turn_liveness(&mut app, resumed_at, false),
+            "{tool_name:?} recovered before resumed work could run"
+        );
+        let stalled_at = resumed_at + TOOL_HANG_WATCHDOG_TIMEOUT + Duration::from_secs(1);
+        assert!(
+            reconcile_turn_liveness(&mut app, stalled_at, false),
+            "{tool_name:?}"
+        );
+        assert!(!app.is_loading);
+    }
+}
+
+fn install_pending_question(app: &mut App, id: &str) {
+    let request = crate::tools::user_input::UserInputRequest {
+        questions: Vec::new(),
+    };
+    app.pending_user_input_prompt = Some((id.into(), request.clone()));
+    app.view_stack.push(UserInputView::new(id, request));
+    app.push_status_toast_record(
+        StatusToast::new("Answer question", StatusToastLevel::Warning, None).for_action(id),
+    );
+}
+
+#[test]
+fn user_input_timeout_retires_only_matching_question_even_when_completion_is_filtered() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".into());
+    install_pending_question(&mut app, "input-timeout");
+    app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
+        "unrelated-approval",
+        "exec_shell",
+        "Review command",
+        &serde_json::json!({"command": "git status"}),
+        "unrelated-key",
+    )));
+    app.push_status_toast_record(
+        StatusToast::new("Review command", StatusToastLevel::Warning, None)
+            .for_action("unrelated-approval"),
+    );
+    let completion = EngineEvent::ToolCallComplete {
+        id: "input-timeout".into(),
+        model_call: None,
+        name: "request_user_input".into(),
+        result: Err(crate::tools::spec::ToolError::Timeout { seconds: 1 }),
+    };
+    assert!(suppress_engine_event_after_local_cancel(&completion));
+    observe_human_request_settlement(&mut app, &completion);
+    assert!(app.pending_user_input_prompt.is_none());
+    assert!(!app.view_stack.contains_kind(ModalKind::UserInput));
+    assert!(app.view_stack.contains_approval_id("unrelated-approval"));
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Approval));
+    assert_eq!(app.status_toasts.len(), 1);
+    assert_eq!(app.status_toasts[0].text, "Review command");
+}
+
+#[test]
+fn user_input_completion_preserves_newer_question_and_dispatch() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".into());
+    let activity = Instant::now() - Duration::from_secs(30);
+    app.turn_last_activity_at = Some(activity);
+    install_pending_question(&mut app, "input-new");
+    let completion = |id: &str| EngineEvent::ToolCallComplete {
+        id: id.into(),
+        model_call: None,
+        name: "execute_tools".into(),
+        result: Err(crate::tools::spec::ToolError::Timeout { seconds: 1 }),
+    };
+    // Neither a previous request nor a wrapping call's different id owns it.
+    observe_human_request_settlement(&mut app, &completion("input-old"));
+    observe_human_request_settlement(&mut app, &completion("outer-call"));
+    apply_user_input_submission_result(&mut app, "input-old", Ok(()));
+    assert_eq!(app.turn_last_activity_at, Some(activity));
+    assert_eq!(
+        app.pending_user_input_prompt
+            .as_ref()
+            .map(|(id, _)| id.as_str()),
+        Some("input-new")
+    );
+    app.suppress_stream_events_until_turn_complete = true;
+    observe_human_request_settlement(
+        &mut app,
+        &EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: crate::core::events::TurnOutcomeStatus::Interrupted,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        },
+    );
+    assert!(app.pending_user_input_prompt.is_some());
+    assert!(app.view_stack.contains_kind(ModalKind::UserInput));
+    assert_eq!(app.status_toasts.len(), 1);
+}
+
+#[test]
+fn user_input_turn_end_cancel_and_disconnect_retire_question_views() {
+    for boundary in ["completed", "interrupted", "failed", "cancel", "disconnect"] {
+        let mut app = create_test_app();
+        app.is_loading = true;
+        app.runtime_turn_status = Some("in_progress".into());
+        install_pending_question(&mut app, "input-boundary");
+        app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
+            "parent-approval",
+            "exec_shell",
+            "Review command",
+            &serde_json::json!({"command": "git status"}),
+            "keep-key",
+        )));
+        match boundary {
+            "cancel" => mark_active_turn_cancelled_locally(&mut app),
+            "disconnect" => assert!(recover_engine_event_disconnect(&mut app)),
+            _ => observe_human_request_settlement(
+                &mut app,
+                &EngineEvent::TurnComplete {
+                    usage: Usage::default(),
+                    parent_route_usage: Usage::default(),
+                    routed_usage_dropped_records: 0,
+                    status: match boundary {
+                        "completed" => crate::core::events::TurnOutcomeStatus::Completed,
+                        "interrupted" => crate::core::events::TurnOutcomeStatus::Interrupted,
+                        _ => crate::core::events::TurnOutcomeStatus::Failed,
+                    },
+                    error: None,
+                    tool_catalog: None,
+                    base_url: None,
+                },
+            ),
+        }
+        assert!(app.pending_user_input_prompt.is_none(), "{boundary}");
+        assert!(
+            !app.view_stack.contains_kind(ModalKind::UserInput),
+            "{boundary}"
+        );
+        assert!(
+            !app.view_stack.contains_approval_id("parent-approval"),
+            "{boundary}"
+        );
+        assert!(
+            !app.status_toasts
+                .iter()
+                .any(|toast| toast.text == "Answer question")
+        );
+    }
 }
 
 #[test]
@@ -15474,6 +16162,10 @@ fn turn_liveness_recovers_running_tool_without_heartbeat() {
     let toast = app.status_toasts.back().expect("tool hang toast");
     assert_eq!(toast.level, StatusToastLevel::Error);
     assert!(toast.text.contains("Tool stalled with no progress"));
+    // The toast is read by a person: it names the command they can type, not
+    // a tool name only the model ever had.
+    assert!(toast.text.contains("/jobs cancel"), "{}", toast.text);
+    assert!(!toast.text.contains("exec_shell"), "{}", toast.text);
 }
 
 #[test]
@@ -15487,12 +16179,12 @@ fn turn_liveness_recovers_stalled_in_progress_turn() {
     app.turn_started_at = Some(now - turn_stall_watchdog_timeout(&app) - Duration::from_millis(1));
     app.streaming_message_index = Some(0);
     app.user_scrolled_during_stream = true;
-    app.pending_turn_route = Some((ApiProvider::Deepseek, "pending-model".to_string(), false));
+    app.pending_turn_route = Some((ProviderKind::Deepseek, "pending-model".to_string(), false));
     app.active_turn = Some(crate::tui::app::ActiveTurnMetadata {
         turn_id: "stale-turn-id".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Openai,
+            provider: ProviderKind::Openai,
             provider_identity: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             auto_model: false,
@@ -15540,12 +16232,12 @@ fn engine_event_disconnect_recovers_live_turn_immediately() {
     app.turn_started_at = Some(Instant::now());
     app.dispatch_started_at = Some(Instant::now());
     app.user_scrolled_during_stream = true;
-    app.pending_turn_route = Some((ApiProvider::Deepseek, "pending-model".to_string(), false));
+    app.pending_turn_route = Some((ProviderKind::Deepseek, "pending-model".to_string(), false));
     app.active_turn = Some(crate::tui::app::ActiveTurnMetadata {
         turn_id: "turn_dead".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Openai,
+            provider: ProviderKind::Openai,
             provider_identity: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             auto_model: false,
@@ -15622,7 +16314,7 @@ fn engine_event_disconnect_cleans_cancelled_turn_metadata() {
         turn_id: "cancelled-turn".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Openai,
+            provider: ProviderKind::Openai,
             provider_identity: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             auto_model: false,
@@ -15960,7 +16652,9 @@ fn hotbar_dispatches_route_switch_slot() {
         .strip_prefix("route.")
         .expect("route id prefix");
     let (provider_key, model) = route_suffix.split_once('.').expect("route id shape");
-    let provider = ApiProvider::parse(provider_key).expect("provider key parses");
+    let identity = Config::default()
+        .resolve_provider_selection_identity(provider_key)
+        .expect("admitted route");
     let model = model.to_string();
     let config = Config {
         hotbar: Some(vec![codewhale_config::HotbarBindingToml {
@@ -15974,7 +16668,7 @@ fn hotbar_dispatches_route_switch_slot() {
     assert_eq!(
         dispatch_hotbar_slot(&mut app, &config, 1).expect("route slot dispatch"),
         Some(HotbarDispatch::AppAction(AppAction::SwitchModelRoute {
-            provider,
+            identity,
             model,
         }))
     );
@@ -16251,6 +16945,7 @@ fn make_subagent(
         git_branch: None,
         agent_type: crate::tools::subagent::FleetRole::Worker,
         assignment: crate::tools::subagent::SubAgentAssignment {
+            native_preset: None,
             objective: format!("objective-{id}"),
             role: Some("worker".to_string()),
         },
@@ -16562,7 +17257,7 @@ fn subagent_token_usage_updates_live_cost_counter_without_card_change() {
             agent_id: "agent-a".to_string(),
             source_id: "response-a".to_string(),
             route: Box::new(test_mailbox_route(
-                ApiProvider::Deepseek,
+                ProviderKind::Deepseek,
                 "deepseek-v4-flash",
             )),
             usage: codewhale_models::Usage {
@@ -16583,7 +17278,7 @@ fn subagent_token_usage_updates_live_cost_counter_without_card_change() {
 #[test]
 fn subagent_token_usage_prices_the_child_route_not_the_parent_route() {
     let mut app = create_test_app();
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
 
     handle_subagent_mailbox(
         &mut app,
@@ -16591,7 +17286,7 @@ fn subagent_token_usage_prices_the_child_route_not_the_parent_route() {
         &crate::tools::subagent::MailboxMessage::TokenUsage {
             agent_id: "agent-codex".to_string(),
             source_id: "response-codex".to_string(),
-            route: Box::new(test_mailbox_route(ApiProvider::OpenaiCodex, "gpt-5.5")),
+            route: Box::new(test_mailbox_route(ProviderKind::OpenaiCodex, "gpt-5.5")),
             usage: codewhale_models::Usage {
                 input_tokens: 10_000,
                 output_tokens: 1_000,
@@ -16613,7 +17308,7 @@ fn subagent_token_usage_is_deduped_by_response_source() {
         agent_id: "agent-a".to_string(),
         source_id: "response-a".to_string(),
         route: Box::new(test_mailbox_route(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek-v4-flash",
         )),
         usage: codewhale_models::Usage {
@@ -16664,7 +17359,7 @@ fn active_deleted_origin_mailbox_usage_does_not_accrue_or_restore_the_session() 
         "origin-turn",
         &manager,
     );
-    let route = test_mailbox_route(ApiProvider::Deepseek, "deepseek-v4-flash");
+    let route = test_mailbox_route(ProviderKind::Deepseek, "deepseek-v4-flash");
     let usage = codewhale_models::Usage {
         input_tokens: 10_000,
         output_tokens: 1_000,
@@ -16735,7 +17430,7 @@ fn subagent_token_usage_source_is_stable_across_engine_turns() {
         agent_id: "agent-a".to_string(),
         source_id: "response-a".to_string(),
         route: Box::new(test_mailbox_route(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek-v4-flash",
         )),
         usage: codewhale_models::Usage {
@@ -17434,7 +18129,7 @@ fn update_notice_block_is_persistent_and_actionable() {
     );
     assert!(block.contains("v0.8.47"), "shows latest version: {block:?}");
     assert!(
-        block.contains("https://github.com/Hmbown/CodeWhale/releases/tag/v0.8.47"),
+        block.contains("https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.8.47"),
         "includes release-notes link: {block:?}"
     );
     assert!(
@@ -18121,7 +18816,7 @@ fn turn_started_route_is_captured_before_cancel_suppression() {
     let mut app = create_test_app();
     app.suppress_stream_events_until_turn_complete = true;
     app.ocean_completion_started_at = Some(Instant::now());
-    app.pending_turn_route = Some((ApiProvider::Deepseek, "pending-model".to_string(), true));
+    app.pending_turn_route = Some((ProviderKind::Deepseek, "pending-model".to_string(), true));
     app.pending_auto_route_receipt = Some(crate::model_routing::AutoRouteReceipt {
         tier: crate::model_routing::AutoRouteTier::Fast,
         pair: crate::model_routing::AutoRoutePair {
@@ -18142,7 +18837,7 @@ fn turn_started_route_is_captured_before_cancel_suppression() {
         created_at,
         submission_id: None,
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Openai,
+            provider: ProviderKind::Openai,
             provider_identity: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             auto_model: true,
@@ -18166,7 +18861,7 @@ fn turn_started_route_is_captured_before_cancel_suppression() {
     assert_eq!(active_turn.turn_id, "turn_cancel_race");
     assert_eq!(active_turn.created_at, created_at);
     let route = active_turn.route.as_ref().expect("captured route");
-    assert_eq!(route.provider, ApiProvider::Openai);
+    assert_eq!(route.provider, ProviderKind::Openai);
     assert_eq!(route.model, "gpt-5.5");
     assert!(route.auto_model);
     assert_eq!(
@@ -18198,7 +18893,7 @@ fn turn_started_route_is_captured_before_cancel_suppression() {
 fn turn_started_suggestion_authority_comes_from_the_route_receipt_not_config() {
     let mut app = create_test_app();
     let receipt = crate::route_receipt::TurnRouteReceipt::new(
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "deepseek",
         "deepseek-chat",
         "https://api.deepseek.com/v1",
@@ -18208,7 +18903,7 @@ fn turn_started_suggestion_authority_comes_from_the_route_receipt_not_config() {
         turn_id: "turn_route_receipt".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Deepseek,
+            provider: ProviderKind::Deepseek,
             provider_identity: "deepseek".to_string(),
             model: "deepseek-chat".to_string(),
             auto_model: false,
@@ -18234,7 +18929,7 @@ fn turn_started_suggestion_authority_comes_from_the_route_receipt_not_config() {
         .suggestion_authority
         .as_ref()
         .expect("the route receipt is the authority, so no config lookup is required");
-    assert_eq!(authority.provider(), ApiProvider::Deepseek);
+    assert_eq!(authority.provider(), ProviderKind::Deepseek);
     assert_eq!(authority.provider_identity(), "deepseek");
     assert_eq!(authority.model(), "deepseek-chat");
     assert_eq!(authority.endpoint_identity(), "https://api.deepseek.com/v1");
@@ -18253,7 +18948,7 @@ fn turn_started_without_a_route_receipt_captures_no_suggestion_authority() {
         turn_id: "turn_no_receipt".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Deepseek,
+            provider: ProviderKind::Deepseek,
             provider_identity: "deepseek".to_string(),
             model: "deepseek-chat".to_string(),
             auto_model: false,
@@ -18286,17 +18981,23 @@ fn turn_started_without_a_route_receipt_captures_no_suggestion_authority() {
 #[test]
 fn engine_error_health_accounting_uses_active_turn_route() {
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = "current-model".to_string();
     let event = EngineEvent::TurnStarted {
         turn_id: "routed-turn".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Openai,
+            provider: ProviderKind::Openai,
             provider_identity: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             auto_model: true,
-            receipt: None,
+            receipt: Some(crate::route_receipt::TurnRouteReceipt::new(
+                ProviderKind::Openai,
+                "openai",
+                "gpt-5.5",
+                "https://api.openai.com/v1",
+                "fixture-key",
+            )),
             billing: Some(crate::core::events::RouteBillingEnvelope {
                 openrouter_vendor: None,
                 billing_surface: Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE.to_string()),
@@ -18312,9 +19013,10 @@ fn engine_error_health_accounting_uses_active_turn_route() {
     };
     capture_turn_started_metadata(&mut app, &event);
 
-    let route = error_health_route(&app, app.api_provider);
+    let route = error_health_route(&app).expect("captured active turn health route");
 
-    assert_eq!(route, (ApiProvider::Openai, "gpt-5.5".to_string()));
+    assert_eq!(route.0.provider, ProviderKind::Openai);
+    assert_eq!(route.1, "gpt-5.5");
 }
 
 #[test]
@@ -18739,7 +19441,7 @@ fn visible_slash_menu_starts_with_six_tasks_and_still_lists_the_rest() {
 #[test]
 fn visible_slash_model_completions_are_provider_scoped() {
     let mut app = create_test_app();
-    app.api_provider = crate::config::ApiProvider::Together;
+    app.api_provider = crate::config::ProviderKind::Together;
     app.model = crate::config::DEFAULT_TOGETHER_MODEL.to_string();
     app.provider_models.insert(
         "openrouter".to_string(),
@@ -18908,8 +19610,9 @@ fn apply_slash_menu_selection_honors_user_argument_metadata_and_builtin_override
     .expect("write argument command");
     // Workspace commands load only in a trusted workspace.
     crate::config::save_workspace_trust(tmp.path()).expect("trust test workspace");
-    let mut app = create_test_app();
-    app.workspace = tmp.path().to_path_buf();
+    let mut app = crate::test_support::test_app_with_options(
+        crate::test_support::test_tui_options(tmp.path()),
+    );
     let entries = vec![
         crate::tui::widgets::SlashMenuEntry {
             name: "/model".to_string(),
@@ -19098,7 +19801,7 @@ fn workspace_context_refresh_respects_ttl_before_requerying_git() {
     std::fs::write(repo.path().join("dirty.txt"), "dirty").expect("write dirty marker");
     // #6565: the badge reads the shared git probe, which the chrome tick
     // keeps fresh; stand in for that tick.
-    crate::tui::git_status::force_refresh(repo.path());
+    crate::git_status::force_refresh(repo.path());
 
     let before_ttl = start + Duration::from_secs(crate::tui::workspace_context::REFRESH_SECS - 1);
     crate::tui::workspace_context::refresh_if_needed(&mut app, before_ttl, true);
@@ -19658,36 +20361,19 @@ async fn steer_user_message_records_prompt_for_cancel_restore() {
 }
 
 #[tokio::test]
-async fn steer_user_message_backgrounds_foreground_shell_before_dispatch() {
+async fn steer_user_message_detaches_session_shell_waits_before_dispatch() {
     let mut app = create_test_app();
     app.is_loading = true;
-    let shell_manager = app
-        .runtime_services
-        .shell_manager
-        .clone()
-        .expect("test app shell manager");
-    let mut active = ActiveCell::new();
-    active.push_tool(
-        "foreground-shell",
-        HistoryCell::Tool(ToolCell::Exec(ExecCell {
-            command: "cargo test --workspace".to_string(),
-            status: ToolStatus::Running,
-            output: None,
-            live_output: None,
-            shell_task_id: None,
-            owner_agent_id: None,
-            owner_agent_name: None,
-            started_at: Some(Instant::now()),
-            duration_ms: None,
-            stale_elapsed_since_output_ms: None,
-            source: ExecSource::Assistant,
-            interaction: None,
-            output_summary: None,
-        })),
-    );
-    app.active_cell = Some(active);
+    app.current_session_id = Some("steer-session".to_string());
+    let shell_manager = app.runtime_services.shell_manager.clone().unwrap();
+    let (waiting, foreign) = {
+        let mut manager = shell_manager.lock().unwrap();
+        (
+            manager.register_shell_wait_for_test("steer-session"),
+            manager.register_shell_wait_for_test("other-session"),
+        )
+    };
     let mut engine = crate::core::engine::mock_engine_handle();
-
     steer_user_message(
         &mut app,
         &Config::default(),
@@ -19696,14 +20382,8 @@ async fn steer_user_message_backgrounds_foreground_shell_before_dispatch() {
     )
     .await
     .expect("steer user message");
-
-    assert!(
-        shell_manager
-            .lock()
-            .expect("shell manager lock")
-            .foreground_background_requested_for_test(),
-        "foreground shell must receive its detach request"
-    );
+    assert!(waiting.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!foreign.load(std::sync::atomic::Ordering::Acquire));
     assert_eq!(
         engine.rx_steer.recv().await.as_deref(),
         Some("use the partial results")
@@ -20407,17 +21087,17 @@ fn external_grant_reuse_completes_provider_onboarding() {
     app.onboarding_missing_key_recovery = true;
     app.offline_mode = true;
     app.trust_mode = true;
-    app.set_provider_identity(ApiProvider::Xai, ApiProvider::Xai.as_str());
+    app.set_provider_identity(ProviderKind::Xai, ProviderKind::Xai.as_str());
     app.set_model_selection(crate::config::DEFAULT_XAI_MODEL.to_string());
 
-    complete_provider_picker_onboarding(&mut app, crate::config::ApiProvider::Xai);
+    complete_provider_picker_onboarding(&mut app, crate::config::ProviderKind::Xai);
 
     assert_ne!(
         app.onboarding,
         OnboardingState::Provider,
         "a satisfied provider must not return to the provider step"
     );
-    assert_eq!(app.onboarding_provider, crate::config::ApiProvider::Xai);
+    assert_eq!(app.onboarding_provider, crate::config::ProviderKind::Xai);
     assert!(!app.onboarding_needs_api_key);
     assert!(!app.offline_mode);
     assert_saved_startup_route("xai", "xai", crate::config::DEFAULT_XAI_MODEL);
@@ -20652,7 +21332,7 @@ fn open_tool_details_pager_supports_active_virtual_tool_cell() {
         &[1],
         100,
         app.transcript_render_options(),
-        &app.thinking_folds,
+        &app.cell_folds,
         None,
         None,
     );
@@ -21029,43 +21709,38 @@ fn terminal_pause_has_live_owner_only_for_running_exec_cells() {
 }
 
 #[test]
-fn active_foreground_shell_running_excludes_detached_background_jobs() {
+fn shell_wait_key_detaches_only_live_waits_of_current_session() {
     let mut app = create_test_app();
-    let mut active = ActiveCell::new();
-    active.push_tool(
-        "shell",
-        HistoryCell::Tool(ToolCell::Exec(ExecCell {
-            command: "cargo test --workspace".to_string(),
-            status: ToolStatus::Running,
-            output: None,
-            live_output: None,
-            shell_task_id: Some("shell-42".to_string()),
-            owner_agent_id: None,
-            owner_agent_name: None,
-            started_at: Some(Instant::now()),
-            duration_ms: None,
-            stale_elapsed_since_output_ms: None,
-            source: ExecSource::Assistant,
-            interaction: None,
-            output_summary: None,
-        })),
-    );
-    app.active_cell = Some(active);
-
-    assert!(
-        !active_foreground_shell_running(&app),
-        "a detached job remains Running but is no longer a foreground wait"
-    );
-
-    let Some(HistoryCell::Tool(ToolCell::Exec(exec))) = app
-        .active_cell
-        .as_mut()
-        .and_then(|active| active.entry_mut(0))
-    else {
-        panic!("running shell cell");
+    app.current_session_id = Some("key-session".to_string());
+    let manager = app.runtime_services.shell_manager.clone().unwrap();
+    let (waiting, foreign) = {
+        let mut manager = manager.lock().unwrap();
+        (
+            manager.register_shell_wait_for_test("key-session"),
+            manager.register_shell_wait_for_test("other-session"),
+        )
     };
-    exec.shell_task_id = None;
-    assert!(active_foreground_shell_running(&app));
+    request_shell_wait_detach(&mut app);
+    assert!(waiting.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!foreign.load(std::sync::atomic::Ordering::Acquire));
+    drop(waiting);
+    assert!(
+        !manager
+            .lock()
+            .unwrap()
+            .request_shell_wait_detach("key-session")
+    );
+    let next = manager
+        .lock()
+        .unwrap()
+        .register_shell_wait_for_test("key-session");
+    assert!(
+        !next.load(std::sync::atomic::Ordering::Acquire),
+        "old requests must expire"
+    );
+    app.current_session_id = Some("absent-session".to_string());
+    request_shell_wait_detach(&mut app);
+    assert!(!next.load(std::sync::atomic::Ordering::Acquire));
 }
 
 #[test]
@@ -21305,6 +21980,41 @@ fn launch_submit_holds_oversized_draft_before_creating_a_session() {
 
     assert!(super::event_loop::launch_submit_held(&mut app));
     assert_eq!(app.input, draft, "the full text stays in the composer");
+    // The toast row sheds clauses to fit, so it carries only the short form;
+    // the full reason (with the write error) lives in the transcript.
+    assert_eq!(
+        app.status_toasts.back().map(|toast| toast.text.as_str()),
+        Some(
+            format!(
+                "Not sent: over {} characters; paste file not saved.",
+                crate::tui::app::MAX_SUBMITTED_INPUT_CHARS
+            )
+            .as_str()
+        )
+    );
+    let held_notes = |app: &App| {
+        app.history
+            .iter()
+            .filter_map(|cell| match cell {
+                HistoryCell::System { content }
+                    if content.contains("could not be saved as a paste file") =>
+                {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let notes = held_notes(&app);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains("press Enter again") && !notes[0].contains("{error}"),
+        "{}",
+        notes[0]
+    );
+    // Retrying the same held submit does not stack identical notes.
+    assert!(super::event_loop::launch_submit_held(&mut app));
+    assert_eq!(held_notes(&app).len(), 1);
 
     app.input = "hello".to_string();
     app.cursor_position = app.input.chars().count();
@@ -21907,7 +22617,7 @@ fn legacy_child_usage_metadata_fails_closed_without_parent_route_fallback() {
         turn_id: "turn-child-usage".to_string(),
         created_at: chrono::Utc::now(),
         route: Some(crate::core::events::TurnRoute {
-            provider: ApiProvider::Deepseek,
+            provider: ProviderKind::Deepseek,
             provider_identity: "deepseek".to_string(),
             model: "deepseek-v4-flash".to_string(),
             auto_model: false,
@@ -21977,7 +22687,7 @@ fn child_usage_metadata_carries_cache_write_and_reasoning_end_to_end() {
     // The shared producer emits every class.
     let priced_route = crate::cost_status::EffectiveRouteEnvelope {
         openrouter_vendor: None,
-        provider: crate::config::ApiProvider::Anthropic,
+        provider: crate::config::ProviderKind::Anthropic,
         provider_identity: "anthropic-api".to_string(),
         model: "claude-haiku-4-5".to_string(),
         billing_surface: Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE.to_string()),
@@ -22007,7 +22717,7 @@ fn child_usage_metadata_carries_cache_write_and_reasoning_end_to_end() {
     // The parent deliberately stays DeepSeek: only the frozen child envelope
     // may control this price.
     let mut priced_app = create_test_app();
-    priced_app.api_provider = crate::config::ApiProvider::Deepseek;
+    priced_app.api_provider = crate::config::ProviderKind::Deepseek;
     priced_app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
     let mut metadata = serde_json::json!({});
     crate::cost_status::attach_child_usage_metadata(&mut metadata, &priced_route, &child_usage);
@@ -22033,11 +22743,11 @@ fn child_usage_metadata_carries_cache_write_and_reasoning_end_to_end() {
     // closed and name the class, rather than pricing "completely" at 0 for the
     // write tokens.
     let mut unpriced_app = create_test_app();
-    unpriced_app.api_provider = crate::config::ApiProvider::Deepseek;
+    unpriced_app.api_provider = crate::config::ProviderKind::Deepseek;
     unpriced_app.billing_presentation = crate::route_billing::BillingPresentation::Metered;
     let unpriced_route = crate::cost_status::EffectiveRouteEnvelope {
         openrouter_vendor: None,
-        provider: crate::config::ApiProvider::Moonshot,
+        provider: crate::config::ProviderKind::Moonshot,
         provider_identity: "moonshot-api".to_string(),
         model: "kimi-k2.7-code".to_string(),
         billing_surface: Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE.to_string()),
@@ -22066,12 +22776,12 @@ fn child_usage_metadata_carries_cache_write_and_reasoning_end_to_end() {
     // A child reporting more reasoning than output is contradicting the subset
     // invariant; the figure is discarded rather than inflating billable output.
     let mut pathological = create_test_app();
-    pathological.api_provider = crate::config::ApiProvider::Deepseek;
+    pathological.api_provider = crate::config::ProviderKind::Deepseek;
     pathological.billing_presentation = crate::route_billing::BillingPresentation::Metered;
     let mut metadata = serde_json::json!({});
     crate::cost_status::attach_child_usage_metadata(
         &mut metadata,
-        &test_mailbox_route(ApiProvider::Deepseek, "deepseek-v4-flash"),
+        &test_mailbox_route(ProviderKind::Deepseek, "deepseek-v4-flash"),
         &codewhale_models::Usage {
             input_tokens: 1_000,
             output_tokens: 100,
@@ -22083,7 +22793,7 @@ fn child_usage_metadata_carries_cache_write_and_reasoning_end_to_end() {
     handle_tool_call_complete(&mut pathological, "rlm-2", "rlm", &result);
     // Cost is that of 1000 input / 100 output, with no reasoning surcharge.
     let sane = crate::pricing::calculate_turn_cost_estimate_for_provider(
-        crate::config::ApiProvider::Deepseek,
+        crate::config::ProviderKind::Deepseek,
         "deepseek-v4-flash",
         &codewhale_models::Usage {
             input_tokens: 1_000,
@@ -22102,7 +22812,7 @@ fn child_usage_metadata_carries_cache_write_and_reasoning_end_to_end() {
 #[test]
 fn zero_usage_model_child_still_records_priced_receipt() {
     let mut app = create_test_app();
-    let route = test_mailbox_route(ApiProvider::Deepseek, "deepseek-v4-flash");
+    let route = test_mailbox_route(ProviderKind::Deepseek, "deepseek-v4-flash");
     let mut metadata = serde_json::json!({});
     crate::cost_status::attach_child_usage_metadata(
         &mut metadata,
@@ -22122,9 +22832,10 @@ fn zero_usage_model_child_still_records_priced_receipt() {
 #[test]
 fn routed_missing_usage_batch_prices_exact_routes_and_only_residual_as_generic() {
     let mut app = create_test_app();
-    let mut metered_route = test_mailbox_route(ApiProvider::Deepseek, "deepseek-v4-flash");
+    let mut metered_route = test_mailbox_route(ProviderKind::Deepseek, "deepseek-v4-flash");
     metered_route.billing_mode = crate::cost_status::RouteBillingMode::Metered;
     let mut local_route = metered_route.clone();
+    local_route.provider = ProviderKind::Custom;
     local_route.provider_identity = "local-computer".to_string();
     local_route.billing_mode = crate::cost_status::RouteBillingMode::Local;
     let batch = crate::cost_status::RuntimeUsageBatch {
@@ -22132,10 +22843,12 @@ fn routed_missing_usage_batch_prices_exact_routes_and_only_residual_as_generic()
         records: Vec::new(),
         drop_records: vec![
             crate::cost_status::RuntimeUsageDropRecord {
+                reason: crate::cost_status::RuntimeUsageMissingReason::default(),
                 source_id: "rlm:missing:metered".to_string(),
                 route: metered_route,
             },
             crate::cost_status::RuntimeUsageDropRecord {
+                reason: crate::cost_status::RuntimeUsageMissingReason::default(),
                 source_id: "rlm:missing:local".to_string(),
                 route: local_route,
             },
@@ -22320,7 +23033,7 @@ fn picker_rename_of_inactive_session_does_not_touch_active_metadata() {
 #[test]
 fn codex_tool_child_usage_does_not_inherit_public_api_pricing() {
     let mut app = create_test_app();
-    app.api_provider = crate::config::ApiProvider::OpenaiCodex;
+    app.api_provider = crate::config::ProviderKind::OpenaiCodex;
     app.billing_presentation =
         crate::route_billing::BillingPresentation::Subscription("Codex OAuth quota");
     let result = Ok(crate::tools::spec::ToolResult::success("ok").with_metadata(
@@ -22450,12 +23163,8 @@ fn automatic_session_snapshot_records_the_literal_custom_table_id() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let manager =
         crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
-    let config = Config {
-        provider: Some("custom".to_string()),
-        default_text_model: Some("legacy-root-model".to_string()),
-        ..Config::default()
-    }
-    .with_legacy_root(None, Some("http://127.0.0.1:18180/v1".to_string()));
+    let config =
+        named_custom_session_config("custom", "http://127.0.0.1:18180/v1", "legacy-root-model");
     let mut app = App::new(create_test_options(), &config);
     app.api_messages_mut()
         .push(text_message("user", "persist root"));
@@ -22463,8 +23172,8 @@ fn automatic_session_snapshot_records_the_literal_custom_table_id() {
     let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
     let serialized = serde_json::to_string(&snapshot).expect("serialize session");
 
-    // The literal route is the `[providers.custom]` table since #6394, so
-    // the snapshot records its exact id. Older id-less records still load.
+    // An explicitly declared literal table has an exact identity; root-only
+    // legacy records retain their separately captured absent-id provenance.
     assert_eq!(snapshot.metadata.model_provider, "custom");
     assert_eq!(
         snapshot.metadata.model_provider_id.as_deref(),
@@ -22748,7 +23457,7 @@ fn missing_named_custom_provider_resume_leaves_current_session_wholly_unchanged(
     app.current_session_id = Some("current-session".to_string());
     app.workspace = PathBuf::from("/tmp/current-workspace");
     app.set_model_selection("deepseek-v4-pro".to_string());
-    app.set_provider_identity(ApiProvider::Deepseek, "deepseek");
+    app.set_provider_identity(ProviderKind::Deepseek, "deepseek");
     app.add_message(HistoryCell::System {
         content: "existing receipt".to_string(),
     });
@@ -22776,7 +23485,7 @@ fn missing_named_custom_provider_resume_leaves_current_session_wholly_unchanged(
     assert_eq!(app.current_session_id.as_deref(), Some("current-session"));
     assert_eq!(app.api_messages.len(), 1);
     assert_eq!(app.workspace, PathBuf::from("/tmp/current-workspace"));
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.provider_identity_for_persistence(), "deepseek");
     assert_eq!(app.model_selection_for_persistence(), "deepseek-v4-pro");
     assert_eq!(config.provider.as_deref(), Some("deepseek"));
@@ -22796,7 +23505,7 @@ fn custom_session_resume_requires_structural_route_not_client_construction() {
     app.current_session_id = Some("current-session".to_string());
     app.workspace = PathBuf::from("/tmp/current-workspace");
     app.set_model_selection("deepseek-v4-pro".to_string());
-    app.set_provider_identity(ApiProvider::Deepseek, "deepseek");
+    app.set_provider_identity(ProviderKind::Deepseek, "deepseek");
     app.add_message(HistoryCell::System {
         content: "existing receipt".to_string(),
     });
@@ -22827,7 +23536,7 @@ fn custom_session_resume_requires_structural_route_not_client_construction() {
     assert!(app.input.is_empty());
     assert!(app.queued_draft.is_none());
     assert_eq!(app.workspace, PathBuf::from("/tmp/other-workspace"));
-    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.api_provider, ProviderKind::Custom);
     assert_eq!(app.provider_identity_for_persistence(), "lm-studio");
     assert_eq!(app.model_selection_for_persistence(), "local-code-model");
     assert!(
@@ -22857,7 +23566,7 @@ fn named_custom_provider_resume_uses_exact_live_endpoint_model_and_workspace() {
 
     apply_loaded_session(&mut app, &mut config, &session).expect("restore exact custom route");
 
-    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.api_provider, ProviderKind::Custom);
     assert_eq!(app.provider_identity_for_persistence(), "lm-studio");
     assert_eq!(app.model_selection_for_persistence(), "local-code-model");
     assert_eq!(app.workspace, resumed_workspace.path());
@@ -22887,7 +23596,7 @@ fn same_workspace_named_custom_switch_requires_engine_respawn() {
     let workspace = PathBuf::from("/tmp/same-workspace-custom-switch");
     let mut app = create_test_app();
     app.workspace.clone_from(&workspace);
-    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_provider_identity(ProviderKind::Custom, "custom-a");
     app.set_model_selection("model-a".to_string());
     let previous_provider = app.api_provider;
     let previous_identity = app.provider_identity_for_persistence().to_string();
@@ -22899,8 +23608,8 @@ fn same_workspace_named_custom_switch_requires_engine_respawn() {
     session.metadata.workspace = workspace;
     apply_loaded_session(&mut app, &mut config, &session).expect("restore custom B");
 
-    assert_eq!(previous_provider, ApiProvider::Custom);
-    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(previous_provider, ProviderKind::Custom);
+    assert_eq!(app.api_provider, ProviderKind::Custom);
     assert_eq!(app.provider_identity_for_persistence(), "custom-b");
     assert!(loaded_session_requires_engine_respawn(
         &app,
@@ -22919,7 +23628,7 @@ fn file_load_uses_one_fresh_config_snapshot_for_custom_route_and_app_state() {
         named_custom_session_config("custom-b", "http://127.0.0.1:18182/v1", "model-b");
     let mut app = create_test_app();
     app.workspace.clone_from(&workspace);
-    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_provider_identity(ProviderKind::Custom, "custom-a");
     app.set_model_selection("model-a".to_string());
     app.api_messages_mut()
         .push(text_message("user", "old conversation"));
@@ -22968,18 +23677,14 @@ fn session_load_resolves_an_idless_custom_record_to_the_literal_table() {
     session.metadata.model_provider_id = None;
     session.metadata.model = "legacy-saved-model".to_string();
 
-    // An older top-level endpoint beside a `[providers.custom]` table belongs
-    // to DeepSeek (#6394); the id-less literal record is the table's route.
-    apply_loaded_session(&mut app, &mut config, &session)
-        .expect("id-less custom record resolves to the literal table");
-    assert_eq!(*app.api_messages, session.messages);
-    assert_eq!(app.api_provider, ApiProvider::Custom);
-    assert_eq!(app.provider_identity_for_persistence(), "custom");
+    let previous_messages = app.api_messages.clone();
+    let previous_provider = app.provider_identity_for_persistence().to_string();
+    let error = apply_loaded_session(&mut app, &mut config, &session)
+        .expect_err("a conflicting root cannot authorize a missing custom id");
+    assert!(error.contains("will not guess or fall back"), "{error}");
+    assert_eq!(app.api_messages, previous_messages);
+    assert_eq!(app.provider_identity_for_persistence(), previous_provider);
     assert_eq!(config.active_route_base_url(), "http://127.0.0.1:18182/v1");
-    assert_eq!(
-        config.deepseek_table_base_url(),
-        Some("http://127.0.0.1:18181/v1")
-    );
 }
 
 #[test]
@@ -23024,7 +23729,7 @@ fn session_load_rejects_empty_custom_id_when_root_and_table_coexist() {
     let mut app = create_test_app();
     app.api_messages_mut()
         .push(text_message("user", "current conversation"));
-    app.set_provider_identity(ApiProvider::Deepseek, "deepseek");
+    app.set_provider_identity(ProviderKind::Deepseek, "deepseek");
     app.set_model_selection("deepseek-v4-pro".to_string());
     let previous_messages = app.api_messages.clone();
     let previous_provider = app.api_provider;
@@ -23078,7 +23783,7 @@ fn file_load_respawns_engine_when_same_custom_identity_changes_endpoint() {
 
     let mut app = create_test_app();
     app.workspace.clone_from(&workspace);
-    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_provider_identity(ProviderKind::Custom, "custom-a");
     app.set_model_selection("model-a".to_string());
     let mut session = saved_session_with_messages(vec![text_message("user", "new endpoint")]);
     session.metadata.model_provider = "custom-a".to_string();
@@ -23101,7 +23806,7 @@ fn file_load_respawns_engine_when_same_custom_identity_changes_endpoint() {
         "http://127.0.0.1:18199/v1"
     );
     let entry = stale_config
-        .provider_config_for(ApiProvider::Custom)
+        .provider_config_for(&stale_config.test_identity_for_kind(ProviderKind::Custom))
         .expect("fresh custom route");
     assert_eq!(entry.api_key.as_deref(), Some("rotated-key"));
     assert_eq!(
@@ -23145,7 +23850,7 @@ fn file_load_route_refresh_preserves_effective_permission_and_feature_overlays()
 
     let mut app = create_test_app();
     app.workspace.clone_from(&workspace);
-    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_provider_identity(ProviderKind::Custom, "custom-a");
     app.set_model_selection("model-a".to_string());
     let mut session = saved_session_with_messages(vec![text_message("user", "keep policy")]);
     session.metadata.model_provider = "custom-a".to_string();
@@ -23197,32 +23902,30 @@ fn session_picker_restore_rejects_active_turn_before_mutating() {
 #[test]
 fn session_restore_rebuilds_fresh_codex_route_limits() {
     let _lock = crate::test_support::lock_test_env();
-    let codex_home = tempfile::tempdir().expect("Codex home");
-    let _codex_home = crate::test_support::EnvVarGuard::set("CODEX_HOME", codex_home.path());
-    std::fs::write(
-        codex_home.path().join("models_cache.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "fetched_at": chrono::Utc::now(),
-            "models": [{
-                "slug": crate::config::DEFAULT_OPENAI_CODEX_MODEL,
-                "priority": 1,
-                "context_window": 272000,
-                "supported_reasoning_levels": [{"effort": "high"}]
-            }]
-        }))
-        .expect("serialize cache"),
-    )
-    .expect("write cache");
+    let home = tempfile::tempdir().expect("owned registration home");
+    let root = home.path().canonicalize().unwrap();
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
     let mut app = create_test_app();
     let mut config = Config::default();
-    let mut session = saved_session_with_messages(vec![text_message("user", "resume Codex")]);
-    session.metadata.model_provider = ApiProvider::OpenaiCodex.as_str().to_string();
+    crate::oauth::install_test_chatgpt_registration(&mut config).unwrap();
+    crate::codex_model_cache::install_test_chatgpt_roster_with_metadata(
+        &config,
+        vec![crate::codex_model_cache::CodexModelMetadata {
+            id: crate::config::DEFAULT_OPENAI_CODEX_MODEL.into(),
+            display_name: None,
+            context_window: Some(272_000),
+            reasoning: Some(true),
+            efforts: vec!["high".into()],
+        }],
+    )
+    .unwrap();
+    let mut session = saved_session_with_messages(vec![text_message("user", "resume ChatGPT")]);
+    session.metadata.model_provider = ProviderKind::OpenaiCodex.as_str().to_string();
     session.metadata.model = crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string();
 
     apply_loaded_session(&mut app, &mut config, &session).expect("restore session");
 
-    assert_eq!(app.api_provider, ApiProvider::OpenaiCodex);
-    assert_eq!(app.model, crate::config::DEFAULT_OPENAI_CODEX_MODEL);
+    assert_eq!(app.api_provider, ProviderKind::OpenaiCodex);
     assert_eq!(
         app.active_route_limits
             .and_then(|limits| limits.context_tokens),
@@ -23328,7 +24031,7 @@ fn auto_route_receipt_survives_session_snapshot_and_restore() {
     };
     let mut app = create_test_app();
     app.set_model_selection("auto".to_string());
-    app.last_effective_provider = Some(ApiProvider::Zai);
+    app.last_effective_provider = Some(ProviderKind::Zai);
     app.last_effective_provider_identity = Some("zai".to_string());
     app.last_effective_model = Some(crate::config::ZAI_GLM_5_2_MODEL.to_string());
     app.last_auto_route_receipt = Some(receipt.clone());
@@ -23359,7 +24062,7 @@ fn auto_route_receipt_survives_session_snapshot_and_restore() {
         .last_auto_route
         .as_ref()
         .expect("persisted Auto route");
-    assert_eq!(saved.provider, ApiProvider::Zai);
+    assert_eq!(saved.provider, ProviderKind::Zai);
     assert_eq!(saved.provider_identity, "zai");
     assert_eq!(saved.model, crate::config::ZAI_GLM_5_2_MODEL);
     assert_eq!(saved.receipt, receipt);
@@ -23373,7 +24076,10 @@ fn auto_route_receipt_survives_session_snapshot_and_restore() {
         .expect("restore session");
 
     assert!(restored_app.auto_model);
-    assert_eq!(restored_app.last_effective_provider, Some(ApiProvider::Zai));
+    assert_eq!(
+        restored_app.last_effective_provider,
+        Some(ProviderKind::Zai)
+    );
     assert_eq!(
         restored_app.last_effective_provider_identity.as_deref(),
         Some("zai")
@@ -23558,13 +24264,13 @@ async fn model_picker_apply_is_session_local_until_startup_default_is_requested(
     }
     .with_legacy_root(Some("test-key".to_string()), None);
 
+    let selected_identity = app.admitted_provider_identity().unwrap().clone();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "deepseek-v4-pro".to_string(),
-        None,
-        None,
+        Some(selected_identity),
         ReasoningEffort::High,
         "auto".to_string(),
         ReasoningEffort::Auto,
@@ -23646,18 +24352,20 @@ async fn model_picker_startup_default_overrides_configured_xai_route_after_resta
         ..crate::test_support::test_tui_options(PathBuf::from("."))
     };
     let mut app = App::new(initial_options, &config);
-    assert_eq!(app.api_provider, ApiProvider::Xai);
+    assert_eq!(app.api_provider, ProviderKind::Xai);
     assert_eq!(app.model, "grok-4.5");
     let previous_effort = app.reasoning_effort;
     let mut engine = mock_engine_handle();
 
+    let selected_identity = config
+        .builtin_provider_identity(ProviderKind::Deepseek)
+        .unwrap();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "deepseek-v4-flash".to_string(),
-        Some(ApiProvider::Deepseek),
-        None,
+        Some(selected_identity),
         previous_effort,
         "grok-4.5".to_string(),
         previous_effort,
@@ -23668,7 +24376,7 @@ async fn model_picker_startup_default_overrides_configured_xai_route_after_resta
     )
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.model, "deepseek-v4-flash");
     assert!(
         app.status_message
@@ -23691,7 +24399,7 @@ async fn model_picker_startup_default_overrides_configured_xai_route_after_resta
         ..crate::test_support::test_tui_options(PathBuf::from("."))
     };
     let restarted = App::new(restart_options, &restart_config);
-    assert_eq!(restarted.api_provider, ApiProvider::Deepseek);
+    assert_eq!(restarted.api_provider, ProviderKind::Deepseek);
     assert_eq!(
         restarted.model, "deepseek-v4-flash",
         "the explicit startup default must replace config's xAI selection"
@@ -23711,13 +24419,13 @@ async fn model_picker_auto_commits_visible_implicit_fixed_model_thinking() {
     }
     .with_legacy_root(Some("test-key".to_string()), None);
 
+    let selected_identity = app.admitted_provider_identity().unwrap().clone();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "auto".to_string(),
-        None,
-        None,
+        Some(selected_identity),
         ReasoningEffort::Max,
         "deepseek-v4-pro".to_string(),
         ReasoningEffort::Auto,
@@ -23744,7 +24452,7 @@ async fn model_picker_auto_commits_visible_implicit_fixed_model_thinking() {
 async fn model_picker_auto_restores_raw_preference_after_fixed_normalization() {
     let _guard = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.set_model_selection("deepseek-v4-pro".to_string());
     app.reasoning_effort = ReasoningEffort::High;
     app.reasoning_effort_preference = Some(ReasoningEffort::Low);
@@ -23754,13 +24462,13 @@ async fn model_picker_auto_restores_raw_preference_after_fixed_normalization() {
     }
     .with_legacy_root(Some("test-key".to_string()), None);
 
+    let selected_identity = app.admitted_provider_identity().unwrap().clone();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "auto".to_string(),
-        None,
-        None,
+        Some(selected_identity),
         ReasoningEffort::Low,
         "deepseek-v4-pro".to_string(),
         ReasoningEffort::Low,
@@ -23835,13 +24543,13 @@ async fn reselecting_live_model_and_thinking_is_session_local() {
         "the test home must start with no recorded setup progress"
     );
 
+    let selected_identity = app.admitted_provider_identity().unwrap().clone();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "deepseek-v4-pro".to_string(),
-        None,
-        None,
+        Some(selected_identity),
         ReasoningEffort::High,
         "deepseek-v4-pro".to_string(),
         ReasoningEffort::High,
@@ -23914,7 +24622,7 @@ async fn reselecting_live_thinking_only_persists_startup_default() {
 async fn model_picker_switches_between_exact_named_custom_routes() {
     let _guard = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_provider_identity(ProviderKind::Custom, "custom-a");
     app.set_model_selection("model-a".to_string());
     let previous_effort = app.reasoning_effort;
     let mut custom = HashMap::new();
@@ -23945,13 +24653,13 @@ async fn model_picker_switches_between_exact_named_custom_routes() {
     };
     let mut engine = mock_engine_handle();
 
+    let selected_identity = config.resolve_provider_pin_identity("custom-b").unwrap();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "model-b".to_string(),
-        None,
-        Some("custom-b".to_string()),
+        Some(selected_identity),
         ReasoningEffort::High,
         "model-a".to_string(),
         previous_effort,
@@ -23959,7 +24667,7 @@ async fn model_picker_switches_between_exact_named_custom_routes() {
     )
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.api_provider, ProviderKind::Custom);
     assert_eq!(app.provider_identity_for_persistence(), "custom-b");
     assert_eq!(app.model_selection_for_persistence(), "model-b");
     assert_eq!(config.provider.as_deref(), Some("custom-b"));
@@ -23970,7 +24678,7 @@ async fn model_picker_switches_between_exact_named_custom_routes() {
 async fn model_picker_auto_switches_exact_named_custom_route_transactionally() {
     let _guard = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_provider_identity(ProviderKind::Custom, "custom-a");
     app.set_model_selection("model-a".to_string());
     app.reasoning_effort = ReasoningEffort::Low;
     app.reasoning_effort_preference = Some(ReasoningEffort::Low);
@@ -24001,13 +24709,13 @@ async fn model_picker_auto_switches_exact_named_custom_route_transactionally() {
     };
     let mut engine = mock_engine_handle();
 
+    let selected_identity = config.resolve_provider_pin_identity("custom-b").unwrap();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "auto".to_string(),
-        None,
-        Some("custom-b".to_string()),
+        Some(selected_identity),
         ReasoningEffort::Low,
         "model-a".to_string(),
         previous_effort,
@@ -24015,7 +24723,7 @@ async fn model_picker_auto_switches_exact_named_custom_route_transactionally() {
     )
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.api_provider, ProviderKind::Custom);
     assert_eq!(app.provider_identity_for_persistence(), "custom-b");
     assert!(app.auto_model);
     assert_eq!(app.model_selection_for_persistence(), "auto");
@@ -24036,7 +24744,7 @@ async fn model_picker_auto_switches_exact_named_custom_route_transactionally() {
 #[test]
 fn dismissing_named_custom_model_picker_restores_app_owned_config_route() {
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Custom, "custom-a");
+    app.set_provider_identity(ProviderKind::Custom, "custom-a");
     let mut config =
         named_custom_session_config("custom-a", "http://127.0.0.1:18181/v1", "model-a");
     config.providers.as_mut().expect("providers").custom.insert(
@@ -24080,13 +24788,13 @@ async fn model_picker_startup_default_reports_settings_write_failure() {
     }
     .with_legacy_root(Some("test-key".to_string()), None);
 
+    let selected_identity = app.admitted_provider_identity().unwrap().clone();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "deepseek-v4-pro".to_string(),
-        None,
-        None,
+        Some(selected_identity),
         ReasoningEffort::High,
         "auto".to_string(),
         ReasoningEffort::Auto,
@@ -24376,14 +25084,38 @@ fn orphan_during_active_keeps_subsequent_completion_routed_correctly() {
     // mid-active, it pushes a real history cell that bumps virtual indices
     // by one. A subsequent legitimate completion must still find its entry.
     let mut app = create_test_app();
+    app.tool_collapse_threshold = 0;
     handle_tool_call_started(
         &mut app,
         "live",
         "exec_shell",
         &serde_json::json!({"command": "ls"}),
     );
+    let _ = render_underwater_test_app(&mut app, 80, 24);
+    assert!(handle_transcript_space(&mut app));
+    let _ = render_underwater_test_app(&mut app, 80, 24);
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Collapsed));
+    let rendered_epoch = app.transcript_identity_epoch;
     // Orphan completion arrives FIRST (before live's completion).
     handle_tool_call_complete(&mut app, "ghost", "weird_tool", &ok_result("ghost-out"));
+    assert!(
+        !app.cell_folds.contains_key(&0),
+        "orphan cannot inherit active fold"
+    );
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Collapsed));
+    assert_ne!(app.transcript_identity_epoch, rendered_epoch);
+    assert!(
+        !handle_transcript_space(&mut app),
+        "pre-insertion action cannot target orphan"
+    );
+    let _ = render_underwater_test_app(&mut app, 80, 24);
+    assert_eq!(
+        app.viewport
+            .transcript_cache
+            .fold_action_target()
+            .map(|target| target.owner.cell_index),
+        Some(1)
+    );
     // Now complete the live tool — it should still mutate the active entry,
     // not silently drop or hit a stale index.
     handle_tool_call_complete(&mut app, "live", "exec_shell", &ok_result("hello"));
@@ -24405,6 +25137,49 @@ fn orphan_during_active_keeps_subsequent_completion_routed_correctly() {
     // Flush settles the active exec into history below the orphan.
     app.flush_active_cell();
     assert_eq!(app.history.len(), 2);
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Collapsed));
+    let _ = render_underwater_test_app(&mut app, 80, 24);
+    assert!(handle_transcript_space(&mut app));
+    assert_eq!(app.cell_folds.get(&1), Some(&TranscriptFold::Expanded));
+}
+
+#[test]
+fn mid_turn_history_insert_rebases_hide_without_changing_finalized_choices() {
+    use crate::tui::mouse_ui::apply_context_menu_action;
+    use crate::tui::views::ContextMenuAction;
+
+    let mut app = create_test_app();
+    app.tool_collapse_threshold = 0;
+    app.add_message(HistoryCell::Assistant {
+        content: "finalized answer".into(),
+        streaming: false,
+    });
+    app.cell_folds.insert(0, TranscriptFold::Collapsed);
+    handle_tool_call_started(
+        &mut app,
+        "live",
+        "exec_shell",
+        &serde_json::json!({"command": "ls"}),
+    );
+    let _ = apply_context_menu_action(&mut app, ContextMenuAction::HideCell { cell_index: 1 });
+    let _ = render_underwater_test_app(&mut app, 80, 24);
+    assert_eq!(app.collapsed_cell_map, vec![0]);
+    handle_tool_call_complete(&mut app, "ghost", "weird_tool", &ok_result("orphan result"));
+    assert_eq!(
+        app.cell_folds,
+        HashMap::from([(0, TranscriptFold::Collapsed)])
+    );
+    assert_eq!(app.collapsed_cells, HashSet::from([2]));
+    let _ = render_underwater_test_app(&mut app, 80, 24);
+    assert_eq!(
+        app.collapsed_cell_map,
+        vec![0, 1],
+        "orphan remains visible, active Hide follows its row"
+    );
+    let _ = apply_context_menu_action(&mut app, ContextMenuAction::ShowCell { cell_index: 2 });
+    let _ = render_underwater_test_app(&mut app, 80, 24);
+    assert_eq!(app.collapsed_cell_map, vec![0, 1, 2]);
+    assert_eq!(app.cell_folds.get(&0), Some(&TranscriptFold::Collapsed));
 }
 
 #[test]
@@ -24630,7 +25405,7 @@ async fn composer_send_anchors_new_message_at_tail() {
     let _env_lock = crate::test_support::lock_test_env();
     let _zai = crate::test_support::EnvVarGuard::set("ZAI_API_KEY", "zai-test-key");
     let mut app = create_test_app();
-    app.set_provider_identity(ApiProvider::Zai, "zai");
+    app.set_provider_identity(ProviderKind::Zai, "zai");
     app.set_model_selection("auto".to_string());
     let config = Config {
         provider: Some("zai".to_string()),
@@ -26096,9 +26871,19 @@ fn recoverable_engine_error_does_not_enter_offline_mode() {
 fn recoverable_provider_error_advances_fallback_chain() {
     use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope, ErrorSeverity};
 
-    let mut app = create_test_app();
+    let config = Config {
+        fallback_providers: vec![ProviderKind::Openrouter],
+        providers: Some(ProvidersConfig {
+            openrouter: ProviderConfig {
+                api_key: Some("captured-fixture-key".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut app = App::new(create_test_options(), &config);
     app.ui_locale = codewhale_localization::Locale::Fr;
-    app.api_provider = ApiProvider::Deepseek;
     app.provider_chain = Some(codewhale_config::ProviderChain::new(
         codewhale_config::ProviderKind::Deepseek,
         &[codewhale_config::ProviderKind::Openrouter],
@@ -26115,7 +26900,7 @@ fn recoverable_provider_error_advances_fallback_chain() {
         ),
     );
 
-    assert_eq!(app.api_provider, ApiProvider::Openrouter);
+    assert_eq!(app.api_provider, ProviderKind::Openrouter);
     assert!(app.is_fallback_active());
     assert!(!app.offline_mode);
     let toast = app.status_toasts.back().expect("fallback notice");
@@ -26145,7 +26930,7 @@ fn auth_error_does_not_trigger_provider_fallback() {
     use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope, ErrorSeverity};
 
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     // Not env-only, so we exercise the category gate rather than the env-key
     // onboarding early-return.
     app.api_key_env_only = false;
@@ -26169,7 +26954,7 @@ fn auth_error_does_not_trigger_provider_fallback() {
 
     assert_eq!(
         app.api_provider,
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         "auth failure must not rotate providers"
     );
     assert!(!app.is_fallback_active());
@@ -26187,8 +26972,19 @@ fn auth_error_does_not_trigger_provider_fallback() {
 fn fallback_switch_status_shows_one_based_position_and_reason() {
     use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope, ErrorSeverity};
 
-    let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    let mut providers = crate::config::ProvidersConfig::default();
+    providers.openrouter.api_key = Some("fixture-fallback-key".to_string());
+    let config = crate::config::Config {
+        provider: Some("deepseek".to_string()),
+        fallback_providers: vec![ProviderKind::Openrouter],
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let mut app = App::new(
+        crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+        &config,
+    );
+    app.api_provider = ProviderKind::Deepseek;
     app.provider_chain = Some(codewhale_config::ProviderChain::new(
         codewhale_config::ProviderKind::Deepseek,
         &[codewhale_config::ProviderKind::Openrouter],
@@ -26205,7 +27001,7 @@ fn fallback_switch_status_shows_one_based_position_and_reason() {
         ),
     );
 
-    assert_eq!(app.api_provider, ApiProvider::Openrouter);
+    assert_eq!(app.api_provider, ProviderKind::Openrouter);
     assert_eq!(
         app.fallback_chain_position(),
         Some(1),
@@ -26245,17 +27041,18 @@ async fn failed_fallback_restores_exact_literal_custom_identity_without_root_cro
         Some("http://127.0.0.1:18180/v1".to_string()),
     );
     let previous_identity = ProviderIdentity {
-        provider: ApiProvider::Custom,
-        key: "custom".to_string(),
-        exact_id: Some("custom".to_string()),
+        provider: ProviderKind::Custom,
+        key: "custom".into(),
+        exact_id: Some("custom".into()),
         migrated_legacy_ollama_cloud_route: false,
+        legacy_root_custom_generation: None,
     };
     let mut app = create_test_app();
     app.set_provider_identity_record(previous_identity.clone());
     app.set_model_selection("literal-table-model".to_string());
     // Mirror `apply_engine_error_to_app`: the fallback chain has advanced the
     // enum while the previous exact route remains the rollback authority.
-    app.api_provider = ApiProvider::Openrouter;
+    app.api_provider = ProviderKind::Openrouter;
     let mut engine = mock_engine_handle();
     let previous_chain = app.provider_chain.clone();
 
@@ -26270,10 +27067,11 @@ async fn failed_fallback_restores_exact_literal_custom_identity_without_root_cro
     )
     .await;
 
-    assert_eq!(app.api_provider, ApiProvider::Custom);
+    assert_eq!(app.api_provider, ProviderKind::Custom);
     assert_eq!(app.provider_identity_for_persistence(), "custom");
     assert_eq!(app.provider_id_for_persistence(), Some("custom"));
-    let (restored_identity, restored_config) = app_scoped_runtime_config(&app, &config);
+    let (restored_identity, restored_config) =
+        app_scoped_runtime_config(&app, &config).expect("restored exact route");
     assert_eq!(restored_identity, previous_identity);
     let route = resolve_runtime_route_for_identity(
         &restored_config,
@@ -26281,7 +27079,7 @@ async fn failed_fallback_restores_exact_literal_custom_identity_without_root_cro
         Some("literal-table-model"),
     )
     .expect("restored identity must still resolve the exact literal table");
-    assert_eq!(route.identity.exact_id.as_deref(), Some("custom"));
+    assert_eq!(route.identity.persisted_id(), Some("custom"));
     assert_eq!(
         route.candidate.endpoint().base_url,
         "http://127.0.0.1:18181/v1"
@@ -26298,7 +27096,7 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
 
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = "deepseek-v4-pro".to_string();
     app.model_ids_passthrough = false;
     app.onboarding = OnboardingState::None;
@@ -26326,15 +27124,18 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
     }
     .with_legacy_root(Some("deepseek-key".to_string()), None);
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Moonshot,
-        Some("kimi-k2.6".to_string()),
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Moonshot);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            Some("kimi-k2.6".to_string()),
+        )
+    }
     .await;
-    assert_eq!(app.api_provider, ApiProvider::Moonshot);
+    assert_eq!(app.api_provider, ProviderKind::Moonshot);
     assert_eq!(app.active_context_window_override, Some(262_144));
     assert_eq!(config.provider.as_deref(), Some("moonshot"));
     assert!(app.pending_provider_switch.is_some());
@@ -26346,7 +27147,7 @@ async fn provider_switch_auth_error_restores_previous_provider_and_model() {
     let rollback_status = rollback_provider_after_auth_failure(&mut app, &mut config)
         .expect("auth failure after provider switch should roll back");
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.model, "deepseek-v4-pro");
     assert_eq!(app.active_context_window_override, Some(1_000_000));
     assert!(!app.model_ids_passthrough);
@@ -26406,7 +27207,7 @@ async fn provider_switch_rollback_corrects_setup_receipt_when_persistence_fails(
     let _home = SettingsHomeGuard::new();
     let bad_config_path = TempDir::new().expect("bad config path");
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.model = "deepseek-v4-pro".to_string();
     app.model_ids_passthrough = false;
     app.onboarding = OnboardingState::None;
@@ -26431,13 +27232,16 @@ async fn provider_switch_rollback_corrects_setup_receipt_when_persistence_fails(
     }
     .with_legacy_root(Some("deepseek-key".to_string()), None);
 
-    switch_provider(
-        &mut app,
-        &mut engine.handle,
-        &mut config,
-        ApiProvider::Moonshot,
-        Some("kimi-k2.6".to_string()),
-    )
+    {
+        let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Moonshot);
+        switch_provider(
+            &mut app,
+            &mut engine.handle,
+            &mut config,
+            captured_fixture_identity,
+            Some("kimi-k2.6".to_string()),
+        )
+    }
     .await;
     let target_state = codewhale_config::SetupState::load()
         .expect("load target setup state")
@@ -26458,7 +27262,7 @@ async fn provider_switch_rollback_corrects_setup_receipt_when_persistence_fails(
     let rollback_status = rollback_provider_after_auth_failure(&mut app, &mut config)
         .expect("auth failure after provider switch should roll back");
 
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_eq!(app.model, "deepseek-v4-pro");
     // The rollback itself writes nothing — there is no persistence step to
     // fail, and the receipt must not claim one.
@@ -26577,6 +27381,44 @@ async fn recoverable_stream_error_keeps_active_turn_for_pending_approval() {
             )
         }),
         "stream decode error should remain visible in transcript"
+    );
+}
+
+#[tokio::test]
+async fn withdrawn_extension_approval_retires_only_its_card_even_when_idle() {
+    let mut app = ask_posture_app();
+    app.is_loading = true;
+    let mut mock = mock_engine_handle();
+    let request = |id: &str| EngineEvent::ApprovalRequired {
+        id: id.into(),
+        tool_name: "exec_shell".into(),
+        description: "extension request".into(),
+        input: serde_json::json!({"command": "echo example"}),
+        approval_key: format!("ext:{id}"),
+        approval_grouping_key: format!("ext-group:{id}"),
+        intent_summary: None,
+        approval_force_prompt: true,
+    };
+    drain_approval_event(&mut app, &mock.handle, request("ext-1.1")).await;
+    drain_approval_event(&mut app, &mock.handle, request("ext-1.2")).await;
+    assert!(app.view_stack.contains_approval_id("ext-1.1"));
+    assert!(app.view_stack.contains_approval_id("ext-1.2"));
+    app.view_stack.push(HelpView::new());
+    app.is_loading = false;
+    assert!(crate::tui::pending_requests::observe_engine_event(
+        &mut app,
+        &EngineEvent::ApprovalWithdrawn {
+            id: "ext-1.1".into()
+        },
+    ));
+    assert!(!app.view_stack.contains_approval_id("ext-1.1"));
+    assert!(app.view_stack.contains_approval_id("ext-1.2"));
+    assert!(app.needs_redraw);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), mock.recv_approval_event())
+            .await
+            .is_err(),
+        "retiring a card does not fabricate a decision"
     );
 }
 
@@ -26815,11 +27657,13 @@ async fn stale_parent_approval_is_resolved_unavailable_not_dropped() {
             questions: Vec::new(),
         },
     };
-    assert!(resolve_stale_parent_request(&app, &mock.handle, &question).await);
-    assert_eq!(
-        mock.recv_user_input_cancellation().await.as_deref(),
-        Some("stale-question")
+    let handle = mock.handle.clone();
+    let (resolved, canceled) = tokio::join!(
+        resolve_stale_parent_request(&app, &handle, &question),
+        mock.recv_user_input_cancellation(),
     );
+    assert!(resolved);
+    assert_eq!(canceled.as_deref(), Some("stale-question"));
 }
 
 #[tokio::test]
@@ -27430,11 +28274,12 @@ async fn keyless_engine_error_stays_visible_after_a_config_ack() {
     let run = tokio::spawn(engine.run());
     handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             content: "hello without a key".to_string(),
             images: Vec::new(),
             mode: AppMode::Agent,
             route: Box::new(
-                resolve_runtime_route(&config, ApiProvider::Deepseek, Some(&app.model))
+                resolve_runtime_route(&config, ProviderKind::Deepseek, Some(&app.model))
                     .expect("structural route resolution"),
             ),
             compaction: Box::default(),
@@ -27524,7 +28369,7 @@ fn env_only_auth_failure_reopens_provider_onboarding() {
     use crate::error_taxonomy::ErrorEnvelope;
     let mut app = create_test_app();
     app.ui_locale = codewhale_localization::Locale::Ja;
-    app.api_provider = crate::config::ApiProvider::Anthropic;
+    app.api_provider = crate::config::ProviderKind::Anthropic;
     app.config_path = Some(std::path::PathBuf::from("/tmp/codewhale-phase2.toml"));
     app.api_key_env_only = true;
     app.onboarding = crate::tui::app::OnboardingState::None;
@@ -27551,7 +28396,7 @@ fn env_only_auth_failure_reopens_provider_onboarding() {
         status,
         app.tr(MessageId::OnboardApiKeyRejectedEnv)
             .replace("{provider}", "anthropic")
-            .replace("{env}", &app.api_provider.env_vars_label())
+            .replace("{env}", &app.api_provider.provider().env_vars().join(" / "))
             .replace("{path}", "/tmp/codewhale-phase2.toml")
     );
     assert!(
@@ -27816,7 +28661,7 @@ fn default_footer_excludes_provider_specific_diagnostic_chips() {
 #[test]
 fn should_fetch_provider_balance_requires_balance_status_item() {
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Deepseek;
+    app.api_provider = ProviderKind::Deepseek;
     app.status_items = crate::config::StatusItem::default_footer();
 
     assert!(!should_fetch_provider_balance(&app));
@@ -27830,16 +28675,16 @@ fn should_fetch_provider_balance_covers_prepaid_providers() {
     let mut app = create_test_app();
     app.status_items = vec![crate::config::StatusItem::Balance];
 
-    app.api_provider = ApiProvider::Ollama;
+    app.api_provider = ProviderKind::Ollama;
     assert!(!should_fetch_provider_balance(&app));
 
-    app.api_provider = ApiProvider::Openrouter;
+    app.api_provider = ProviderKind::Openrouter;
     assert!(should_fetch_provider_balance(&app));
 
-    app.api_provider = ApiProvider::Siliconflow;
+    app.api_provider = ProviderKind::Siliconflow;
     assert!(should_fetch_provider_balance(&app));
 
-    app.api_provider = ApiProvider::DeepseekCN;
+    app.api_provider = ProviderKind::Deepseek;
     assert!(should_fetch_provider_balance(&app));
 }
 
@@ -27891,7 +28736,7 @@ fn duplicate_mailbox_token_usage_does_not_regress_displayed_cost() {
         agent_id: "agent-x".to_string(),
         source_id: "response-x".to_string(),
         route: Box::new(test_mailbox_route(
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek-v4-flash",
         )),
         usage: codewhale_models::Usage {
@@ -30734,13 +31579,15 @@ async fn refused_route_change_does_not_pin_a_startup_default_and_says_so() {
     // A busy session refuses model/thinking changes outright.
     app.is_loading = true;
 
+    let selected_identity = config
+        .builtin_provider_identity(ProviderKind::Deepseek)
+        .unwrap();
     apply_model_picker_choice(
         &mut app,
         &mut engine.handle,
         &mut config,
         "deepseek-v4-flash".to_string(),
-        Some(ApiProvider::Deepseek),
-        None,
+        Some(selected_identity),
         previous_effort,
         "grok-4.5".to_string(),
         previous_effort,
@@ -30750,7 +31597,7 @@ async fn refused_route_change_does_not_pin_a_startup_default_and_says_so() {
 
     assert_eq!(
         app.api_provider,
-        ApiProvider::Xai,
+        ProviderKind::Xai,
         "the refused switch must leave the live route alone"
     );
     let settings = crate::settings::Settings::load().expect("load settings");
@@ -32607,7 +33454,7 @@ async fn provider_switch_back_lands_on_root_default_owned_by_that_provider() {
     // at the root, so `/provider openai` came back on the catalog default.
     let _home = SettingsHomeGuard::new();
     let mut app = create_test_app();
-    app.api_provider = ApiProvider::Openai;
+    app.api_provider = ProviderKind::Openai;
     app.model = "gpui-fixture".to_string();
     let mut engine = mock_engine_handle();
     let mut config = Config {
@@ -32626,29 +33473,35 @@ async fn provider_switch_back_lands_on_root_default_owned_by_that_provider() {
     .with_legacy_root(Some("deepseek-key".to_string()), None);
 
     assert!(
-        switch_provider(
-            &mut app,
-            &mut engine.handle,
-            &mut config,
-            ApiProvider::Deepseek,
-            None,
-        )
+        {
+            let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Deepseek);
+            switch_provider(
+                &mut app,
+                &mut engine.handle,
+                &mut config,
+                captured_fixture_identity,
+                None,
+            )
+        }
         .await
     );
-    assert_eq!(app.api_provider, ApiProvider::Deepseek);
+    assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert_ne!(app.model, "gpui-fixture");
 
     assert!(
-        switch_provider(
-            &mut app,
-            &mut engine.handle,
-            &mut config,
-            ApiProvider::Openai,
-            None,
-        )
+        {
+            let captured_fixture_identity = (config).test_identity_for_kind(ProviderKind::Openai);
+            switch_provider(
+                &mut app,
+                &mut engine.handle,
+                &mut config,
+                captured_fixture_identity,
+                None,
+            )
+        }
         .await
     );
-    assert_eq!(app.api_provider, ApiProvider::Openai);
+    assert_eq!(app.api_provider, ProviderKind::Openai);
     assert_eq!(app.model, "gpui-fixture");
 }
 
@@ -32704,58 +33557,100 @@ fn long_session_history(turns: usize) -> Vec<HistoryCell> {
     cells
 }
 
+/// A session whose every turn ends in a run of three tool calls, so the
+/// collapsed-run projection (and the filtered transcript path) is live.
+fn collapsing_session_history(turns: usize) -> Vec<HistoryCell> {
+    let tool = |name: &str| {
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: name.to_string(),
+            status: ToolStatus::Success,
+            input_summary: Some(format!("path: {name}.txt")),
+            output: Some(format!("full output from {name}")),
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        }))
+    };
+    let mut cells = Vec::with_capacity(turns * 5);
+    for turn in 0..turns {
+        cells.push(HistoryCell::User {
+            content: format!("question {turn}: please look at the render path"),
+        });
+        for name in ["read_file", "list_dir", "web_search"] {
+            cells.push(tool(name));
+        }
+        cells.push(HistoryCell::Assistant {
+            content: format!("Answer {turn}.\n\n- point one\n- point two"),
+            streaming: false,
+        });
+    }
+    cells
+}
+
 /// Full-frame scroll benchmark for #6652; run with `--ignored --nocapture`.
+/// `plain` histories take the unfiltered path; `collapsed` ones take the
+/// filtered path with collapsed tool-run summaries.
 #[test]
 #[ignore = "timing benchmark, not a correctness gate"]
 #[allow(clippy::print_stderr)]
 fn bench_full_frame_scroll_cost_by_history_length() {
-    for turns in [100usize, 1_000] {
-        let mut app = create_test_app();
-        app.history = long_session_history(turns);
-        app.resync_history_revisions();
-        let config = Config::default();
-        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
-        terminal
-            .draw(|frame| {
-                let _ = super::frame::render(frame, &mut app, &config);
-            })
-            .unwrap();
-        let frames = 200u32;
-        let started = Instant::now();
-        for _ in 0..frames {
-            app.viewport.pending_scroll_delta = -3;
-            app.needs_redraw = true;
+    for collapsed in [false, true] {
+        let shape = if collapsed { "collapsed" } else { "plain" };
+        for turns in [100usize, 1_000, 5_000] {
+            let mut app = create_test_app();
+            if collapsed {
+                app.tool_collapse_mode = crate::tui::app::ToolCollapseMode::Compact;
+                app.tool_collapse_threshold = 3;
+                app.history = collapsing_session_history(turns);
+            } else {
+                app.history = long_session_history(turns);
+            }
+            app.resync_history_revisions();
+            let config = Config::default();
+            let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
             terminal
                 .draw(|frame| {
                     let _ = super::frame::render(frame, &mut app, &config);
                 })
                 .unwrap();
+            let frames = 200u32;
+            let started = Instant::now();
+            for _ in 0..frames {
+                app.viewport.pending_scroll_delta = -3;
+                app.needs_redraw = true;
+                terminal
+                    .draw(|frame| {
+                        let _ = super::frame::render(frame, &mut app, &config);
+                    })
+                    .unwrap();
+            }
+            let elapsed = started.elapsed();
+            eprintln!(
+                "#6652 full-frame {shape}: {} cells, {} lines, {:?}/scroll frame",
+                app.history.len(),
+                app.viewport.transcript_cache.total_lines(),
+                elapsed / frames
+            );
+            // Chrome that grows or shrinks (composer lines, toasts, turn rows)
+            // changes the transcript height without changing its width.
+            let started = Instant::now();
+            for frame in 0..frames {
+                let height = if frame % 2 == 0 { 41 } else { 40 };
+                terminal.backend_mut().resize(140, height);
+                app.needs_redraw = true;
+                terminal
+                    .draw(|frame| {
+                        let _ = super::frame::render(frame, &mut app, &config);
+                    })
+                    .unwrap();
+            }
+            eprintln!(
+                "#6652 full-frame {shape}: {} cells, {:?}/height-change frame",
+                app.history.len(),
+                started.elapsed() / frames
+            );
         }
-        let elapsed = started.elapsed();
-        eprintln!(
-            "#6652 full-frame: {} cells, {} lines, {:?}/scroll frame",
-            app.history.len(),
-            app.viewport.transcript_cache.total_lines(),
-            elapsed / frames
-        );
-        // Chrome that grows or shrinks (composer lines, toasts, turn rows)
-        // changes the transcript height without changing its width.
-        let started = Instant::now();
-        for frame in 0..frames {
-            let height = if frame % 2 == 0 { 41 } else { 40 };
-            terminal.backend_mut().resize(140, height);
-            app.needs_redraw = true;
-            terminal
-                .draw(|frame| {
-                    let _ = super::frame::render(frame, &mut app, &config);
-                })
-                .unwrap();
-        }
-        eprintln!(
-            "#6652 full-frame: {} cells, {:?}/height-change frame",
-            app.history.len(),
-            started.elapsed() / frames
-        );
     }
 }
 
@@ -32869,4 +33764,454 @@ fn g3_resize_clear_and_failure_are_inside_synchronized_output() {
             "resize must emit a clear"
         );
     }
+}
+
+#[test]
+fn background_skill_cache_refuses_stale_epoch_workspace_and_plugin_snapshot() {
+    let mut app = create_test_app();
+    app.cached_skills = vec![("existing".into(), "kept".into())];
+    let current = app.skill_cache_scope(7);
+    let result = vec![("new".into(), "reviewed".into())];
+    assert!(!app.install_skill_cache_if_current(&current, 8, result.clone()));
+    let mut stale_workspace = current.clone();
+    stale_workspace.workspace = app.workspace.join("different");
+    assert!(!app.install_skill_cache_if_current(&stale_workspace, 7, result.clone()));
+    let mut stale_dir = current.clone();
+    stale_dir.skills_dir = app.skills_dir.join("different");
+    assert!(!app.install_skill_cache_if_current(&stale_dir, 7, result.clone()));
+    let mut stale_mode = current.clone();
+    stale_mode.mode = if app.skills_discovery_mode == crate::skills::SkillDiscoveryMode::Compatible
+    {
+        crate::skills::SkillDiscoveryMode::CodeWhaleOnly
+    } else {
+        crate::skills::SkillDiscoveryMode::Compatible
+    };
+    assert!(!app.install_skill_cache_if_current(&stale_mode, 7, result.clone()));
+    let mut stale_plugins = current.clone();
+    stale_plugins.plugins = Arc::new(crate::plugins::PluginRegistry::empty(&app.workspace));
+    assert!(!app.install_skill_cache_if_current(&stale_plugins, 7, result.clone()));
+    assert_eq!(app.cached_skills, [("existing".into(), "kept".into())]);
+    assert!(app.install_skill_cache_if_current(&current, 7, result.clone()));
+    assert_eq!(app.cached_skills, result);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn persisted_queued_native_skill_is_denied_after_host_withdrawal() {
+    use crate::extension_host::tests::{FixturePlugins, node_for_tests};
+    let Some(node) =
+        node_for_tests("persisted_queued_native_skill_is_denied_after_host_withdrawal")
+    else {
+        return;
+    };
+    let _home = crate::test_support::SealedHome::new();
+    let _policy = crate::plugins::activation::TestPolicyGuard::extension_host(true);
+    let fixture = FixturePlugins::new(&["skills-root"]).await;
+    let plugins = fixture.registry();
+    let manager = fixture.manager(node);
+    let _manager = crate::extension_host::TestManagerGuard::install(Arc::clone(&manager));
+    let engine = manager.attach(Arc::clone(&plugins));
+    engine.sync().await.unwrap();
+    let plugins = engine.plugin_view();
+    let catalog = crate::skills::discover_in_workspace_with_mode_and_plugins(
+        fixture.workspace(),
+        crate::skills::SkillDiscoveryMode::CodeWhaleOnly,
+        Some(&plugins),
+    );
+    let skill = catalog.get("skills-root:quick-check").unwrap();
+    let queued = QueuedMessage::new("finish the check".into(), Some(skill.body.clone()))
+        .with_skill_provenance(skill.source.provenance());
+    let serialized = serde_json::to_string(&queued_ui_to_session(&queued)).unwrap();
+    let restored =
+        queued_session_to_ui(serde_json::from_str::<QueuedSessionMessage>(&serialized).unwrap());
+    let mut app = create_test_app();
+    app.workspace = fixture.workspace().to_path_buf();
+    app.plugin_registry = Arc::clone(&plugins);
+    let mut git = crate::tui::git_mention::GitMentionCache::default();
+    assert!(
+        queued_message_content_for_app(&app, &restored, None, &mut git)
+            .unwrap()
+            .contains("Inspect the exact source")
+    );
+    manager.shutdown().await;
+    assert!(queued_message_content_for_app(&app, &restored, None, &mut git).is_err());
+}
+
+/// Extension shell/network cards remain human decisions under Full Access.
+/// Exercise the real stale-request and UI handler path, not only its resolver.
+#[tokio::test]
+async fn full_access_extension_calls_open_human_cards_despite_remembered_grants() {
+    for name in ["bash", "web_search"] {
+        let mut app = ask_posture_app();
+        app.approval_mode = ApprovalMode::Bypass;
+        app.is_loading = true;
+        let input = serde_json::json!({"command": "echo fixture"});
+        let (key, group) = crate::tools::approval_cache::extension_origin_approval_keys(
+            "ext:fixture@reviewed-hash",
+            None,
+            name,
+            &input,
+        );
+        app.approval_session_approved.insert(group.0.clone());
+        let mut mock = mock_engine_handle();
+        drain_approval_event(
+            &mut app,
+            &mock.handle,
+            EngineEvent::ApprovalRequired {
+                id: "extension-core-call".into(),
+                tool_name: name.into(),
+                description: "Requested by extension:fixture".into(),
+                input,
+                approval_key: key.0,
+                approval_grouping_key: group.0,
+                intent_summary: None,
+                approval_force_prompt: true,
+            },
+        )
+        .await;
+        assert_eq!(
+            app.view_stack.top_kind(),
+            Some(ModalKind::Approval),
+            "{name}"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                mock.recv_approval_decision(),
+            )
+            .await
+            .is_err(),
+            "the posture must not answer for the user: {name}"
+        );
+    }
+}
+
+#[test]
+fn extension_prompt_origin_keeps_denials_and_other_policy_holds() {
+    use crate::core::authority::ApprovalRequestDisposition as D;
+    let mut app = ask_posture_app();
+    app.approval_mode = ApprovalMode::Bypass;
+    let key = "extcall:ext:fixture@hash:shell:key";
+    app.approval_session_denied.insert(key.into());
+    assert_eq!(
+        resolve_ui_approval_disposition(&app, "bash", "group", key, true),
+        D::AutoDenySessionDenied
+    );
+    app.approval_session_denied.clear();
+    assert_eq!(
+        resolve_ui_approval_disposition(&app, "bash", "group", "model-key", true),
+        D::AutoDenyFullAccessPolicyHold
+    );
+    assert_eq!(
+        resolve_ui_approval_disposition(&app, "bash", "group", key, false),
+        D::AutoApprove
+    );
+    app.approval_mode = ApprovalMode::Auto;
+    assert_eq!(
+        resolve_ui_approval_disposition(&app, "bash", "group", key, true),
+        D::AutoDenyAutoReview
+    );
+    app.approval_mode = ApprovalMode::Never;
+    assert_eq!(
+        resolve_ui_approval_disposition(&app, "bash", "group", key, true),
+        D::AutoDenyNeverPosture
+    );
+}
+
+#[test]
+fn account_profile_fallback_notice_stays_in_the_transcript() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = App::new(create_test_options(), &Config::default());
+    let notice = app
+        .tr(MessageId::ProfileConstitutionUnavailableLocal)
+        .to_string();
+    let before = app.history.len();
+    assert!(super::event_loop::apply_engine_status(
+        &mut app,
+        notice.clone()
+    ));
+    assert!(!super::event_loop::apply_engine_status(
+        &mut app,
+        "Executing tools sequentially".into()
+    ));
+    assert_eq!(app.history.len(), before + 1);
+    assert!(matches!(&app.history[before], HistoryCell::System { content } if *content == notice));
+}
+
+#[test]
+fn engine_retry_status_receipts_survive_footer_overwrite_in_the_existing_transcript() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = App::new(create_test_options(), &Config::default());
+    let first = "Retry attempt: transport 1/2; upstream 503; waiting 0.00s";
+    let last = "Retry recovery: transport request recovered after 1 retries";
+    let before = app.history.len();
+    assert!(super::event_loop::apply_engine_status(
+        &mut app,
+        first.into()
+    ));
+    assert!(super::event_loop::apply_engine_status(
+        &mut app,
+        last.into()
+    ));
+    assert!(!super::event_loop::apply_engine_status(
+        &mut app,
+        "Executing tools sequentially".into()
+    ));
+    assert_eq!(app.history.len(), before + 2);
+    assert!(matches!(&app.history[before], HistoryCell::System { content } if content == first));
+    assert!(matches!(&app.history[before + 1], HistoryCell::System { content } if content == last));
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Executing tools sequentially")
+    );
+}
+
+#[test]
+fn engine_retry_receipt_projection_keeps_quiet_history_without_internal_status_rows() {
+    let _home = SettingsHomeGuard::new();
+    let config = Config {
+        notifications: Some(crate::config::NotificationsConfig {
+            quiet: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut app = App::new(create_test_options(), &config);
+    let before = app.history.len();
+    for status in [
+        "Continuing — next model step",
+        "Loaded deferred tool 'read'. Retry the call with its visible schema.",
+        "Goal set; starting goal work.",
+    ] {
+        assert!(!super::event_loop::apply_engine_status(
+            &mut app,
+            status.into()
+        ));
+    }
+    assert!(super::event_loop::apply_engine_status(
+        &mut app,
+        "Retry recovery: stream recovered after 1 retries".into()
+    ));
+    assert_eq!(app.history.len(), before + 1);
+}
+
+#[test]
+fn a_foreground_shell_wait_is_one_tool_card_not_also_a_background_job() {
+    use super::task_projection::project_shell_jobs;
+    use crate::tools::shell::ShellStatus;
+    let mut app = create_test_app();
+    app.current_session_id = Some("fg".into());
+    let mut foreground = shell_job("shell_fg", "ls | head -40", ShellStatus::Running, None);
+    foreground.background = false;
+    foreground.finished_at = None;
+    let mut entries = Vec::new();
+    project_shell_jobs(&mut app, &mut entries, std::slice::from_ref(&foreground));
+    assert!(entries.is_empty(), "{entries:?}");
+
+    // Ctrl+B detaches it into /jobs: now it is exactly one background job.
+    foreground.background = true;
+    project_shell_jobs(&mut app, &mut entries, &[foreground]);
+    assert_eq!(entries.len(), 1);
+}
+
+fn human_wait_test_app(running_tool: bool) -> App {
+    let mut app = create_test_app();
+    let started = Instant::now() - TOOL_HANG_WATCHDOG_TIMEOUT - Duration::from_secs(60);
+    app.is_loading = true;
+    app.runtime_turn_status = Some("in_progress".into());
+    app.turn_started_at = Some(started);
+    app.turn_last_activity_at = Some(started);
+    if running_tool {
+        let mut active = ActiveCell::new();
+        active.push_tool(
+            "human-wait-call",
+            HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+                name: "exec_shell".into(),
+                status: ToolStatus::Running,
+                input_summary: None,
+                output: None,
+                prompts: None,
+                spillover_path: None,
+                output_summary: None,
+                is_diff: false,
+            })),
+        );
+        app.active_cell = Some(active);
+    }
+    app
+}
+
+fn add_human_wait_approval(app: &mut App, id: &str) {
+    push_approval_request_view(
+        app,
+        id,
+        "exec_shell",
+        "Review this command",
+        &serde_json::json!({"command":"pwd"}),
+        "key",
+        "group",
+        None,
+        crate::config::ApprovalDefaultSelection::Deny,
+        None,
+    );
+}
+
+#[test]
+fn turn_liveness_keeps_buried_indefinite_approvals_alive_until_withdrawn() {
+    for running_tool in [false, true] {
+        let mut app = human_wait_test_app(running_tool);
+        add_human_wait_approval(&mut app, "human-wait-call");
+        app.view_stack.push(HelpView::default());
+        assert!(!reconcile_turn_liveness(&mut app, Instant::now(), false));
+        assert!(app.is_loading);
+        assert!(crate::tui::pending_requests::observe_engine_event(
+            &mut app,
+            &EngineEvent::ApprovalWithdrawn {
+                id: "human-wait-call".into()
+            }
+        ));
+        assert!(!app.view_stack.contains_approval_id("human-wait-call"));
+        assert!(reconcile_turn_liveness(&mut app, Instant::now(), false));
+    }
+}
+
+#[test]
+fn turn_liveness_keeps_elevation_alive_and_retires_its_exact_card() {
+    let mut app = human_wait_test_app(true);
+    app.view_stack
+        .push(crate::tui::approval::ElevationView::new(
+            crate::tui::approval::ElevationRequest::generic(
+                "human-wait-call",
+                "exec_shell",
+                "denied",
+            ),
+            app.ui_locale,
+        ));
+    app.view_stack.push(HelpView::default());
+    assert!(!reconcile_turn_liveness(&mut app, Instant::now(), false));
+    assert!(crate::tui::pending_requests::observe_engine_event(
+        &mut app,
+        &EngineEvent::ApprovalWithdrawn {
+            id: "human-wait-call".into()
+        }
+    ));
+    assert!(!app.view_stack.contains_kind(ModalKind::Elevation));
+    assert!(reconcile_turn_liveness(&mut app, Instant::now(), false));
+}
+
+#[test]
+fn turn_liveness_scopes_hidden_child_decisions_to_the_current_session() {
+    let id = "agent:child-wait:approval:boot:1";
+    for foreign in [false, true] {
+        let mut app = human_wait_test_app(true);
+        app.current_session_id = Some("current-session".into());
+        app.child_agent_sessions.insert(
+            "child-wait".into(),
+            if foreign {
+                "another-session"
+            } else {
+                "current-session"
+            }
+            .into(),
+        );
+        crate::tui::pending_requests::record(
+            &mut app,
+            id,
+            crate::tui::pending_requests::PendingChildRequest {
+                agent_id: "child-wait".into(),
+                tool_name: "exec_shell".into(),
+                description: "Review child command".into(),
+                input: serde_json::json!({"command":"pwd"}),
+                approval_key: "key".into(),
+                approval_grouping_key: "group".into(),
+                intent_summary: None,
+                requested_at: Instant::now(),
+            },
+        );
+        assert_eq!(
+            reconcile_turn_liveness(&mut app, Instant::now(), false),
+            foreign
+        );
+    }
+}
+
+#[test]
+fn human_decision_delivery_gives_work_a_new_window_without_disabling_recovery() {
+    let mut app = human_wait_test_app(true);
+    note_human_decision_delivered(&mut app, "human-wait-call");
+    let activity = app.turn_last_activity_at.expect("reply activity");
+    assert!(!reconcile_turn_liveness(&mut app, Instant::now(), false));
+    assert!(reconcile_turn_liveness(
+        &mut app,
+        activity + TOOL_HANG_WATCHDOG_TIMEOUT + Duration::from_secs(1),
+        false
+    ));
+}
+
+#[test]
+fn human_decision_from_another_session_does_not_refresh_this_turn() {
+    let mut app = human_wait_test_app(true);
+    let before = app.turn_last_activity_at;
+    app.current_session_id = Some("current-session".into());
+    app.child_agent_sessions
+        .insert("child-wait".into(), "another-session".into());
+    note_human_decision_delivered(&mut app, "agent:child-wait:approval:boot:1");
+    assert_eq!(app.turn_last_activity_at, before);
+}
+
+#[test]
+fn child_elevation_footer_tracks_the_visible_decision_without_initial_approval_authority() {
+    let mut app = human_wait_test_app(true);
+    let id = "agent:child-wait:approval:boot:1";
+    crate::tui::pending_requests::record(
+        &mut app,
+        id,
+        crate::tui::pending_requests::PendingChildRequest {
+            agent_id: "child-wait".into(),
+            tool_name: "exec_shell".into(),
+            description: "Review child command".into(),
+            input: serde_json::json!({"command": "pwd"}),
+            approval_key: "key".into(),
+            approval_grouping_key: "group".into(),
+            intent_summary: None,
+            requested_at: Instant::now(),
+        },
+    );
+    assert_eq!(crate::tui::pending_requests::footer_rows(&app).len(), 1);
+    app.view_stack
+        .push(crate::tui::approval::ElevationView::new(
+            crate::tui::approval::ElevationRequest::generic(id, "exec_shell", "denied"),
+            app.ui_locale,
+        ));
+    assert_eq!(app.view_stack.top_approval_id(), None);
+    assert!(crate::tui::pending_requests::footer_rows(&app).is_empty());
+    add_human_wait_approval(&mut app, "other-decision");
+    assert_eq!(crate::tui::pending_requests::footer_rows(&app).len(), 1);
+    crate::tui::pending_requests::retire(&mut app, id);
+    assert!(crate::tui::pending_requests::footer_rows(&app).is_empty());
+    assert!(app.view_stack.contains_approval_id("other-decision"));
+}
+
+#[test]
+fn ended_parent_turn_retires_approvals_and_elevations_but_keeps_child_requests() {
+    let mut app = human_wait_test_app(true);
+    add_human_wait_approval(&mut app, "parent-card");
+    add_human_wait_approval(&mut app, "agent:child-wait:approval:boot:1");
+    app.view_stack
+        .push(crate::tui::approval::ElevationView::new(
+            crate::tui::approval::ElevationRequest::generic(
+                "parent-elevation",
+                "exec_shell",
+                "denied",
+            ),
+            app.ui_locale,
+        ));
+    assert!(app.view_stack.contains_tool_decision_id("parent-elevation"));
+    assert!(!app.view_stack.contains_approval_id("parent-elevation"));
+    settle_pending_human_requests(&mut app);
+    assert!(!app.view_stack.contains_approval_id("parent-card"));
+    assert!(!app.view_stack.contains_tool_decision_id("parent-elevation"));
+    assert!(
+        app.view_stack
+            .contains_approval_id("agent:child-wait:approval:boot:1")
+    );
 }

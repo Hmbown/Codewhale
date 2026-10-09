@@ -1,6 +1,6 @@
 //! Process-level telemetry contract.
 //!
-//! Everything here drives the real `codewhale-tui` binary inside a sealed
+//! Everything here drives the real `codewhale` binary inside a sealed
 //! `HOME`/`CODEWHALE_HOME`, with a loopback recorder standing in for the
 //! telemetry endpoint. The unit tests in `codewhale-telemetry` prove the
 //! predicate; these prove that the *emitting process* consults it — which is
@@ -133,7 +133,7 @@ impl Fixture {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(codewhale_tui_binary());
+        let mut command = Command::new(crate::binary::codewhale());
         command
             .current_dir(&self.workspace)
             .env_clear()
@@ -165,21 +165,22 @@ impl Fixture {
     /// The cheapest subcommand that still traverses the whole telemetry
     /// lifecycle: arm, `session_start`, dispatch, `session_end`, bounded local
     /// persistence. Verbose logging exposes the actual persistence outcome.
-    /// `completions` loads no config of its own, so its telemetry state cannot
-    /// be confused with subcommand-owned state.
-    fn run_completions(&self) -> Output {
+    /// The read-only `config telemetry` query traverses the shared command
+    /// lifecycle without provider, MCP, or model execution. Structural Doctor
+    /// deliberately has no telemetry lifecycle or persistence side effects.
+    fn run_short_command(&self) -> Output {
         let mut command = self.command();
         command.args([
             "--verbose",
             "--config",
             self.config_path.to_str().expect("config path"),
-            "completions",
-            "bash",
+            "config",
+            "telemetry",
         ]);
-        let output = command.output().expect("run codewhale-tui completions");
+        let output = command.output().expect("run codewhale config telemetry");
         assert!(
             output.status.success(),
-            "completions failed\nstdout:\n{}\nstderr:\n{}",
+            "config telemetry failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -214,22 +215,6 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
             _ => {}
         }
     }
-}
-
-fn codewhale_tui_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
-    path
 }
 
 // ── Recorder ─────────────────────────────────────────────────────────────
@@ -361,7 +346,7 @@ async fn current_explicit_consent_buffers_one_complete_session_without_network()
 
     fixture.write_config("telemetry = true\n");
     fixture.record_notice(true);
-    let output = fixture.run_completions();
+    let output = fixture.run_short_command();
 
     assert_short_cli_persistence_without_network(
         &fixture,
@@ -377,7 +362,7 @@ async fn default_on_reports_local_persistence_without_network() {
     let server = start_recorder().await;
     let fixture = Fixture::new().with_endpoint(&server.uri());
 
-    let output = fixture.run_completions();
+    let output = fixture.run_short_command();
 
     assert_short_cli_persistence_without_network(
         &fixture,
@@ -457,7 +442,7 @@ async fn config_file_only_opt_out_sends_zero_requests() {
     fixture.write_config("telemetry = false\n");
     fixture.record_notice(true);
 
-    let output = fixture.run_completions();
+    let output = fixture.run_short_command();
     assert!(output.status.success());
 
     assert_no_batches(&server, "`telemetry = false` in the config file").await;
@@ -480,11 +465,10 @@ async fn telemetry_disabled_by_env_sends_zero_requests() {
         .args([
             "--config",
             fixture.config_path.to_str().expect("config path"),
-            "completions",
-            "bash",
+            "doctor",
         ])
         .output()
-        .expect("run codewhale-tui completions");
+        .expect("run codewhale doctor");
 
     assert_no_batches(&server, "`CODEWHALE_TELEMETRY=0`").await;
     assert!(
@@ -508,11 +492,10 @@ async fn an_unparseable_telemetry_env_value_sends_zero_requests() {
         .args([
             "--config",
             fixture.config_path.to_str().expect("config path"),
-            "completions",
-            "bash",
+            "doctor",
         ])
         .output()
-        .expect("run codewhale-tui completions");
+        .expect("run codewhale doctor");
 
     assert_no_batches(&server, "`CODEWHALE_TELEMETRY=maybe`").await;
     assert!(
@@ -528,7 +511,7 @@ async fn telemetry_defaults_on_without_notice_buffers_a_complete_session() {
     let fixture = Fixture::new().with_endpoint(&server.uri());
     // Deliberately no `record_notice`.
 
-    let output = fixture.run_completions();
+    let output = fixture.run_short_command();
 
     assert_short_cli_persistence_without_network(&fixture, &server, &output, "default-on usage")
         .await;
@@ -552,7 +535,7 @@ async fn a_stale_accepted_notice_remains_on_without_synthesizing_current_accepta
         .save_to(&fixture.setup_state_path())
         .expect("write setup state");
 
-    let output = fixture.run_completions();
+    let output = fixture.run_short_command();
 
     assert_short_cli_persistence_without_network(&fixture, &server, &output, "default-on usage")
         .await;
@@ -577,7 +560,7 @@ async fn disabling_after_buffering_wipes_and_sends_nothing() {
     fixture.write_config("telemetry = false\n");
     fixture.record_notice(true);
 
-    fixture.run_completions();
+    fixture.run_short_command();
 
     assert_no_batches(&server, "an explicit opt-out with a populated buffer").await;
     assert!(
@@ -615,11 +598,10 @@ async fn forced_off_run_preserves_a_consenting_users_state() {
         .args([
             "--config",
             fixture.config_path.to_str().expect("config path"),
-            "completions",
-            "bash",
+            "doctor",
         ])
         .output()
-        .expect("run codewhale-tui completions");
+        .expect("run codewhale doctor");
 
     assert_no_batches(&server, "a forced-off run").await;
     assert_eq!(
@@ -654,11 +636,10 @@ async fn a_run_scoped_kill_switch_preserves_a_consenting_users_state() {
             .args([
                 "--config",
                 fixture.config_path.to_str().expect("config path"),
-                "completions",
-                "bash",
+                "doctor",
             ])
             .output()
-            .expect("run codewhale-tui completions");
+            .expect("run codewhale doctor");
 
         assert_no_batches(&server, "a run-scoped kill switch").await;
         assert!(
@@ -675,7 +656,7 @@ async fn a_run_scoped_kill_switch_preserves_a_consenting_users_state() {
     // And the persistent switch still is the destructive one, on the same
     // home, so the two are not merely both no-ops here.
     fixture.write_config("telemetry = false\n");
-    fixture.run_completions();
+    fixture.run_short_command();
     assert!(
         root.join("disabled").exists(),
         "the config-file opt-out must still wipe and tombstone"
@@ -693,7 +674,7 @@ async fn a_disabled_run_creates_no_telemetry_directory() {
     fixture.write_config("telemetry = false\n");
     fixture.record_notice(false);
 
-    fixture.run_completions();
+    fixture.run_short_command();
 
     assert_no_batches(&server, "a declined run").await;
     assert!(
@@ -721,11 +702,11 @@ async fn skip_onboarding_writes_no_telemetry_decision() {
             "--config",
             fixture.config_path.to_str().expect("config path"),
             "--skip-onboarding",
-            "completions",
-            "bash",
+            "config",
+            "telemetry",
         ])
         .output()
-        .expect("run codewhale-tui completions");
+        .expect("run short telemetry config command");
     assert!(output.status.success());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -860,7 +841,7 @@ async fn a_hostile_buffer_line_never_reaches_a_batch() {
     plant_sentinels(&fixture, &server.uri());
 
     let mut command = exec_command(&fixture, "hello");
-    let mut child = command.spawn().expect("spawn codewhale-tui exec");
+    let mut child = command.spawn().expect("spawn codewhale exec");
     let stdout = read_in_background(child.stdout.take().expect("stdout pipe"));
     let stderr = read_in_background(child.stderr.take().expect("stderr pipe"));
 
@@ -895,8 +876,8 @@ async fn a_hostile_buffer_line_never_reaches_a_batch() {
 
     let status = child
         .wait_timeout(EXEC_TIMEOUT)
-        .expect("wait for codewhale-tui exec")
-        .expect("codewhale-tui exec must exit");
+        .expect("wait for codewhale exec")
+        .expect("codewhale exec must exit");
     let output = Output {
         status,
         stdout: stdout.join().expect("stdout reader"),
@@ -941,7 +922,7 @@ async fn mid_session_opt_out_stops_the_shutdown_flush() {
     plant_sentinels(&fixture, &server.uri());
 
     let mut command = exec_command(&fixture, "hello");
-    let mut child = command.spawn().expect("spawn codewhale-tui exec");
+    let mut child = command.spawn().expect("spawn codewhale exec");
     let stdout = read_in_background(child.stdout.take().expect("stdout pipe"));
     let stderr = read_in_background(child.stderr.take().expect("stderr pipe"));
 
@@ -963,8 +944,8 @@ async fn mid_session_opt_out_stops_the_shutdown_flush() {
 
     let status = child
         .wait_timeout(EXEC_TIMEOUT)
-        .expect("wait for codewhale-tui exec")
-        .expect("codewhale-tui exec must exit");
+        .expect("wait for codewhale exec")
+        .expect("codewhale exec must exit");
     let output = Output {
         status,
         stdout: stdout.join().expect("stdout reader"),
@@ -993,7 +974,7 @@ async fn ctrl_c_exits_while_a_second_process_holds_the_lock() {
     plant_sentinels(&fixture, &server.uri());
 
     let mut command = exec_command(&fixture, "hello");
-    let mut child = command.spawn().expect("spawn codewhale-tui exec");
+    let mut child = command.spawn().expect("spawn codewhale exec");
 
     let root = fixture.telemetry_root();
     let lock_path = root.join("buffer.jsonl.lock");
@@ -1014,7 +995,7 @@ async fn ctrl_c_exits_while_a_second_process_holds_the_lock() {
     let started = Instant::now();
     let status = child
         .wait_timeout(Duration::from_secs(10))
-        .expect("wait for codewhale-tui exec");
+        .expect("wait for codewhale exec");
     let status = status.unwrap_or_else(|| {
         let _ = child.kill();
         panic!(
@@ -1209,14 +1190,14 @@ fn exec_command(fixture: &Fixture, prompt: &str) -> Command {
 
 fn run_exec(fixture: &Fixture, prompt: &str) -> Output {
     let mut command = exec_command(fixture, prompt);
-    let mut child = command.spawn().expect("spawn codewhale-tui exec");
+    let mut child = command.spawn().expect("spawn codewhale exec");
     let stdout = read_in_background(child.stdout.take().expect("stdout pipe"));
     let stderr = read_in_background(child.stderr.take().expect("stderr pipe"));
     let status = match child.wait_timeout(EXEC_TIMEOUT).expect("wait for exec") {
         Some(status) => status,
         None => {
             let _ = child.kill();
-            panic!("codewhale-tui exec did not exit within {EXEC_TIMEOUT:?}");
+            panic!("codewhale exec did not exit within {EXEC_TIMEOUT:?}");
         }
     };
     Output {

@@ -21,22 +21,11 @@ import {
   splitMessage,
   compactRuntimeError,
   latestRunningTurn,
-  activeTurnBlock,
   helpText,
   processUpdateBatch,
 } from "./lib.mjs";
 import { renderQrToText } from "./qr.mjs";
 import { ThreadStore as CoreThreadStore, writeFileDurable, ApprovalOwnershipError, decideApproval as decideRuntimeApproval } from "../../bridge-core/src/lib.mjs";
-
-// ============================================================================
-// ThreadStore — JSON 文件持久化（与 feishu/telegram/wechat bridge 一致）
-// ============================================================================
-
-class ThreadStore extends CoreThreadStore {
-  constructor(filePath) {
-    super(filePath, { messageLimit: 500 });
-  }
-}
 
 // ============================================================================
 // 账号持久化
@@ -204,20 +193,23 @@ async function readJsonSafe(response) {
 
 async function runtimeJson(subPath, { method = "GET", body = null, auth = true } = {}) {
   const url = `${config.runtimeUrl}${subPath}`;
-  const options = { method, headers: auth ? authHeaders() : {} };
+  const options = { method, headers: auth ? authHeaders() : {}, signal: AbortSignal.timeout(10000) };
   if (body) options.body = JSON.stringify(body);
   const response = await fetch(url, options);
   const result = await readJsonSafe(response);
   if (!response.ok) {
-    throw new Error(compactRuntimeError(response.status, result));
+    const error = new Error(compactRuntimeError(response.status, result));
+    error.status = response.status;
+    throw error;
   }
   return result;
 }
 
 async function* readSse(response) {
   let buffer = "";
+  const decoder = new TextDecoder();
   for await (const chunk of response.body) {
-    buffer += new TextDecoder().decode(chunk, { stream: true });
+    buffer += decoder.decode(chunk, { stream: true });
     const lines = buffer.split("\n");
     buffer = lines.pop() || "";
     for (const line of lines) {
@@ -238,20 +230,19 @@ async function* readSse(response) {
 // 消息发送 — 通过 iLink sendMessage
 // ============================================================================
 
-async function sendText(chatId, text) {
+async function sendText(chatId, text, { clientId } = {}) {
   if (!botAccount) {
-    console.error("sendText: bot not logged in");
-    return;
+    throw new Error("Bot account unavailable");
   }
   const chunks = splitMessage(text, config.maxReplyChars);
-  for (const chunk of chunks) {
+  for (const [index, chunk] of chunks.entries()) {
     await sendMessage({
       baseUrl: botAccount.baseUrl,
       token: botAccount.token,
       body: {
         msg: {
           to_user_id: chatId,
-          client_id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+          client_id: clientId ? `${clientId}-${index}` : crypto.randomUUID(),
           message_type: 2, // BOT
           message_state: 2, // FINISH
           item_list: [{ type: 1, text_item: { text: chunk } }],
@@ -264,14 +255,18 @@ async function sendText(chatId, text) {
 
 async function getContextToken(chatId) {
   const state = await threadStore.getChat(chatId);
-  return state?.contextToken || undefined;
+  // Legacy tokens without an account identity are ambiguous; the next inbound
+  // message stores a fresh token bound to the active bot account.
+  return state?.contextTokenAccountId === accountIdentity()
+    ? state.contextToken || undefined
+    : undefined;
 }
 
 // ============================================================================
 // 命令处理（与 feishu/telegram/wechat bridge 一致）
 // ============================================================================
 
-async function handleCommand(chatId, command) {
+async function handleCommand(chatId, command, inbound = {}) {
   const action = commandAction(command);
   switch (action.kind) {
     case "help":
@@ -284,8 +279,18 @@ async function handleCommand(chatId, command) {
       await sendThreads(chatId);
       return;
     case "new_thread": {
-      const state = await ensureThread(chatId, { forceNew: true });
-      await sendText(chatId, `Created thread ${state.threadId}`);
+      try {
+        const state = await ensureThread(chatId, { forceNew: true });
+        if (inbound.contextToken) {
+          await threadStore.patchChat(chatId, {
+            contextToken: inbound.contextToken,
+            contextTokenAccountId: accountIdentity(),
+          });
+        }
+        await sendText(chatId, `Created thread ${state.threadId}`);
+      } catch (error) {
+        await sendText(chatId, `New conversation failed: ${error.message}`);
+      }
       return;
     }
     case "resume":
@@ -304,22 +309,43 @@ async function handleCommand(chatId, command) {
       await setChatModel(chatId, action.modelName);
       return;
     case "prompt":
-      await runPrompt(chatId, action.prompt);
+      await runPrompt(chatId, action.prompt, inbound);
       return;
     default:
       await sendText(chatId, helpText());
   }
 }
 
-async function ensureThread(chatId, { forceNew = false } = {}) {
-  const existing = await threadStore.getChat(chatId);
-  if (existing?.threadId && !forceNew) return existing;
+async function ensureThread(chatId, { forceNew = false, threadRequest } = {}) {
+  let existing = await threadStore.getChat(chatId);
+  const previousAccounts = new Set([existing?.bindingAccountId, existing?.pendingAdmission?.accountId, existing?.turnDelivery?.accountId].filter(Boolean));
+  const replacingAccount = forceNew && previousAccounts.size === 1 && !previousAccounts.has(accountIdentity());
+  if (forceNew && hasPendingWork(existing) && !replacingAccount) throw new Error("This chat still has a pending turn or retained reply. Use /status first.");
+  if (existing?.threadId && !forceNew) {
+    if (existing.bindingAccountId !== accountIdentity()) throw new Error("This thread belongs to another or unverified bot account. Use /new to create an explicit binding.");
+    return existing;
+  }
+
+  if (replacingAccount) {
+    // Explicit /new retires the previous account's private receipt before any
+    // new side effect. It remains in this store, outside automatic recovery.
+    const { retiredAccountStates = {}, ...retired } = existing;
+    const receipt = crypto.createHash("sha256").update(JSON.stringify(retired)).digest("hex");
+    const retained = { ...retiredAccountStates, [receipt]: retired };
+    // Fail before creating a new thread; never evict an uncertain submission
+    // or reply merely to make room. Existing over-limit stores remain intact.
+    if (Object.keys(retained).length > threadStore.options.actionLimit || Buffer.byteLength(JSON.stringify(retained), "utf8") > 1024 * 1024) {
+      throw new Error("Retired account receipt storage is full. Ask the local operator to stop the bridge, back up thread-map.json, and reconcile retiredAccountStates before retrying /new.");
+    }
+    await threadStore.patchChat(chatId, { retiredAccountStates: retained });
+    existing = await threadStore.getChat(chatId);
+  }
 
   const effectiveModel = existing?.model || config.model;
 
   const thread = await runtimeJson("/v1/threads", {
     method: "POST",
-    body: {
+    body: threadRequest || {
       model: effectiveModel,
       workspace: config.workspace,
       mode: config.mode,
@@ -333,8 +359,12 @@ async function ensureThread(chatId, { forceNew = false } = {}) {
   });
 
   const state = {
-    ...preservedChatStateFields(existing),
+    ...preservedChatStateFields(existing, replacingAccount
+      ? ["model", "retiredAccountStates"]
+      : ["model", "authorizedIdentity", "contextToken", "contextTokenAccountId", "pendingAdmission", "retiredAccountStates"]),
+    threadBindings: [...threadBindings(chatId, existing), { threadId: thread.id, accountId: accountIdentity(), actorId: turnActor(chatId) }].slice(-threadStore.options.actionLimit),
     threadId: thread.id,
+    bindingAccountId: accountIdentity(),
     lastSeq: 0,
     activeTurnId: null,
     updatedAt: new Date().toISOString(),
@@ -343,193 +373,280 @@ async function ensureThread(chatId, { forceNew = false } = {}) {
   return state;
 }
 
-function turnActor(chatId) {
-  return chatId ? `weixin-user:${chatId}` : "";
+function accountIdentity() {
+  return typeof botAccount?.accountId === "string" ? botAccount.accountId.trim() : "";
 }
 
-async function runPrompt(chatId, prompt) {
-  if (!prompt.trim()) {
-    await sendText(chatId, helpText());
-    return;
+function turnActor(chatId) {
+  return accountIdentity() && chatId ? `weixin-account:${accountIdentity()}:user:${chatId}` : "";
+}
+
+function threadBindings(chatId, state) {
+  const bindings = (Array.isArray(state?.threadBindings) ? state.threadBindings : []).filter((entry) => entry?.threadId && entry.accountId && entry.actorId);
+  if (state?.threadId && state.bindingAccountId) {
+    const current = { threadId: state.threadId, accountId: state.bindingAccountId, actorId: `weixin-account:${state.bindingAccountId}:user:${chatId}` };
+    if (!bindings.some((entry) => entry.threadId === current.threadId && entry.accountId === current.accountId && entry.actorId === current.actorId)) bindings.push(current);
   }
-  const state = await ensureThread(chatId);
-  const effectiveModel = state?.model || config.model;
-  const detail = await runtimeJson(
-    `/v1/threads/${encodeURIComponent(state.threadId)}`
-  );
-  const activeBlock = activeTurnBlock(detail, state);
-  if (activeBlock) {
-    await threadStore.patchChat(chatId, {
-      activeTurnId: activeBlock.turnId,
-      updatedAt: new Date().toISOString(),
-    });
-    await sendText(chatId, activeBlock.message);
-    return;
+  return bindings.slice(-threadStore.options.actionLimit);
+}
+
+function ownsThread(chatId, state, threadId) {
+  return threadBindings(chatId, state).some((entry) => entry.threadId === threadId && entry.accountId === accountIdentity() && entry.actorId === turnActor(chatId));
+}
+
+function inboundKey(msg) {
+  const id = msg.message_id;
+  if (!accountIdentity() || !msg.from_user_id || id === undefined || id === null || String(id).trim() === "") return null;
+  return JSON.stringify([accountIdentity(), msg.from_user_id, String(id)]);
+}
+
+function hasPendingWork(state) {
+  return Boolean(state?.pendingAdmission || state?.activeTurnId || state?.turnDelivery?.outputs?.some((entry) => entry.status !== "accepted"));
+}
+
+function ownsRecovery(chatId, state) {
+  const pending = state?.pendingAdmission || state?.turnDelivery;
+  return pending?.accountId === accountIdentity() && pending?.actorId === turnActor(chatId) && isAllowed(chatId);
+}
+
+function supportsAdmissionRecovery() {
+  return runtimeCapabilities.turn_operation_idempotency === true && runtimeCapabilities.turn_operation_lookup === true;
+}
+
+async function runPrompt(chatId, prompt, { messageKey } = {}) {
+  if (!prompt.trim()) return sendText(chatId, helpText());
+  const current = await threadStore.getChat(chatId);
+  if (hasPendingWork(current)) {
+    startChatRecovery(chatId);
+    return sendText(chatId, "This chat has a pending turn or retained reply. Use /status or /interrupt.");
   }
-  if (state.activeTurnId) {
+  if (current?.threadId && current.bindingAccountId !== accountIdentity()) return sendText(chatId, "This conversation belongs to another or unverified bot account. Use /new to create a new conversation.");
+  if (!messageKey || !turnActor(chatId)) throw new Error("A stable incoming message identity is required.");
+  const request = {
+    prompt, input_summary: prompt.slice(0, 200), model: current?.model || config.model,
+    mode: config.mode, allow_shell: config.allowShell, trust_mode: config.trustMode, auto_approve: config.autoApprove,
+  };
+  // Retain the frozen request before any admission side effect or poll acknowledgement.
+  const operationKey = supportsAdmissionRecovery() ? crypto.createHash("sha256").update(messageKey).digest("hex") : null;
+  if (operationKey) request.operation_key = operationKey;
+  await threadStore.patchChat(chatId, { pendingAdmission: {
+    accountId: accountIdentity(), actorId: turnActor(chatId), messageKey, request, operationKey,
+    threadId: current?.threadId || null, submitted: false, sinceSeq: null,
+    threadRequest: { model: request.model, workspace: config.workspace, mode: request.mode, allow_shell: request.allow_shell,
+      trust_mode: request.trust_mode, auto_approve: request.auto_approve, archived: false,
+      system_prompt: "You are being controlled from a WeChat phone chat via iLink Bot. Keep status updates concise. Ask for tool approvals when needed; do not assume mobile messages imply blanket approval." },
+  } });
+  startChatRecovery(chatId);
+}
+
+async function reconcileAdmission(chatId) {
+  let state = await threadStore.getChat(chatId);
+  let pending = state?.pendingAdmission;
+  if (!pending || !ownsRecovery(chatId, state)) return;
+  if (!pending.threadId) {
+    const thread = await ensureThread(chatId, { threadRequest: pending.threadRequest });
+    // ensureThread replaces chat state only for a new thread; retain the admission.
+    pending = { ...pending, threadId: thread.threadId };
+    await threadStore.patchChat(chatId, { pendingAdmission: pending });
+  }
+  if (pending.sinceSeq === null) {
+    const detail = await runtimeJson(`/v1/threads/${encodeURIComponent(pending.threadId)}`);
+    if (latestRunningTurn(detail)) {
+      await threadStore.patchChat(chatId, { pendingAdmission: { ...pending, blocked: true } });
+      return;
+    }
+    pending = { ...pending, sinceSeq: Number(detail.latest_seq || 0), blocked: false };
+    await threadStore.patchChat(chatId, { pendingAdmission: pending });
+  }
+  let turn;
+  if (pending.submitted) {
+    if (!pending.operationKey || !supportsAdmissionRecovery()) return;
+    try {
+      turn = await runtimeJson(`/v1/threads/${encodeURIComponent(pending.threadId)}/turn-operations/${encodeURIComponent(pending.operationKey)}`);
+    } catch (error) {
+      // 409 is an incomplete durable admission, not permission to create another turn.
+      if (error.status !== 404) throw error;
+    }
+  }
+  if (!turn) {
+    pending = { ...pending, submitted: true };
+    await threadStore.patchChat(chatId, { pendingAdmission: pending });
+    const result = await runtimeJson(`/v1/threads/${encodeURIComponent(pending.threadId)}/turns`, { method: "POST", body: pending.request });
+    turn = result?.turn;
+  }
+  if (!turn?.id || turn.thread_id !== pending.threadId) throw new Error("Invalid Engine admission receipt");
+  await threadStore.recordTurnOrigin(chatId, pending.threadId, turn.id, pending.actorId);
+  await threadStore.patchChat(chatId, {
+    pendingAdmission: null, activeTurnId: turn.id, lastSeq: pending.sinceSeq,
+    turnDelivery: { accountId: pending.accountId, actorId: pending.actorId, threadId: pending.threadId,
+      turnId: turn.id, messageKey: pending.messageKey, nextSeq: pending.sinceSeq, responseText: "", outputs: [], terminal: false },
+  });
+}
+
+function queueOutput(delivery, key, text) {
+  if (!text || delivery.outputs.some((entry) => entry.key === key)) return;
+  // Persist one independently acknowledged chunk per API call. A stable client ID
+  // helps reconciliation but iLink does not promise exactly-once recipient delivery.
+  for (const [index, chunk] of splitMessage(text, config.maxReplyChars).entries()) {
+    const chunkKey = `${key}:${index}`;
+    if (delivery.outputs.some((entry) => entry.key === chunkKey)) continue;
+    delivery.outputs.push({ key: chunkKey, text: chunk, status: "queued",
+      clientId: crypto.createHash("sha256").update(`${delivery.accountId}:${delivery.turnId}:${chunkKey}`).digest("hex") });
+  }
+}
+
+function finishDelivery(delivery, status) {
+  if (delivery.terminal) return;
+  delivery.terminal = true;
+  delivery.status = status;
+  const text = delivery.responseText.trim();
+  queueOutput(delivery, "result", [text, status !== "completed" ? `Turn ${status}.` : (!text ? "Turn completed." : "")].filter(Boolean).join("\n\n"));
+}
+
+async function saveDelivery(chatId, delivery) {
+  await threadStore.patchChat(chatId, { turnDelivery: delivery, lastSeq: delivery.nextSeq });
+}
+
+async function flushOutputs(chatId) {
+  let state = await threadStore.getChat(chatId);
+  if (!state?.turnDelivery || !ownsRecovery(chatId, state)) return;
+  let delivery = structuredClone(state.turnDelivery);
+  if (threadStore.turnOrigin(chatId, delivery.threadId, delivery.turnId)?.actorId !== delivery.actorId) return;
+  for (const entry of delivery.outputs) {
+    if (entry.status === "accepted" || entry.status === "uncertain") continue;
+    if (entry.status === "sending") {
+      entry.status = "uncertain";
+      await saveDelivery(chatId, delivery);
+      continue;
+    }
+    entry.status = "sending";
+    await saveDelivery(chatId, delivery);
+    try {
+      await sendText(chatId, entry.text, { clientId: entry.clientId });
+      entry.status = "accepted";
+    } catch (error) {
+      entry.status = error.deliveryStatus === "rejected" ? "queued" : "uncertain";
+      await saveDelivery(chatId, delivery);
+      return;
+    }
+    await saveDelivery(chatId, delivery);
+  }
+  if (delivery.terminal && delivery.outputs.every((entry) => entry.status === "accepted")) {
     await threadStore.patchChat(chatId, { activeTurnId: null });
   }
-  const sinceSeq = Number(detail.latest_seq || state.lastSeq || 0);
-
-  const turnResponse = await runtimeJson(
-    `/v1/threads/${encodeURIComponent(state.threadId)}/turns`,
-    {
-      method: "POST",
-      body: {
-        prompt,
-        input_summary: prompt.slice(0, 200),
-        model: effectiveModel,
-        mode: config.mode,
-        allow_shell: config.allowShell,
-        trust_mode: config.trustMode,
-        auto_approve: config.autoApprove,
-      },
-    }
-  );
-
-  const turnId = turnResponse.turn?.id;
-  // A turn the Runtime accepted keeps streaming even when its origin cannot be
-  // recorded; its approvals then fail closed and are decided from the TUI.
-  if (turnId && turnActor(chatId)) {
-    await threadStore.recordTurnOrigin(chatId, state.threadId, turnId, turnActor(chatId));
-  }
-  await threadStore.patchChat(chatId, {
-    activeTurnId: turnId || null,
-    lastSeq: sinceSeq,
-    updatedAt: new Date().toISOString(),
-  });
-  await sendText(chatId, `Started turn ${turnId || "(unknown)"}`);
-
-  try {
-    await streamTurnEvents(chatId, state.threadId, turnId, sinceSeq);
-  } finally {
-    await threadStore.patchChat(chatId, {
-      activeTurnId: null,
-      updatedAt: new Date().toISOString(),
-    });
-  }
 }
 
-async function streamTurnEvents(chatId, threadId, turnId, sinceSeq) {
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    config.turnTimeoutMs
-  );
-  let responseText = "";
-  let latestSeq = sinceSeq;
-  let sentProgressAt = Date.now();
+function approvalText(approval) {
+  const id = approval.approval_id || approval.id;
+  return ["Approval required", `tool=${approval.tool_name || "unknown"}`, id ? `approval_id=${id}` : "",
+    approval.description || "", id ? `Reply /allow ${id} or /deny ${id}` : "Use the terminal to decide this approval."].filter(Boolean).join("\n");
+}
 
+async function reconcileSnapshot(chatId) {
+  const state = await threadStore.getChat(chatId);
+  if (!state?.turnDelivery || !ownsRecovery(chatId, state)) return;
+  const delivery = structuredClone(state.turnDelivery);
+  const detail = await runtimeJson(`/v1/threads/${encodeURIComponent(delivery.threadId)}`);
+  const turn = detail.turns?.find((entry) => entry.id === delivery.turnId && entry.thread_id === delivery.threadId);
+  if (!turn) throw new Error("Accepted Engine turn is unavailable");
+  const items = (detail.items || []).filter((item) => item.turn_id === delivery.turnId && item.kind === "agent_message");
+  if (items.some((item) => typeof item.detail !== "string")) throw new Error("Engine snapshot lacks full assistant output");
+  if (items.length) delivery.responseText = items.map((item) => item.detail).join("\n\n");
+  delivery.nextSeq = Math.max(delivery.nextSeq, Number(detail.latest_seq || 0));
+  for (const approval of detail.pending_approvals || []) {
+    if (approval.turn_id === delivery.turnId) queueOutput(delivery, `approval:${approval.approval_id || approval.id}`, approvalText(approval));
+  }
+  if (["completed", "failed", "canceled", "interrupted"].includes(turn.status)) finishDelivery(delivery, turn.status);
+  await saveDelivery(chatId, delivery);
+}
+
+async function streamTurnEvents(chatId, controller) {
+  let state = await threadStore.getChat(chatId);
+  const delivery = structuredClone(state.turnDelivery);
+  // Bound headers and streaming together; this never interrupts the Engine turn.
+  const timeout = setTimeout(() => controller.abort(), config.turnTimeoutMs);
   try {
-    const response = await fetch(
-      `${config.runtimeUrl}/v1/threads/${encodeURIComponent(threadId)}/events?since_seq=${sinceSeq}`,
-      {
-        headers: authHeaders(),
-        signal: controller.signal,
-      }
-    );
-    if (!response.ok) {
-      const body = await readJsonSafe(response);
-      throw new Error(compactRuntimeError(response.status, body));
-    }
-
+    const response = await fetch(`${config.runtimeUrl}/v1/threads/${encodeURIComponent(delivery.threadId)}/events?since_seq=${delivery.nextSeq}`,
+      { headers: authHeaders(), signal: controller.signal });
+    if (!response.ok) throw new Error("Engine event observation unavailable");
     for await (const event of readSse(response)) {
       if (!event.data) continue;
       const record = JSON.parse(event.data);
-      latestSeq = Math.max(latestSeq, Number(record.seq || 0));
-      await threadStore.patchChat(chatId, { lastSeq: latestSeq });
-
-      if (turnId && record.turn_id && record.turn_id !== turnId) continue;
-
-      if (
-        record.event === "item.delta" &&
-        record.payload?.kind === "agent_message"
-      ) {
-        responseText += record.payload.delta || "";
-        const now = Date.now();
-        if (
-          responseText.length > config.maxReplyChars &&
-          now - sentProgressAt > 15000
-        ) {
-          await sendText(chatId, responseText.slice(0, config.maxReplyChars));
-          responseText = responseText.slice(config.maxReplyChars);
-          sentProgressAt = now;
-        }
+      if (record.event === "stream.end") {
+        if (record.payload?.retryable === false || record.retryable === false) return false;
+        break;
       }
-
-      if (record.event === "approval.required") {
-        const approval = record.payload || {};
-        const approvalId = approval.approval_id || approval.id;
-        if (!approvalId) {
-          await sendText(
-            chatId,
-            [
-              "Approval required",
-              `tool=${approval.tool_name || "unknown"}`,
-              approval.description || "",
-              "",
-              "No approval_id was provided by the runtime; use /status and retry from the TUI.",
-            ]
-              .filter(Boolean)
-              .join("\n")
-          );
-        } else {
-          await sendText(
-            chatId,
-            [
-              "Approval required",
-              `tool=${approval.tool_name || "unknown"}`,
-              `approval_id=${approvalId}`,
-              approval.description || "",
-              "",
-              `Reply /allow ${approvalId} or /deny ${approvalId}`,
-            ]
-              .filter(Boolean)
-              .join("\n")
-          );
+      const seq = Number(record.seq || 0);
+      if (seq <= delivery.nextSeq) continue;
+      delivery.nextSeq = seq;
+      if (record.turn_id === delivery.turnId) {
+        if (record.event === "item.delta" && record.payload?.kind === "agent_message") delivery.responseText += record.payload.delta || "";
+        if (record.event === "approval.required") {
+          const approval = record.payload || {};
+          queueOutput(delivery, `approval:${approval.approval_id || approval.id || seq}`, approvalText(approval));
         }
+        const status = record.payload?.turn?.status || record.payload?.status;
+        if (record.event === "turn.completed") finishDelivery(delivery, status || "completed");
+        if (record.event === "turn.lifecycle" && ["failed", "canceled", "interrupted"].includes(status)) finishDelivery(delivery, status);
       }
-
-      if (record.event === "turn.completed") {
-        const turn = record.payload?.turn || {};
-        const status = turn.status || "completed";
-        const error = turn.error ? `\n${turn.error}` : "";
-        if (status !== "completed") {
-          await sendText(chatId, `Turn ${status}.${error}`.trim());
-        } else {
-          await sendText(
-            chatId,
-            responseText.trim() || "Turn completed."
-          );
-        }
-        return;
-      }
-
-      if (record.event === "turn.lifecycle") {
-        const status =
-          record.payload?.turn?.status || record.payload?.status;
-        if (["failed", "canceled", "interrupted"].includes(status)) {
-          await sendText(chatId, `Turn ${status}.`);
-          return;
-        }
-      }
+      // Cursor, accumulator and pending output are committed together before send.
+      await saveDelivery(chatId, delivery);
+      await flushOutputs(chatId);
+      // flushOutputs mutates output states; retain them for the next journal event.
+      delivery.outputs = structuredClone((await threadStore.getChat(chatId)).turnDelivery.outputs);
+      if (delivery.terminal) return true;
+      if (stopping) break;
     }
-  } catch (error) {
-    if (error.name === "AbortError") {
-      await sendText(
-        chatId,
-        `Turn timed out after ${Math.round(config.turnTimeoutMs / 1000)}s.`
-      );
-      return;
-    }
-    throw error;
+    return true;
   } finally {
     clearTimeout(timeout);
+    controller.abort();
   }
+}
+
+function startChatRecovery(chatId) {
+  if (stopping || recoveryTasks.has(chatId)) return;
+  const task = (async () => {
+    while (!stopping) {
+      let state = await threadStore.getChat(chatId);
+      if (!ownsRecovery(chatId, state)) return;
+      try {
+        if (state.pendingAdmission) {
+          await reconcileAdmission(chatId);
+          state = await threadStore.getChat(chatId);
+          if (state.pendingAdmission) {
+            if (state.pendingAdmission.submitted && !state.pendingAdmission.operationKey) return;
+            await sleep(1000);
+            continue;
+          }
+        }
+        if (!state.turnDelivery) return;
+        await reconcileSnapshot(chatId);
+        await flushOutputs(chatId);
+        state = await threadStore.getChat(chatId);
+        if (state.turnDelivery.terminal) {
+          if (!state.turnDelivery.outputs.some((entry) => entry.status === "queued")) return;
+          await sleep(1000);
+          continue;
+        }
+        const controller = new AbortController();
+        recoveryControllers.set(chatId, controller);
+        const retryable = await streamTurnEvents(chatId, controller);
+        recoveryControllers.delete(chatId);
+        if (retryable === false) return;
+      } catch {
+        if (stopping) return;
+        console.warn("Turn observation interrupted; retaining the accepted turn for recovery.");
+      }
+      await sleep(1000);
+    }
+  })().finally(() => { recoveryTasks.delete(chatId); recoveryControllers.delete(chatId); });
+  recoveryTasks.set(chatId, task);
 }
 
 async function sendStatus(chatId) {
   try {
+    const state = await threadStore.getChat(chatId);
     const [health, runtimeInfo, workspace] = await Promise.all([
       runtimeJson("/health", { auth: false }),
       runtimeJson("/v1/runtime/info"),
@@ -538,6 +655,10 @@ async function sendStatus(chatId) {
     await sendText(
       chatId,
       [
+        `user_id=${chatId}`,
+        state?.pendingAdmission ? "Turn admission is pending; its original request is retained." : "",
+        state?.activeTurnId && ownsRecovery(chatId, state) ? `accepted_turn=${state.activeTurnId}` : "",
+        state?.turnDelivery?.outputs?.some((entry) => entry.status === "uncertain") ? "A reply has unconfirmed API acceptance. It is retained for review and will not be resent automatically." : "",
         `runtime=${health.status || "unknown"}`,
         `version=${runtimeInfo.version || "unknown"}`,
         `bind=${runtimeInfo.bind_host}:${runtimeInfo.port}`,
@@ -557,11 +678,19 @@ async function sendStatus(chatId) {
 
 async function sendThreads(chatId) {
   try {
-    const threads = await runtimeJson(
-      "/v1/threads/summary?limit=8&include_archived=true"
-    );
+    const state = await threadStore.getChat(chatId);
+    const ownedIds = threadBindings(chatId, state)
+      .filter((entry) => entry.accountId === accountIdentity() && entry.actorId === turnActor(chatId))
+      .map((entry) => entry.threadId);
+    if (!ownedIds.length) {
+      await sendText(chatId, "No recent runtime threads owned by this account and chat.");
+      return;
+    }
+    const query = new URLSearchParams({ limit: "8", include_archived: "true", thread_ids: ownedIds.join(",") });
+    const threads = (await runtimeJson(`/v1/threads/summary?${query}`))
+      .filter((thread) => ownsThread(chatId, state, thread.id));
     if (!threads.length) {
-      await sendText(chatId, "No runtime threads yet.");
+      await sendText(chatId, "No recent runtime threads owned by this account and chat.");
       return;
     }
     await sendText(
@@ -585,13 +714,17 @@ async function resumeThread(chatId, args) {
     return;
   }
   try {
+    const existing = await threadStore.getChat(chatId);
+    if (hasPendingWork(existing)) throw new Error("This chat still has a pending turn or retained reply. Use /status first.");
+    if (!ownsThread(chatId, existing, threadId)) throw new ApprovalOwnershipError("Thread is not owned by this account and chat");
     const detail = await runtimeJson(
       `/v1/threads/${encodeURIComponent(threadId)}`
     );
-    const existing = await threadStore.getChat(chatId);
     await threadStore.setChat(chatId, {
-      ...preservedChatStateFields(existing),
+      ...preservedChatStateFields(existing, ["model", "authorizedIdentity", "contextToken", "contextTokenAccountId", "retiredAccountStates"]),
+      threadBindings: threadBindings(chatId, existing),
       threadId,
+      bindingAccountId: accountIdentity(),
       lastSeq: Number(detail.latest_seq || 0),
       activeTurnId: null,
       updatedAt: new Date().toISOString(),
@@ -612,8 +745,8 @@ async function interruptActiveTurn(chatId) {
     const detail = await runtimeJson(
       `/v1/threads/${encodeURIComponent(state.threadId)}`
     );
-    const runningTurn = latestRunningTurn(detail);
-    const turnId = state.activeTurnId || runningTurn?.id;
+    const turnId = state.activeTurnId;
+    if (state.turnDelivery?.accountId !== accountIdentity() || threadStore.turnOrigin(chatId, state.threadId, turnId)?.actorId !== turnActor(chatId)) throw new ApprovalOwnershipError("Turn is not owned by this account and chat");
     if (!turnId) {
       await sendText(chatId, "No active turn recorded for this chat.");
       return;
@@ -702,7 +835,9 @@ async function setChatModel(chatId, modelName) {
 let botAccount = null;
 let stopping = false;
 let threadStore;
-let stopSignal = null;
+const recoveryTasks = new Map();
+const recoveryControllers = new Map();
+let runtimeCapabilities = {};
 
 function resolveSyncBufPath(stateDir) {
   return path.join(stateDir, "sync-buf.txt");
@@ -725,53 +860,29 @@ async function saveSyncBuf(stateDir, buf) {
   await writeFileDurable(p, buf, { mode: 0o600 });
 }
 
-/** One claimed inbound message: context token, text, allowlist, command. */
+/** One durably claimed inbound message; agent observation runs separately. */
 async function handleInbound(msg) {
   const fromUser = msg.from_user_id || "";
-  // 保存 context_token
-  if (msg.context_token) {
-    await threadStore.patchChat(fromUser, {
-      contextToken: msg.context_token,
-      updatedAt: new Date().toISOString(),
-    });
-  }
-
-  // 提取文本
+  if (msg.message_type !== undefined && msg.message_type !== 1) return;
+  if (!isAllowed(fromUser)) return;
   const text = extractText(msg.item_list);
-
-  if (!text) {
-    await sendText(
-      fromUser,
-      "仅支持文本消息。图片/语音/视频/文件暂不支持。"
-    );
-    return;
+  if (msg.context_token) {
+    const state = await threadStore.getChat(fromUser);
+    // A pending admission already owns its context before a thread is bound.
+    // Preserve foreign or unattributed receipts until /new retires them.
+    if ((!state?.bindingAccountId || state.bindingAccountId === accountIdentity())
+      && (!state?.pendingAdmission || state.pendingAdmission.accountId === accountIdentity())
+      && (!state?.turnDelivery || state.turnDelivery.accountId === accountIdentity())) {
+      await threadStore.patchChat(fromUser, {
+        contextToken: msg.context_token,
+        contextTokenAccountId: accountIdentity(),
+      });
+    }
   }
-
-  console.log(
-    `[inbound] from=${fromUser} text=${text.slice(0, 100)}`
-  );
-
-  // 白名单检查
-  if (!isAllowed(fromUser)) {
-    await sendText(
-      fromUser,
-      [
-        "This WeChat user is not in WEIXIN_CHAT_ALLOWLIST.",
-        `user_id=${fromUser}`,
-        "",
-        "For first pairing, add this user_id to WEIXIN_CHAT_ALLOWLIST, or temporarily set WEIXIN_ALLOW_UNLISTED=true.",
-      ].join("\n")
-    );
-    return;
-  }
-
-  // 命令路由
-  const command = parseCommand(text);
-  await handleCommand(fromUser, command).catch((error) => {
-    console.error(
-      `failed to handle command from=${fromUser} text=${text.slice(0, 100)}`,
-      error
-    );
+  if (!text) return sendText(fromUser, "仅支持文本消息。图片/语音/视频/文件暂不支持。");
+  await handleCommand(fromUser, parseCommand(text), {
+    messageKey: inboundKey(msg),
+    contextToken: msg.context_token,
   });
 }
 
@@ -827,26 +938,37 @@ async function monitorLoop() {
 
       consecutiveFailures = 0;
 
-      // 先处理消息，再保存游标：进程崩溃时整批从 iLink 重放，
-      // 已完成的消息按 key 跳过，崩溃时正在处理的消息只提示、不重跑。
       await processUpdateBatch({
-        messages: resp.msgs || [],
+        messages: resp.msgs,
         nextCursor: resp.get_updates_buf,
         store: threadStore,
-        keyOf: (msg) => (msg.from_user_id ? `${msg.from_user_id}:${String(msg.message_id || "")}` : null),
-        interrupted: async (msg) => {
-          if (!isAllowed(msg.from_user_id)) return;
-          await sendText(
-            msg.from_user_id,
-            "桥接进程在处理这条消息时重启，未重复执行；如仍需要请重新发送。\nThe bridge restarted while handling this message and did not run it again; send it again if you still need it."
-          );
+        keyOf: (msg) => {
+          const key = inboundKey(msg);
+          if (!key) console.warn("Ignored inbound message without a stable account/peer/message identity.");
+          return key;
         },
         handle: handleInbound,
-        commitCursor: async (buf) => {
-          getUpdatesBuf = buf;
-          await saveSyncBuf(config.stateDir, buf);
+        interrupted: async (msg) => {
+          const key = inboundKey(msg);
+          const state = await threadStore.getChat(msg.from_user_id);
+          if (state?.pendingAdmission?.messageKey === key || state?.turnDelivery?.messageKey === key) {
+            startChatRecovery(msg.from_user_id);
+          } else if (commandAction(parseCommand(extractText(msg.item_list))).kind === "prompt") {
+            // Prompt admission always persists before side effects. No receipt
+            // means this claim crashed before admission, so it can be handled.
+            await handleInbound(msg);
+          } else if (isAllowed(msg.from_user_id)) {
+            await sendText(msg.from_user_id, "The bridge restarted while handling this command. Its effect is uncertain; check /status before repeating it.");
+          }
+        },
+        commitCursor: async (cursor) => {
+          await saveSyncBuf(config.stateDir, cursor);
+          getUpdatesBuf = cursor;
         },
       });
+      for (const [chatId, state] of threadStore.listChats()) {
+        if (hasPendingWork(state)) startChatRecovery(chatId);
+      }
     } catch (error) {
       if (error.name === "AbortError" || error.message?.includes("abort")) {
         // 长轮询超时是正常的，立即重试
@@ -909,7 +1031,7 @@ async function main() {
     );
     process.exit(1);
   }
-  threadStore = await ThreadStore.open(config.threadMapPath);
+  threadStore = await CoreThreadStore.open(config.threadMapPath, { messageLimit: 500, privateMode: true });
 
   // 尝试加载已有账号
   botAccount = await loadAccount(config.stateDir);
@@ -953,6 +1075,12 @@ async function main() {
     console.log(`✅ Login successful! accountId=${botAccount.accountId}`);
   }
 
+  if (!accountIdentity()) throw new Error("The saved bot account has no stable account identity; pair again before receiving messages.");
+  try { runtimeCapabilities = (await runtimeJson("/v1/runtime/info"))?.capabilities || {}; } catch { console.warn("Engine recovery capabilities unavailable; uncertain admissions will remain retained."); }
+  for (const [chatId, state] of threadStore.listChats()) {
+    if (hasPendingWork(state)) startChatRecovery(chatId);
+  }
+
   // 通知上线
   try {
     const startResp = await notifyStart({
@@ -988,6 +1116,7 @@ async function shutdown() {
   if (stopping) return;
   stopping = true;
   console.log("Shutting down...");
+  for (const controller of recoveryControllers.values()) controller.abort();
 
   if (botAccount?.token) {
     try {

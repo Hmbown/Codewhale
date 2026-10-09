@@ -12,7 +12,7 @@ async fn rejected_manual_compaction_route_closes_typed_lifecycle() {
     .with_legacy_root(Some(String::new()), None);
     let route = resolve_runtime_route(
         &route_config,
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         Some(crate::config::DEFAULT_TEXT_MODEL),
     )
     .expect("structurally resolve route without credential");
@@ -67,7 +67,7 @@ async fn queued_manual_compaction_cancellation_is_idempotent_and_skips_route_act
     .with_legacy_root(Some(String::new()), None);
     let route = resolve_runtime_route(
         &route_config,
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
         Some(crate::config::DEFAULT_TEXT_MODEL),
     )
     .expect("structurally resolve route without credential");

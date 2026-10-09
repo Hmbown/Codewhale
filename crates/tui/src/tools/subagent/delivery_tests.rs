@@ -518,7 +518,7 @@ async fn enforced_readonly_python_queries_sqlite_under_a_live_peer_write_claim()
             .configured_sandbox_type()
             .is_some();
         runtime.worker_profile = WorkerRuntimeProfile::for_role(role.clone());
-        let registry = SubAgentToolRegistry::new_with_owner(
+        let registry = ChildCoreProbe::new_with_owner(
             runtime,
             role,
             "agent_analysis".into(),

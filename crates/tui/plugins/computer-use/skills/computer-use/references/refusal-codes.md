@@ -1,5 +1,13 @@
 # Refusal codes and the move that fixes them
 
+Named batch lookup returns `element_not_found` or `element_ambiguous` before
+input when its search has zero or multiple matches. `observation_incomplete`
+means a truncated walk cannot prove uniqueness or absence. Narrow the app/window
+or explicitly observe/select a target. Observe and narrow query
+and exact role; do not substitute guessed coordinates. `condition_not_met`
+means a batch wait timed out and subsequent steps did not run. Inspect
+`completed_steps`, `action_sent` and `outcome_unknown`; earlier effects remain.
+
 Every refusal is structured: `ok:false` with an `error.code` you can branch on.
 Never retry a refusal unchanged — re-observe, re-target, or change route.
 
@@ -45,11 +53,20 @@ Never retry a refusal unchanged — re-observe, re-target, or change route.
 | `confirmation_required` | the click or press would activate a pay/buy/order/send/transfer/delete control | stop and show the user exactly what will happen; only on their approval, `consent {action:"allow", confirm:"<token>"}` and repeat the identical call |
 | `confirmation_unknown` | the confirmation token is unknown, used, or expired | repeat the original call for a fresh token and ask the user again |
 | `script_refused` | `app_script` would reach a shell, Cocoa, dynamic code, a terminal app, or an app it does not name with a literal | use the host's shell for shell work, or name the app literally; never rewrite the script to get past the check |
-| `not_replayable` | a trajectory step had its entered text redacted, so replay stops there | redo that step by hand |
+| `not_replayable` | a trajectory step contains saved capture pins, redacted text or a consent decision | replay stops there; observe and plan a new action, preserving the actual permission and confirmation gates; never strip or remap pins |
 | `foreground_denied` | the user denied shared-desktop (foreground) control | work background-only; do not retry `activate:true` |
 | `frame_refused` | the app refused both the position and the size write | the window is fullscreen, tiled or otherwise not movable by the app |
 | `trajectory_not_found` | no trajectory file matches the id (or none exist) | `trajectory {action:"status"}` lists recent files |
 | `replay_too_large` | the trajectory exceeds the 200-turn replay cap | split it, or replay a pruned copy |
+| `input_owner_unknown` | Linux cannot tell which app would receive this input: no window manager publishes its stacking order, no managed window has keyboard focus, or the session is Wayland | bring the target app's window to the front (observe it or click it), then retry; on Wayland use an X11 session |
+| `popup_open` | a menu or popup item is open in the app that would receive the keys | send `key escape` (allowed while a menu is open), observe the app, then retry |
+| `window_not_active` | the element is focused, but its window is not the active one, so keys would go to another window | bring the app forward (`open_application activate:true`, which needs foreground consent) or ask the user to focus it |
+| `no_window` | the app has no visible window to capture (minimized or unmapped) | restore it, or ask the user; capture the display instead |
+| `no_window_manager` | window geometry is not published, so app-window screenshots and recordings cannot be cropped | start a window manager, or capture the display |
+| `focus_failed` | AT-SPI refused focus on the element (not focusable, or focus refused) | observe again and choose a focusable control |
+| `select_text_failed` | AT-SPI refused the text range or the caret position | observe the element; the range must lie inside its text |
+| `no_value` | the element exposes neither a text nor a numeric value | read a labelled control or a different element |
+| `recording_failed` | ffmpeg could not start or finish the recording | check the display and the ffmpeg install; the receipt names the partial file |
 | `app_upgrade_required` | the helper predates the feature or is not running | restart/update the Codewhale Computer Use app |
 | `unsupported_on_backend` | tool not implemented on that platform backend | check the platform note in the main skill |
 | `unsupported_on_transport` | `app_script` sent to an ssh/docker/hdc computer — scripting is local-only so a remote channel never becomes a shell | run it on `local`, or use the host's own remote access |
@@ -73,6 +90,15 @@ was refused before delivery. Use accessibility, browser control or a separate
 computer; a typing pause does not authorize foreground control.
 
 ## Reading a receipt
+
+- `raster_id` identifies a screenshot, zoom or OCR image on this server and
+  computer. Supply it with raster coordinates. `raster_stale` means another
+  capture replaced it; `no_raster` means the context was retired or no image
+  was observed. Both refuse before input: observe again instead of removing
+  the pin. `bad_target` refuses malformed IDs or IDs on absolute screen points.
+- `target_raster_id` on a successful coordinate receipt names the image used
+  for conversion; `parent_raster_id` on a zoom names the image actually cropped.
+  These are identity receipts, not proof of a current UI or completed task.
 
 - `action_sent` / `verified` mean dispatch (and, where available, read-back) —
   not task success. Verify the effect with a fresh observation.

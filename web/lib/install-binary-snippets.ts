@@ -5,13 +5,13 @@ function windowsSnippet(arch: "x64" | "arm64"): string {
 $ErrorActionPreference = "Stop"
 $dest = "$Env:USERPROFILE\\bin"
 New-Item -ItemType Directory -Force $dest | Out-Null
-$manifest = Invoke-WebRequest https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-artifacts-sha256.txt
+$manifest = Invoke-WebRequest https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-artifacts-sha256.txt
 
 Invoke-WebRequest \`
-  -Uri https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-windows-${arch}.exe \`
+  -Uri https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-windows-${arch}.exe \`
   -OutFile "$dest\\codewhale.exe"
 Invoke-WebRequest \`
-  -Uri https://github.com/Hmbown/CodeWhale/releases/latest/download/codew-windows-${arch}.exe \`
+  -Uri https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codew-windows-${arch}.exe \`
   -OutFile "$dest\\codew.exe"
 
 $expected = @{}
@@ -27,7 +27,7 @@ $Env:Path = "$dest;$Env:Path"`;
 
 function windowsVerify(arch: "x64" | "arm64"): string {
   return `# PowerShell
-$manifest = Invoke-WebRequest https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-artifacts-sha256.txt
+$manifest = Invoke-WebRequest https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-artifacts-sha256.txt
 $expected = @{}
 $manifest.Content -split "\`n" | ForEach-Object {
   $parts = $_.Trim() -split "\\s+"
@@ -38,40 +38,40 @@ if ((Get-FileHash "$Env:USERPROFILE\\bin\\codew.exe" -Algorithm SHA256).Hash -ne
 }
 
 export const SNIPPETS: Record<Arch, string> = {
-  "macos-arm64": `curl -fsSL -O https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-artifacts-sha256.txt
+  "macos-arm64": `curl -fsSL -O https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-artifacts-sha256.txt
 curl -fsSL -O \\
-  https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-macos-arm64
+  https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-macos-arm64
 curl -fsSL -O \\
-  https://github.com/Hmbown/CodeWhale/releases/latest/download/codew-macos-arm64
+  https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codew-macos-arm64
 grep -E ' (codewhale|codew)-macos-arm64$' codewhale-artifacts-sha256.txt | shasum -a 256 -c -
 chmod +x codewhale-macos-arm64 codew-macos-arm64
 xattr -d com.apple.quarantine codewhale-macos-arm64 codew-macos-arm64 2>/dev/null || true
 sudo mv codewhale-macos-arm64 /usr/local/bin/codewhale
 sudo mv codew-macos-arm64 /usr/local/bin/codew`,
-  "macos-x64": `curl -fsSL -O https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-artifacts-sha256.txt
+  "macos-x64": `curl -fsSL -O https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-artifacts-sha256.txt
 curl -fsSL -O \\
-  https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-macos-x64
+  https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-macos-x64
 curl -fsSL -O \\
-  https://github.com/Hmbown/CodeWhale/releases/latest/download/codew-macos-x64
+  https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codew-macos-x64
 grep -E ' (codewhale|codew)-macos-x64$' codewhale-artifacts-sha256.txt | shasum -a 256 -c -
 chmod +x codewhale-macos-x64 codew-macos-x64
 xattr -d com.apple.quarantine codewhale-macos-x64 codew-macos-x64 2>/dev/null || true
 sudo mv codewhale-macos-x64 /usr/local/bin/codewhale
 sudo mv codew-macos-x64 /usr/local/bin/codew`,
-  "linux-x64": `curl -fsSL -O https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-artifacts-sha256.txt
+  "linux-x64": `curl -fsSL -O https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-artifacts-sha256.txt
 curl -fsSL -O \\
-  https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-linux-x64
+  https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-linux-x64
 curl -fsSL -O \\
-  https://github.com/Hmbown/CodeWhale/releases/latest/download/codew-linux-x64
+  https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codew-linux-x64
 grep -E ' (codewhale|codew)-linux-x64$' codewhale-artifacts-sha256.txt | sha256sum -c -
 chmod +x codewhale-linux-x64 codew-linux-x64
 sudo mv codewhale-linux-x64 /usr/local/bin/codewhale
 sudo mv codew-linux-x64 /usr/local/bin/codew`,
-  "linux-arm64": `curl -fsSL -O https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-artifacts-sha256.txt
+  "linux-arm64": `curl -fsSL -O https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-artifacts-sha256.txt
 curl -fsSL -O \\
-  https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-linux-arm64
+  https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-linux-arm64
 curl -fsSL -O \\
-  https://github.com/Hmbown/CodeWhale/releases/latest/download/codew-linux-arm64
+  https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codew-linux-arm64
 grep -E ' (codewhale|codew)-linux-arm64$' codewhale-artifacts-sha256.txt | sha256sum -c -
 chmod +x codewhale-linux-arm64 codew-linux-arm64
 sudo mv codewhale-linux-arm64 /usr/local/bin/codewhale
@@ -81,7 +81,7 @@ sudo mv codew-linux-arm64 /usr/local/bin/codew`,
 };
 
 function unixVerify(platform: string, checksumCommand: string): string {
-  return `curl -fsSL -O https://github.com/Hmbown/CodeWhale/releases/latest/download/codewhale-artifacts-sha256.txt
+  return `curl -fsSL -O https://github.com/codewhale-hq/CodeWhale/releases/latest/download/codewhale-artifacts-sha256.txt
 verify_binary() {
   asset="$1"
   installed="$2"

@@ -27,7 +27,7 @@ export default async function ModelsPage({ params }: { params: Promise<{ locale:
   const t = (copy: LocalizedText) => fill(pickText(copy, locale), {
     version: facts.version ?? "—", model: facts.defaultModel ?? "—",
   });
-  const providerDocs = "https://github.com/Hmbown/CodeWhale/blob/main/docs/PROVIDERS.md";
+  const providerDocs = "https://github.com/codewhale-hq/CodeWhale/blob/main/docs/PROVIDERS.md";
   const docsLink = (
     <Link href={providerDocs} className="section-link">
       {t(MODELS_COPY.providerDocs)}
@@ -98,7 +98,7 @@ export default async function ModelsPage({ params }: { params: Promise<{ locale:
           </div>
           <p className="section-scope mt-5">
             {t(MODELS_COPY.missing)}{" "}
-            <Link href="https://github.com/Hmbown/CodeWhale/issues/new/choose" className="link">{t(MODELS_COPY.request)}</Link>
+            <Link href="https://github.com/codewhale-hq/CodeWhale/issues/new/choose" className="link">{t(MODELS_COPY.request)}</Link>
           </p>
         </Section>
       </div>

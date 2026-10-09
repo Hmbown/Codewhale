@@ -18,7 +18,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 
 use super::events::{ChangeReceipt, ObservationSummary, WorkGraphProposal};
 use super::ids::{BindingId, WorkEdgeId, WorkNodeId};
@@ -38,6 +38,11 @@ pub const ACTIVITY_CAP: usize = 256;
 
 /// Bounded idempotency-key dedup window kept on the snapshot.
 pub const SEEN_KEYS_CAP: usize = 1024;
+
+/// Ended, non-durable Operation nodes (one per finished shell call) kept on
+/// the snapshot (#6842). They are a derived index — the calls and their output
+/// live in the session transcript — so older ones are evicted, not archived.
+pub const ENDED_OPERATION_CAP: usize = 256;
 
 /// Canonical reasoning-effort tiers recorded as configuration facts. This is
 /// deliberately an enum rather than free-form text so Work Graph activity can
@@ -64,16 +69,30 @@ pub enum ReasoningEffortTier {
 }
 
 /// Bounded, receipt-only activity attached to the session graph.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkActivityEvent {
     ReasoningEffortChanged {
         requested: ReasoningEffortTier,
         effective: ReasoningEffortTier,
         /// Immutable routing kind, distinct from the exact provider identity.
         /// A custom table may legally use a built-in slug as its identity.
+        provider_kind: Option<ProviderKind>,
+        provider: String,
+        endpoint_identity: Option<String>,
+        model: Option<String>,
+        ts: Ts,
+        operation: Option<WorkNodeId>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WorkActivityEventWire {
+    ReasoningEffortChanged {
+        requested: ReasoningEffortTier,
+        effective: ReasoningEffortTier,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        provider_kind: Option<ApiProvider>,
+        provider_kind: Option<String>,
         provider: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         endpoint_identity: Option<String>,
@@ -85,23 +104,47 @@ pub enum WorkActivityEvent {
     },
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum WorkActivityEventWire {
-    ReasoningEffortChanged {
-        requested: ReasoningEffortTier,
-        effective: ReasoningEffortTier,
-        #[serde(default)]
-        provider_kind: Option<ApiProvider>,
-        provider: String,
-        #[serde(default)]
-        endpoint_identity: Option<String>,
-        #[serde(default)]
-        model: Option<String>,
-        ts: Ts,
-        #[serde(default)]
-        operation: Option<WorkNodeId>,
-    },
+impl Serialize for WorkActivityEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::ReasoningEffortChanged {
+                requested,
+                effective,
+                provider_kind,
+                provider,
+                endpoint_identity,
+                model,
+                ts,
+                operation,
+            } => {
+                let provider_kind = provider_kind
+                    .map(|kind| {
+                        codewhale_config::descriptors::tui_wire_tag_for_route(kind, provider)
+                            .map(str::to_string)
+                            .ok_or_else(|| {
+                                serde::ser::Error::custom(
+                                    "contradictory activity provider identity",
+                                )
+                            })
+                    })
+                    .transpose()?;
+                WorkActivityEventWire::ReasoningEffortChanged {
+                    requested: *requested,
+                    effective: *effective,
+                    provider_kind,
+                    provider: provider.clone(),
+                    endpoint_identity: endpoint_identity.clone(),
+                    model: model.clone(),
+                    ts: *ts,
+                    operation: operation.clone(),
+                }
+                .serialize(serializer)
+            }
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for WorkActivityEvent {
@@ -120,6 +163,14 @@ impl<'de> Deserialize<'de> for WorkActivityEvent {
                 ts,
                 operation,
             } => {
+                let provider_kind = provider_kind
+                    .map(|tag| {
+                        codewhale_config::descriptors::kind_from_tui_wire_tag(&tag, &provider)
+                            .ok_or_else(|| {
+                                serde::de::Error::custom("contradictory activity provider identity")
+                            })
+                    })
+                    .transpose()?;
                 // Pre-provenance snapshots cannot prove what route received
                 // the control. Keep them loadable, but never preserve a
                 // claimed effective tier as if kind/endpoint/model were known.
@@ -148,7 +199,7 @@ impl<'de> Deserialize<'de> for WorkActivityEvent {
 #[must_use]
 pub(crate) fn constrained_effective_reasoning_for_route(
     requested: ReasoningEffortTier,
-    provider: ApiProvider,
+    provider: ProviderKind,
     endpoint_identity: &str,
     model: &str,
 ) -> Option<ReasoningEffortTier> {
@@ -156,7 +207,7 @@ pub(crate) fn constrained_effective_reasoning_for_route(
         Auto, High, Low, Medium, Off, ThinkingEnabledGranularityUnavailable, Unavailable,
     };
 
-    if provider == ApiProvider::Zai {
+    if provider == ProviderKind::Zai {
         if !crate::config::is_exact_zai_chat_route(provider, endpoint_identity) {
             return Some(Unavailable);
         }
@@ -184,7 +235,7 @@ pub(crate) fn constrained_effective_reasoning_for_route(
         return Some(Unavailable);
     }
 
-    if provider == ApiProvider::Minimax {
+    if provider == ProviderKind::Minimax {
         if crate::config::is_exact_minimax_m3_route(provider, endpoint_identity, model) {
             return Some(match requested {
                 Off | Auto => requested,
@@ -194,7 +245,7 @@ pub(crate) fn constrained_effective_reasoning_for_route(
         return Some(Unavailable);
     }
 
-    if provider == ApiProvider::MinimaxAnthropic {
+    if provider == ProviderKind::MinimaxAnthropic {
         if crate::config::is_exact_minimax_anthropic_m3_route(provider, endpoint_identity, model) {
             return Some(match requested {
                 Off | Auto => requested,
@@ -208,7 +259,7 @@ pub(crate) fn constrained_effective_reasoning_for_route(
     // merely because it has a bounded URL and model string. Until immutable
     // route provenance carries a validated capability contract, its effective
     // tier must remain unavailable.
-    if provider == ApiProvider::Custom {
+    if provider == ProviderKind::Custom {
         return Some(Unavailable);
     }
 

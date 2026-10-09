@@ -103,12 +103,10 @@ fn append_at(app: &mut App, entry_idx: usize, text: &str, now: Instant) {
 /// Build the spinner-decorated placeholder shown in the thinking entry
 /// while a translation is in flight (`Thinking… (1.2s |)`).
 fn translation_placeholder_spinner_frame(app: &App, elapsed: f32) -> &'static str {
-    let animated_frame = match (elapsed.mul_add(2.0, 0.0) as usize) % 4 {
-        0 => "|",
-        1 => "/",
-        2 => "-",
-        _ => "\\",
-    };
+    let elapsed = std::time::Duration::try_from_secs_f32(elapsed.max(0.0))
+        .unwrap_or(std::time::Duration::MAX);
+    let animated_frame =
+        codewhale_ratatui::spin::frame(elapsed, codewhale_ratatui::MotionMode::Full, true);
     app.motion_policy().spinner_glyph(animated_frame, true)
 }
 
@@ -322,12 +320,12 @@ mod tests {
         let mut app = test_app();
         app.low_motion = false;
         app.fancy_animations = true;
-        assert_eq!(translation_placeholder_spinner_frame(&app, 0.0), "|");
-        assert_eq!(translation_placeholder_spinner_frame(&app, 0.6), "/");
+        assert_eq!(translation_placeholder_spinner_frame(&app, 0.0), ">");
+        assert_eq!(translation_placeholder_spinner_frame(&app, 0.6), "\\");
 
         app.low_motion = true;
-        assert_eq!(translation_placeholder_spinner_frame(&app, 0.0), "⣤");
-        assert_eq!(translation_placeholder_spinner_frame(&app, 0.6), "⣤");
+        assert_eq!(translation_placeholder_spinner_frame(&app, 0.0), "●");
+        assert_eq!(translation_placeholder_spinner_frame(&app, 0.6), "●");
 
         app.low_motion = false;
         app.fancy_animations = false;

@@ -56,7 +56,12 @@ fn private_route_config() -> Config {
 }
 
 fn resolve(config: &Config, model: &str) -> ResolvedRuntimeRoute {
-    resolve_runtime_route(config, config.api_provider(), Some(model)).expect("resolve route")
+    resolve_runtime_route(
+        config,
+        config.active_provider_identity().unwrap().provider,
+        Some(model),
+    )
+    .expect("resolve route")
 }
 
 fn fixture_compaction() -> CompactionConfig {
@@ -69,6 +74,7 @@ fn fixture_compaction() -> CompactionConfig {
 fn turn_op(content: &str, route: &ResolvedRuntimeRoute) -> Op {
     let compaction = fixture_compaction();
     Op::SendMessage(TurnSpec {
+        profile_constitution: None,
         max_output_tokens: None,
         content: content.to_string(),
         images: Vec::new(),

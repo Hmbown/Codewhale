@@ -105,7 +105,7 @@ else
   fail=1
 fi
 
-crates_user_agent="CodeWhale release check (https://github.com/Hmbown/CodeWhale)"
+crates_user_agent="CodeWhale release check (https://github.com/codewhale-hq/CodeWhale)"
 for crate in "${release_crates[@]}"; do
   if curl -fsSL -A "${crates_user_agent}" "https://crates.io/api/v1/crates/${crate}/${version}" >/dev/null 2>&1; then
     echo "crates.io ${crate}@${version} is published."

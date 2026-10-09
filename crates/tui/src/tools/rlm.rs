@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::client::CodewhaleClient;
 use crate::repl::PythonRuntime;
 use crate::rlm::RlmBridge;
 use crate::rlm::session::{
@@ -31,7 +30,6 @@ use crate::tools::spec::{
 
 /// Registered name of the persistent RLM session tool.
 pub(crate) const RLM_TOOL_NAME: &str = "rlm";
-const DEFAULT_CHILD_MODEL: &str = "deepseek-v4-flash";
 const MAX_INLINE_CONTENT_CHARS: usize = 200_000;
 const FULL_STDOUT_HEAD_CHARS: usize = 4_096;
 const FULL_STDOUT_TAIL_CHARS: usize = 1_024;
@@ -72,50 +70,28 @@ fn rlm_kernel_error_result(
 
 /// Unified RLM session tool.
 ///
-/// One struct and one input schema for the canonical `rlm` tool. `client` is
-/// only exercised by the `eval` action (child sub-RLM queries); other actions
-/// ignore it.
+/// One input schema and the existing per-session Python store. Provider RPCs
+/// require the caller receipt attached by Core to the actual ToolContext.
 pub struct RlmTool {
     name: &'static str,
     forced_action: Option<&'static str>,
-    client: Option<CodewhaleClient>,
-    /// Kept only for replay-compatible explicit RLM sessions. New normal
-    /// agent work uses the session kernel and inherits its route there.
-    root_model: String,
 }
 
 impl RlmTool {
     #[must_use]
-    pub fn new(name: &'static str, client: Option<CodewhaleClient>) -> Self {
+    pub fn new(name: &'static str) -> Self {
         Self {
             name,
             forced_action: None,
-            client,
-            root_model: DEFAULT_CHILD_MODEL.to_string(),
         }
-    }
-
-    /// Bind an explicit compatibility session to the active parent route.
-    /// This prevents a saved/manual RLM invocation from silently falling back
-    /// to an unrelated legacy child model.
-    #[must_use]
-    pub fn with_root_model(mut self, root_model: String) -> Self {
-        self.root_model = root_model;
-        self
     }
 
     #[cfg(test)]
     #[must_use]
-    pub fn alias(
-        name: &'static str,
-        action: &'static str,
-        client: Option<CodewhaleClient>,
-    ) -> Self {
+    pub fn alias(name: &'static str, action: &'static str) -> Self {
         Self {
             name,
             forced_action: Some(action),
-            client,
-            root_model: DEFAULT_CHILD_MODEL.to_string(),
         }
     }
 
@@ -388,80 +364,110 @@ impl RlmTool {
         input: &Value,
         context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        let source_count = rlm_open_source_count(input);
-        if source_count != 1 {
-            let mut msg = String::from(
-                "rlm_open: provide exactly one of `file_path` (local file), `content` (inline text), `url`, or `session_object`",
-            );
-            // "did you mean" for common misnamings (#2655).
-            if let Some(obj) = input.as_object() {
-                let seen: Vec<&str> = [
-                    "prompt",
-                    "resident_file",
-                    "text",
-                    "body",
-                    "path",
-                    "file",
-                    "source",
-                ]
-                .into_iter()
-                .filter(|k| obj.contains_key(*k))
-                .collect();
-                if !seen.is_empty() {
-                    msg.push_str(&format!(
-                        ". Saw {seen:?} — did you mean file_path/content/url/session_object? (to evaluate against an existing context, pass its name to rlm action='eval', or use `session_object`)"
-                    ));
-                }
-            }
-            return Err(ToolError::invalid_input(msg));
-        }
-
-        let (body, source_type, source_hint) = load_source(input, context).await?;
-        if body.trim().is_empty() {
-            return Err(ToolError::invalid_input(
-                "rlm_open: input is empty after loading",
+        let deadline = context.turn_deadline.unwrap_or_else(|| {
+            tokio::time::Instant::now() + crate::tools::subagent::DEFAULT_CHILD_WALL_TIME
+        });
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ToolError::execution_failed(
+                "RLM parent turn deadline exhausted before opening context",
             ));
         }
-
-        let name = input
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| derive_session_name(source_hint.as_deref()));
-
-        {
-            let sessions = context.runtime.rlm_sessions.lock().await;
-            if sessions.contains_key(&name) {
-                return Err(ToolError::invalid_input(format!(
-                    "rlm_open: context name `{name}` already exists"
-                )));
+        let open = async {
+            let source_count = rlm_open_source_count(input);
+            if source_count != 1 {
+                let mut msg = String::from(
+                    "rlm_open: provide exactly one of `file_path` (local file), `content` (inline text), `url`, or `session_object`",
+                );
+                // "did you mean" for common misnamings (#2655).
+                if let Some(obj) = input.as_object() {
+                    let seen: Vec<&str> = [
+                        "prompt",
+                        "resident_file",
+                        "text",
+                        "body",
+                        "path",
+                        "file",
+                        "source",
+                    ]
+                    .into_iter()
+                    .filter(|k| obj.contains_key(*k))
+                    .collect();
+                    if !seen.is_empty() {
+                        msg.push_str(&format!(
+                            ". Saw {seen:?} — did you mean file_path/content/url/session_object? (to evaluate against an existing context, pass its name to rlm action='eval', or use `session_object`)"
+                        ));
+                    }
+                }
+                return Err(ToolError::invalid_input(msg));
             }
+
+            let (body, source_type, source_hint) = load_source(input, context).await?;
+            if body.trim().is_empty() {
+                return Err(ToolError::invalid_input(
+                    "rlm_open: input is empty after loading",
+                ));
+            }
+
+            let name = input
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| derive_session_name(source_hint.as_deref()));
+
+            {
+                let sessions = context.runtime.rlm_sessions.lock().await;
+                if sessions.contains_key(&name) {
+                    return Err(ToolError::invalid_input(format!(
+                        "rlm_open: context name `{name}` already exists"
+                    )));
+                }
+            }
+
+            let context_path = write_context_file(&body).map_err(|e| {
+                ToolError::execution_failed(format!("rlm_open: failed to stage context: {e}"))
+            })?;
+            let context_path = tempfile::TempPath::try_from_path(context_path).map_err(|e| {
+                ToolError::execution_failed(format!("rlm_open: failed to own staged context: {e}"))
+            })?;
+            let kernel = PythonRuntime::spawn_with_context(&context_path)
+                .await
+                .map_err(|e| ToolError::execution_failed(format!("rlm_open: {e}")))?;
+            // PythonRuntime now owns cleanup; a dropped startup kept the TempPath.
+            let context_path = context_path.keep().map_err(|e| {
+                ToolError::execution_failed(format!("rlm_open: context handoff failed: {e}"))
+            })?;
+            let context_meta = ContextMeta::from_body(&body, source_type);
+            let session = RlmSession::new(name.clone(), kernel, context_meta.clone(), context_path);
+            let id = session.id.clone();
+
+            let mut sessions = context.runtime.rlm_sessions.lock().await;
+            sessions.insert(name.clone(), Arc::new(tokio::sync::Mutex::new(session)));
+
+            ToolResult::json(&json!({
+                "name": name,
+                "id": id,
+                "length": context_meta.length,
+                "type": context_meta.type_name,
+                "preview_500": context_meta.preview_500,
+                "sha256": context_meta.sha256,
+            }))
+            .map_err(|e| ToolError::execution_failed(e.to_string()))
+        };
+        tokio::select! {
+            biased;
+            () = async {
+                if let Some(cancel) = context.cancel_token.as_ref() {
+                    cancel.cancelled().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => Err(ToolError::cancelled("RLM originating turn cancelled while opening context")),
+            result = tokio::time::timeout_at(deadline, open) => result.map_err(|_| {
+                ToolError::execution_failed("RLM parent turn deadline exhausted opening context")
+            })?,
         }
-
-        let context_path = write_context_file(&body).map_err(|e| {
-            ToolError::execution_failed(format!("rlm_open: failed to stage context: {e}"))
-        })?;
-        let kernel = PythonRuntime::spawn_with_context(&context_path)
-            .await
-            .map_err(|e| ToolError::execution_failed(format!("rlm_open: {e}")))?;
-        let context_meta = ContextMeta::from_body(&body, source_type);
-        let session = RlmSession::new(name.clone(), kernel, context_meta.clone(), context_path);
-        let id = session.id.clone();
-
-        let mut sessions = context.runtime.rlm_sessions.lock().await;
-        sessions.insert(name.clone(), Arc::new(tokio::sync::Mutex::new(session)));
-
-        ToolResult::json(&json!({
-            "name": name,
-            "id": id,
-            "length": context_meta.length,
-            "type": context_meta.type_name,
-            "preview_500": context_meta.preview_500,
-            "sha256": context_meta.sha256,
-        }))
-        .map_err(|e| ToolError::execution_failed(e.to_string()))
     }
 
     async fn execute_eval(
@@ -485,37 +491,56 @@ impl RlmTool {
                 "RLM parent turn deadline exhausted before execution",
             ));
         }
-        let mut session = tokio::time::timeout_at(deadline, async {
-            let session = get_session(context, name).await?;
-            Ok::<_, ToolError>(session.lock_owned().await)
-        })
-        .await
-        .map_err(|_| {
-            ToolError::execution_failed("RLM parent turn deadline exhausted waiting for context")
-        })??;
+        let original_cancel = context.cancel_token.clone();
+        let wait_for_cancel = || async {
+            if let Some(cancel) = original_cancel.as_ref() {
+                cancel.cancelled().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        let mut session = tokio::select! {
+            biased;
+            () = wait_for_cancel() => return Err(ToolError::cancelled("RLM originating turn cancelled while waiting for context")),
+            result = tokio::time::timeout_at(deadline, async {
+                let session = get_session(context, name).await?;
+                Ok::<_, ToolError>(session.lock_owned().await)
+            }) => result.map_err(|_| {
+                ToolError::execution_failed("RLM parent turn deadline exhausted waiting for context")
+            })??,
+        };
         let config = session.config.clone();
 
-        let Some(kernel) = session.kernel.as_mut() else {
+        if let Some(caller) = context.rlm_caller.as_deref() {
+            caller.validate_context(context)?;
+        }
+        // The active round owns the existing interpreter. Dropping this
+        // future kills unknown running code rather than leaving it in the
+        // persistent map; only a completed round restores the same kernel.
+        let Some(mut kernel) = session.kernel.take() else {
             return Err(ToolError::invalid_input(format!(
                 "rlm_eval: context `{name}` is closed"
             )));
         };
 
         let started = Instant::now();
-        let (round, child_usage_batch, nested_events) = if let Some(client) = self.client.clone() {
+        let (round, child_usage_batch, nested_events) = if let Some(caller) =
+            context.rlm_caller.as_deref()
+        {
             let bridge = RlmBridge::new(
-                Arc::new(client),
-                self.root_model.clone(),
+                caller,
                 config.sub_rlm_max_depth.min(HARD_SUB_RLM_DEPTH_CAP),
+                Duration::from_secs(config.sub_query_timeout_secs),
             )
             .with_deadline(Some(deadline))
             .with_gate(context.execution.nested_call_gate.clone());
-            let round_result =
-                tokio::time::timeout_at(bridge.deadline(), kernel.run(code, Some(&bridge)))
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err("RLM evaluation reached the parent turn deadline".into())
-                    });
+            let round_result = tokio::select! {
+                biased;
+                () = wait_for_cancel() => Err("RLM evaluation cancelled by its originating turn".into()),
+                result = tokio::time::timeout_at(bridge.deadline(), kernel.run(code, Some(&bridge))) => {
+                    result.unwrap_or_else(|_| Err("RLM evaluation reached the parent turn deadline".into()))
+                },
+            };
             let usage = bridge.usage_snapshot().await;
             let round = match round_result {
                 Ok(round) => round,
@@ -553,19 +578,16 @@ impl RlmTool {
                 usage.nested_events,
             )
         } else {
-            let round =
-                match tokio::time::timeout_at(deadline, kernel.run(code, None::<&RlmBridge>)).await
-                {
-                    Ok(result) => {
-                        result.map_err(|e| ToolError::execution_failed(format!("rlm_eval: {e}")))?
+            let round = tokio::select! {
+                biased;
+                () = wait_for_cancel() => return Err(ToolError::cancelled("RLM evaluation cancelled by its originating turn")),
+                result = tokio::time::timeout_at(deadline, kernel.run(code, None::<&RlmBridge<'_>>)) => {
+                    match result {
+                        Ok(result) => result.map_err(|e| ToolError::execution_failed(format!("rlm_eval: {e}")))?,
+                        Err(_) => return Err(ToolError::execution_failed("RLM evaluation reached the parent turn deadline")),
                     }
-                    Err(_) => {
-                        session.kernel = None;
-                        return Err(ToolError::execution_failed(
-                            "RLM evaluation reached the parent turn deadline",
-                        ));
-                    }
-                };
+                },
+            };
             (
                 round,
                 crate::cost_status::RuntimeUsageBatch::default(),
@@ -573,6 +595,7 @@ impl RlmTool {
             )
         };
 
+        session.kernel = Some(kernel);
         session.rpc_count = session.rpc_count.saturating_add(round.rpc_count);
         session.total_duration += round.elapsed;
         session.last_used_at = Instant::now();
@@ -690,6 +713,13 @@ impl RlmTool {
         context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let name = required_non_empty_str(input, "name")?;
+        // No cross-session authority exists in this surface. Refuse before
+        // mutating any other setting, rather than retaining an inert true bit.
+        if input.get("share_session").and_then(Value::as_bool) == Some(true) {
+            return Err(ToolError::invalid_input(
+                "rlm_configure: share_session=true is unsupported; contexts remain caller-session scoped",
+            ));
+        }
         let session = get_session(context, name).await?;
         let mut session = session.lock().await;
 
@@ -710,8 +740,8 @@ impl RlmTool {
         if let Some(depth) = input.get("sub_rlm_max_depth").and_then(Value::as_u64) {
             session.config.sub_rlm_max_depth = (depth as u32).min(HARD_SUB_RLM_DEPTH_CAP);
         }
-        if let Some(share) = input.get("share_session").and_then(Value::as_bool) {
-            session.config.share_session = share;
+        if input.get("share_session").and_then(Value::as_bool) == Some(false) {
+            session.config.share_session = false;
         }
 
         ToolResult::json(&json!({
@@ -998,24 +1028,21 @@ mod tests {
     #[test]
     fn schema_uses_new_tool_names() {
         assert_eq!(
-            RlmTool::alias("rlm_session_objects", "session_objects", None).name(),
+            RlmTool::alias("rlm_session_objects", "session_objects").name(),
             "rlm_session_objects"
         );
-        assert_eq!(RlmTool::alias("rlm_open", "open", None).name(), "rlm_open");
-        assert_eq!(RlmTool::alias("rlm_eval", "eval", None).name(), "rlm_eval");
+        assert_eq!(RlmTool::alias("rlm_open", "open").name(), "rlm_open");
+        assert_eq!(RlmTool::alias("rlm_eval", "eval").name(), "rlm_eval");
         assert_eq!(
-            RlmTool::alias("rlm_configure", "configure", None).name(),
+            RlmTool::alias("rlm_configure", "configure").name(),
             "rlm_configure"
         );
-        assert_eq!(
-            RlmTool::alias("rlm_close", "close", None).name(),
-            "rlm_close"
-        );
+        assert_eq!(RlmTool::alias("rlm_close", "close").name(), "rlm_close");
     }
 
     #[test]
     fn rlm_tool_is_compatibility_only_not_model_visible() {
-        let canonical = RlmTool::new("rlm", None);
+        let canonical = RlmTool::new("rlm");
         assert!(!canonical.model_visible());
         assert_eq!(canonical.name(), "rlm");
         let actions = canonical.input_schema()["properties"]["action"]["enum"]
@@ -1030,11 +1057,11 @@ mod tests {
         }
 
         for alias in [
-            RlmTool::alias("rlm_session_objects", "session_objects", None),
-            RlmTool::alias("rlm_open", "open", None),
-            RlmTool::alias("rlm_eval", "eval", None),
-            RlmTool::alias("rlm_configure", "configure", None),
-            RlmTool::alias("rlm_close", "close", None),
+            RlmTool::alias("rlm_session_objects", "session_objects"),
+            RlmTool::alias("rlm_open", "open"),
+            RlmTool::alias("rlm_eval", "eval"),
+            RlmTool::alias("rlm_configure", "configure"),
+            RlmTool::alias("rlm_close", "close"),
         ] {
             assert!(
                 !alias.model_visible(),
@@ -1048,10 +1075,14 @@ mod tests {
     fn kernel_failure_result_retains_child_usage_receipt() {
         let route = crate::cost_status::EffectiveRouteEnvelope::capture(
             None,
-            crate::config::ApiProvider::Deepseek,
-            "deepseek-rlm",
-            DEFAULT_CHILD_MODEL,
-            Some(crate::config::ApiProvider::Deepseek.default_base_url()),
+            crate::config::ProviderKind::Deepseek,
+            crate::config::ProviderKind::Deepseek.as_str(),
+            "deepseek-v4-flash",
+            Some(
+                crate::config::ProviderKind::Deepseek
+                    .provider()
+                    .default_base_url(),
+            ),
             chrono::Utc::now(),
         );
         let usage = codewhale_models::Usage {
@@ -1068,6 +1099,7 @@ mod tests {
             },
         };
         let drop_record = crate::cost_status::RuntimeUsageDropRecord {
+            reason: crate::cost_status::RuntimeUsageMissingReason::default(),
             source_id: "rlm:test:request:1".to_string(),
             route: route.clone(),
         };
@@ -1099,7 +1131,7 @@ mod tests {
 
     #[test]
     fn rlm_eval_requires_approval() {
-        let tool = RlmTool::alias("rlm_eval", "eval", None);
+        let tool = RlmTool::alias("rlm_eval", "eval");
         assert_eq!(tool.approval_requirement(), ApprovalRequirement::Required);
         assert!(
             tool.capabilities()
@@ -1107,7 +1139,7 @@ mod tests {
         );
 
         // Evaluation requires approval; concrete open inputs are classified below.
-        let canonical = RlmTool::new("rlm", None);
+        let canonical = RlmTool::new("rlm");
         assert_eq!(
             canonical.approval_requirement_for(&json!({"action": "eval"})),
             ApprovalRequirement::Required
@@ -1124,10 +1156,7 @@ mod tests {
 
     #[test]
     fn rlm_open_requires_outbound_approval_but_keeps_local_reads_automatic() {
-        for tool in [
-            RlmTool::new("rlm", None),
-            RlmTool::alias("rlm_open", "open", None),
-        ] {
+        for tool in [RlmTool::new("rlm"), RlmTool::alias("rlm_open", "open")] {
             assert_eq!(tool.approval_requirement(), ApprovalRequirement::Required);
             for source in [
                 json!({"url": "https://example.com/document"}),
@@ -1160,15 +1189,15 @@ mod tests {
     fn read_only_and_parallel_flags_match_legacy_contract() {
         // Legacy: session_objects was parallel-friendly read-only; open carried
         // ExecutesCode (not read-only). Open now classifies the concrete source.
-        let session_objects = RlmTool::alias("rlm_session_objects", "session_objects", None);
+        let session_objects = RlmTool::alias("rlm_session_objects", "session_objects");
         assert!(session_objects.supports_parallel());
         assert!(session_objects.is_read_only_for(&json!({})));
 
-        let open = RlmTool::alias("rlm_open", "open", None);
+        let open = RlmTool::alias("rlm_open", "open");
         assert!(!open.is_read_only_for(&json!({})));
         assert_eq!(open.approval_requirement(), ApprovalRequirement::Required);
 
-        let canonical = RlmTool::new("rlm", None);
+        let canonical = RlmTool::new("rlm");
         assert!(canonical.supports_parallel_for(&json!({"action": "session_objects"})));
         assert!(!canonical.supports_parallel_for(&json!({"action": "eval"})));
         assert!(canonical.is_read_only_for(&json!({"action": "configure"})));
@@ -1178,7 +1207,7 @@ mod tests {
 
     #[test]
     fn canonical_rejects_unknown_or_missing_action() {
-        let tool = RlmTool::new("rlm", None);
+        let tool = RlmTool::new("rlm");
         let err = tool
             .resolve_action(&json!({}))
             .expect_err("missing action must fail");
@@ -1218,7 +1247,7 @@ mod tests {
     #[tokio::test]
     async fn rlm_session_objects_lists_active_prompt_object() {
         let ctx = ctx_with_session_objects();
-        let result = RlmTool::alias("rlm_session_objects", "session_objects", None)
+        let result = RlmTool::alias("rlm_session_objects", "session_objects")
             .execute(json!({}), &ctx)
             .await
             .expect("list session objects");
@@ -1236,7 +1265,7 @@ mod tests {
     #[tokio::test]
     async fn rlm_open_loads_active_session_prompt_object() {
         let ctx = ctx_with_session_objects();
-        let open = RlmTool::alias("rlm_open", "open", None)
+        let open = RlmTool::alias("rlm_open", "open")
             .execute(
                 json!({"name": "active_prompt", "session_object": "session://active/system_prompt"}),
                 &ctx,
@@ -1252,7 +1281,7 @@ mod tests {
                 .contains("CodeWhale")
         );
 
-        RlmTool::alias("rlm_close", "close", None)
+        RlmTool::alias("rlm_close", "close")
             .execute(json!({"name": "active_prompt"}), &ctx)
             .await
             .expect("close");
@@ -1261,7 +1290,7 @@ mod tests {
     #[tokio::test]
     async fn rlm_open_loads_transcript_message_object() {
         let ctx = ctx_with_session_objects();
-        let open = RlmTool::alias("rlm_open", "open", None)
+        let open = RlmTool::alias("rlm_open", "open")
             .execute(
                 json!({"name": "first_message", "session_object": "session://active/messages/0"}),
                 &ctx,
@@ -1277,7 +1306,7 @@ mod tests {
                 .contains("RLM surface")
         );
 
-        RlmTool::alias("rlm_close", "close", None)
+        RlmTool::alias("rlm_close", "close")
             .execute(json!({"name": "first_message"}), &ctx)
             .await
             .expect("close");
@@ -1286,7 +1315,7 @@ mod tests {
     #[tokio::test]
     async fn rlm_open_ignores_blank_source_defaults_from_schema_fillers() {
         let ctx = ctx();
-        RlmTool::alias("rlm_open", "open", None)
+        RlmTool::alias("rlm_open", "open")
             .execute(
                 json!({"name": "blank-defaults", "file_path": "", "content": "body", "url": ""}),
                 &ctx,
@@ -1294,7 +1323,7 @@ mod tests {
             .await
             .expect("open with blank sibling source fields");
 
-        RlmTool::alias("rlm_close", "close", None)
+        RlmTool::alias("rlm_close", "close")
             .execute(json!({"name": "blank-defaults"}), &ctx)
             .await
             .expect("close");
@@ -1305,7 +1334,7 @@ mod tests {
         // #2655: a wrong source field name yields actionable guidance, not just
         // the canonical "provide exactly one" message.
         let ctx = ctx();
-        let err = RlmTool::alias("rlm_open", "open", None)
+        let err = RlmTool::alias("rlm_open", "open")
             .execute(json!({"name": "doc", "prompt": "summarize this"}), &ctx)
             .await
             .expect_err("misnamed source field should fail");
@@ -1322,7 +1351,7 @@ mod tests {
     async fn rlm_eval_missing_code_explains_raw_python() {
         // #2655: the missing-code error should teach the tool, with an example.
         let ctx = ctx();
-        let err = RlmTool::alias("rlm_eval", "eval", None)
+        let err = RlmTool::alias("rlm_eval", "eval")
             .execute(json!({"name": "doc"}), &ctx)
             .await
             .expect_err("missing code should fail");
@@ -1336,7 +1365,7 @@ mod tests {
 
     #[test]
     fn rlm_eval_schema_names_the_runtime_content_variable() {
-        let schema = RlmTool::alias("rlm_eval", "eval", None).input_schema();
+        let schema = RlmTool::alias("rlm_eval", "eval").input_schema();
         let description = schema["properties"]["code"]["description"]
             .as_str()
             .expect("rlm_eval code description");
@@ -1358,14 +1387,21 @@ mod tests {
                 "content": "```repl\nFINAL('durable nested answer')\n```"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16}
         }))).expect(2).mount(&server).await;
-        let config = crate::config::Config::default()
-            .with_legacy_root(Some("loopback-fixture-key".into()), Some(server.uri()));
-        let client = CodewhaleClient::new(&config).unwrap();
-        let tool = RlmTool::new("rlm", Some(client)).with_root_model("deepseek-v4-flash".into());
+        let mut config = crate::core::engine::tests::rlm_host::fixture_config("deepseek-v4-flash");
+        let identity = config.active_provider_identity().unwrap();
+        config.provider_config_for_mut(&identity).unwrap().base_url = Some(server.uri());
+        let client = Arc::new(crate::client::CodewhaleClient::new(&config).unwrap());
+        let tool = RlmTool::new("rlm");
         let temp = tempfile::tempdir().unwrap();
         let mut context = ToolContext::new(temp.path());
         context.execution.nested_call_gate =
             Some(crate::tools::codemode::NestedCallGate::admitting_for_test());
+        context = crate::core::engine::tests::rlm_host::context_for_replies(
+            &config,
+            "deepseek-v4-flash",
+            &context,
+            client,
+        );
         tool.execute(
             json!({"action": "open", "name": "receipts", "content": "fixture context"}),
             &context,
@@ -1458,10 +1494,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistent_open_obeys_original_cancel_and_deadline_without_installing_a_kernel() {
+        let temp = tempfile::tempdir().unwrap();
+        let tool = RlmTool::new("rlm");
+        for cancelled in [true, false] {
+            let mut context = ToolContext::new(temp.path());
+            let cancel = tokio_util::sync::CancellationToken::new();
+            context.cancel_token = Some(cancel.clone());
+            context.turn_deadline = Some(
+                tokio::time::Instant::now()
+                    + if cancelled {
+                        Duration::from_secs(30)
+                    } else {
+                        Duration::from_millis(40)
+                    },
+            );
+            let sessions = context.runtime.rlm_sessions.lock().await;
+            let input = json!({"action": "open", "name": "never-installed", "content": "fixture"});
+            let mut open = tool.execute(input, &context);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut open)
+                    .await
+                    .is_err()
+            );
+            if cancelled {
+                cancel.cancel();
+            }
+            let error = tokio::time::timeout(Duration::from_secs(1), &mut open)
+                .await
+                .expect("original cancellation and deadline both release a contended open")
+                .unwrap_err();
+            if cancelled {
+                assert!(matches!(error, ToolError::Cancelled { .. }));
+            } else {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("deadline exhausted opening context")
+                );
+            }
+            assert!(
+                sessions.is_empty(),
+                "no interpreter is installed while admission waits"
+            );
+            drop(open);
+            drop(sessions);
+            assert!(context.runtime.rlm_sessions.lock().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn parent_deadline_bounds_rlm_session_lock_waits() {
         let temp = tempfile::tempdir().unwrap();
         let mut context = ToolContext::new(temp.path());
-        let tool = RlmTool::new("rlm", None);
+        let tool = RlmTool::new("rlm");
         tool.execute(
             json!({"action": "open", "name": "contended", "content": "fixture"}),
             &context,
@@ -1514,7 +1600,7 @@ mod tests {
     async fn expired_parent_deadline_prevents_rlm_python_side_effects() {
         let temp = tempfile::tempdir().unwrap();
         let mut context = ToolContext::new(temp.path());
-        let tool = RlmTool::new("rlm", None);
+        let tool = RlmTool::new("rlm");
         tool.execute(
             json!({"action": "open", "name": "expired", "content": "fixture"}),
             &context,
@@ -1544,7 +1630,7 @@ mod tests {
     #[tokio::test]
     async fn rlm_session_open_eval_close_lifecycle() {
         let ctx = ctx();
-        RlmTool::alias("rlm_open", "open", None)
+        RlmTool::alias("rlm_open", "open")
             .execute(
                 json!({"name": "sample", "content": "alpha\nbeta\ngamma"}),
                 &ctx,
@@ -1552,7 +1638,7 @@ mod tests {
             .await
             .expect("open");
 
-        let eval = RlmTool::alias("rlm_eval", "eval", None)
+        let eval = RlmTool::alias("rlm_eval", "eval")
             .execute(json!({"name": "sample", "code": "print('ok')"}), &ctx)
             .await
             .expect("eval");
@@ -1563,7 +1649,7 @@ mod tests {
             .replace("\r\n", "\n");
         assert_eq!(stdout_preview, "ok\n");
 
-        let close = RlmTool::alias("rlm_close", "close", None)
+        let close = RlmTool::alias("rlm_close", "close")
             .execute(json!({"name": "sample"}), &ctx)
             .await
             .expect("close");
@@ -1574,7 +1660,7 @@ mod tests {
     async fn rlm_canonical_action_routing_runs_full_lifecycle() {
         // The visible surface: one `rlm` tool, action-parameterized.
         let ctx = ctx();
-        let tool = RlmTool::new("rlm", None);
+        let tool = RlmTool::new("rlm");
         tool.execute(
             json!({"action": "open", "name": "canonical", "content": "body"}),
             &ctx,
@@ -1606,12 +1692,12 @@ mod tests {
     #[tokio::test]
     async fn rlm_eval_final_returns_handle() {
         let ctx = ctx();
-        RlmTool::alias("rlm_open", "open", None)
+        RlmTool::alias("rlm_open", "open")
             .execute(json!({"name": "finals", "content": "body"}), &ctx)
             .await
             .expect("open");
 
-        let eval = RlmTool::alias("rlm_eval", "eval", None)
+        let eval = RlmTool::alias("rlm_eval", "eval")
             .execute(
                 json!({"name": "finals", "code": "finalize('done', confidence=0.8)"}),
                 &ctx,
@@ -1623,7 +1709,7 @@ mod tests {
         assert_eq!(eval_json["final"]["name"], "final_1");
         assert_eq!(eval_json["confidence"], 0.8);
 
-        RlmTool::alias("rlm_close", "close", None)
+        RlmTool::alias("rlm_close", "close")
             .execute(json!({"name": "finals"}), &ctx)
             .await
             .expect("close");
@@ -1632,12 +1718,12 @@ mod tests {
     #[tokio::test]
     async fn rlm_eval_final_preserves_json_handle() {
         let ctx = ctx();
-        RlmTool::alias("rlm_open", "open", None)
+        RlmTool::alias("rlm_open", "open")
             .execute(json!({"name": "json-final", "content": "body"}), &ctx)
             .await
             .expect("open");
 
-        let eval = RlmTool::alias("rlm_eval", "eval", None)
+        let eval = RlmTool::alias("rlm_eval", "eval")
             .execute(
                 json!({"name": "json-final", "code": "finalize({'answer': 42, 'items': ['a', 'b']})"}),
                 &ctx,
@@ -1659,7 +1745,7 @@ mod tests {
         let read_json: Value = serde_json::from_str(&read.content).expect("read json");
         assert_eq!(read_json["matches"], json!(["a", "b"]));
 
-        RlmTool::alias("rlm_close", "close", None)
+        RlmTool::alias("rlm_close", "close")
             .execute(json!({"name": "json-final"}), &ctx)
             .await
             .expect("close");
@@ -1668,11 +1754,11 @@ mod tests {
     #[tokio::test]
     async fn rlm_configure_metadata_omits_stdout() {
         let ctx = ctx();
-        RlmTool::alias("rlm_open", "open", None)
+        RlmTool::alias("rlm_open", "open")
             .execute(json!({"name": "quiet", "content": "body"}), &ctx)
             .await
             .expect("open");
-        RlmTool::alias("rlm_configure", "configure", None)
+        RlmTool::alias("rlm_configure", "configure")
             .execute(
                 json!({"name": "quiet", "output_feedback": "metadata", "sub_rlm_max_depth": 99}),
                 &ctx,
@@ -1680,16 +1766,152 @@ mod tests {
             .await
             .expect("configure");
 
-        let eval = RlmTool::alias("rlm_eval", "eval", None)
+        let eval = RlmTool::alias("rlm_eval", "eval")
             .execute(json!({"name": "quiet", "code": "print('hidden')"}), &ctx)
             .await
             .expect("eval");
         let eval_json: Value = serde_json::from_str(&eval.content).expect("eval json");
         assert!(eval_json.get("stdout_preview").is_none());
 
-        RlmTool::alias("rlm_close", "close", None)
+        RlmTool::alias("rlm_close", "close")
             .execute(json!({"name": "quiet"}), &ctx)
             .await
             .expect("close");
+    }
+    #[tokio::test]
+    async fn shared_session_refusal_is_atomic_and_persistent_kernel_owns_no_caller() {
+        let workspace = tempfile::tempdir().unwrap();
+        let base = ToolContext::new(workspace.path());
+        let model = "captured-kernel-model";
+        let config = crate::core::engine::tests::rlm_host::fixture_config(model);
+        let mock = Arc::new(crate::llm_client::mock::MockLlmClient::new(Vec::new()));
+        let context = crate::core::engine::tests::rlm_host::context_for_replies(
+            &config,
+            model,
+            &base,
+            mock.clone(),
+        );
+        let weak_caller = Arc::downgrade(context.rlm_caller.as_ref().unwrap());
+        let sessions = context.runtime.rlm_sessions.clone();
+        let tool = RlmTool::new("rlm");
+        tool.execute(
+            json!({"action":"open", "name":"lifetime", "content":"long local context"}),
+            &context,
+        )
+        .await
+        .unwrap();
+        let before = serde_json::to_value(
+            get_session(&context, "lifetime")
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .config
+                .clone(),
+        )
+        .unwrap();
+        let error = tool.execute(json!({"action":"configure", "name":"lifetime", "share_session":true, "sub_query_timeout_secs":1, "output_feedback":"metadata"}), &context).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("share_session=true is unsupported")
+        );
+        let after = serde_json::to_value(
+            get_session(&context, "lifetime")
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .config
+                .clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            before, after,
+            "unsupported session authority refuses before any settings change"
+        );
+        drop(context);
+        assert!(
+            weak_caller.upgrade().is_none(),
+            "persistent kernels must not retain model authority or their borrowed callback"
+        );
+        assert_eq!(
+            sessions.lock().await.len(),
+            1,
+            "the actual kernel map is still live"
+        );
+        assert_eq!(mock.call_count(), 0);
+        sessions.lock().await.clear();
+    }
+    #[tokio::test]
+    async fn persistent_eval_drop_and_original_cancel_kill_running_kernel_without_retaining_caller()
+    {
+        for cancel_original in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            let base = ToolContext::new(workspace.path());
+            let model = "captured-kernel-model";
+            let config = crate::core::engine::tests::rlm_host::fixture_config(model);
+            let mock = Arc::new(crate::llm_client::mock::MockLlmClient::new(Vec::new()));
+            let context = crate::core::engine::tests::rlm_host::context_for_replies(
+                &config,
+                model,
+                &base,
+                mock.clone(),
+            );
+            let weak_caller = Arc::downgrade(context.rlm_caller.as_ref().unwrap());
+            let cancel = context.cancel_token.as_ref().unwrap().clone();
+            let tool = RlmTool::new("rlm");
+            tool.execute(
+                json!({"action":"open", "name":"running", "content":"local long context"}),
+                &context,
+            )
+            .await
+            .unwrap();
+            let marker = workspace.path().join("started.txt");
+            let effect = workspace.path().join("must-not-run.txt");
+            let code = format!(
+                "import pathlib, time\nstarted = pathlib.Path({})\nstarted_temporary = started.with_suffix('.tmp')\nstarted_temporary.write_text(_ctx_file)\nstarted_temporary.replace(started)\ntime.sleep(1)\npathlib.Path({}).write_text('effect after cancellation')",
+                serde_json::to_string(&marker.to_string_lossy()).unwrap(),
+                serde_json::to_string(&effect.to_string_lossy()).unwrap(),
+            );
+            let input = json!({"action":"eval", "name":"running", "code":code});
+            let mut call = Box::pin(tool.execute(input, &context));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    result = &mut call => panic!("running eval finished before its marker: {result:?}"),
+                    () = async {
+                        while !marker.exists() {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    } => {},
+                }
+            }).await.expect("actual persistent Python round starts");
+            let context_path = PathBuf::from(std::fs::read_to_string(&marker).unwrap());
+            assert!(context_path.exists());
+            if cancel_original {
+                cancel.cancel();
+                let result = tokio::time::timeout(Duration::from_secs(1), &mut call)
+                    .await
+                    .expect("origin cancellation hands back promptly")
+                    .unwrap();
+                assert!(!result.success);
+                assert!(result.content.contains("cancelled by its originating turn"));
+            }
+            drop(call);
+            let session = get_session(&context, "running").await.unwrap();
+            assert!(session.lock().await.kernel.is_none());
+            assert!(
+                !context_path.exists(),
+                "dropped interpreter releases its owned context file"
+            );
+            drop(context);
+            assert!(weak_caller.upgrade().is_none());
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            assert!(
+                !effect.exists(),
+                "unknown Python code cannot outlive dropped/cancelled eval"
+            );
+            assert_eq!(mock.call_count(), 0);
+        }
     }
 }

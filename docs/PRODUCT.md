@@ -4,36 +4,41 @@
 
 ## Platform
 
-web (the public site and docs in `web/`), documenting a terminal application
-(the Rust TUI in `crates/tui`). Paths below are relative to the repository
-root.
+web (the public site and docs in `web/`), documenting Codewhale's Engine,
+terminal and connected tools. The terminal is one product surface, not the
+definition of the product. Paths below are relative to the repository root.
 
 ## Users
 
-Developers who run a coding agent in their own terminal against their own
-repositories: solo maintainers, small teams, and open-source contributors. They
-arrive at the site to decide whether to install, to install, and then to look up
-how a command, mode, or concept works. Many already use a competing agent and
-compare on model choice, cost, and control.
+People building apps, automating recurring work, researching and working across
+files and connected services. This includes solo developers, small teams and
+open-source contributors. They arrive to understand what they can accomplish,
+install, connect their models and tools, and look up how a command, mode or
+concept works. Model choice, cost and control matter to that decision.
 
 ## Product Purpose
 
-Codewhale is an open-source (MIT) coding agent and terminal UI written in Rust
-(Ratatui + Tokio; sandboxed tools via Bubblewrap/Seatbelt). Given a model and a
-task it reads the repository, edits files, runs the checks, and stops when the
-job is done or it needs a human. The site exists to (1) get a developer from
-"what is this" to a working install in one screen, and (2) be the canonical,
-current documentation for the shipped release. Success is an install that works
-and a docs answer found without leaving the page.
+Codewhale is an open-source (MIT), provider-neutral agentic computing system.
+Given a task, it works through files, commands and connected tools to build
+something useful, while keeping access, approvals and work history legible.
+The Rust Engine supplies the shared Runtime; Ratatui is its terminal surface.
+The site should make the result understandable, get a visitor to a working
+install, and provide current documentation. Success is a task someone can
+start, an install that works and a useful docs answer.
 
 ## Positioning
 
-Bring your own model. Codewhale is provider-neutral: any hosted, gateway, or
-local model, and a different model per role. The user's model inventory is the
+Bring your own model. Codewhale is provider-neutral: use your model API
+accounts, compatible gateways, or local and self-hosted inference, with a
+different model per role. The user's model inventory is the
 **Fleet** (`codewhale fleet`, `/fleet`; `pod` remains a compatibility alias).
 Modes are Plan, Work, Operate; permission levels are Ask, Auto-Review, Full
-Access. The agent runs on the user's machine, in the user's terminal — there is
-no hosted runtime to sell.
+Access. Plugins and MCP servers add tools; scripts can use service APIs.
+Each external service requires its own setup and authentication. General MCP
+support does not establish that a particular service has been connected or
+qualified with Codewhale. Terminal, local browser, native
+app and hosted product availability must be stated separately from the common
+Runtime model: source readiness is not deployment or customer acceptance.
 
 ## Operating Context
 
@@ -50,10 +55,11 @@ no hosted runtime to sell.
   `web/lib/content/vocabulary.ts` and `docs/public-surface-facts.json`.
 - Localised through shared dictionaries in `web/lib/i18n/dictionaries/` with
   locale-key parity enforced; no page-local copy forks.
-- The 0.9.12 shell (on the integration branch): transcript first, composer
-  plate, one info line, and a bottom dock with tabs Tasks / Agents / Context /
-  Pinned (+ ×). There is no top bar; docs that describe the shell describe the
-  dock.
+- The terminal puts the conversation above the composer, posture and metrics.
+  Its workbar exposes Tasks, Fleet, Jobs, Files, Notes, Context, Git and Cost;
+  the development candidate also adds a Terminal panel for its real PTY sessions
+  on macOS and Linux. Product previews come from the built native TUI's actual PTY cells;
+  the Ratatui explorer separately demonstrates reusable components with example data.
 
 ## Capabilities and Constraints
 
@@ -61,12 +67,21 @@ no hosted runtime to sell.
   compatibility identifiers (GitHub org/repo, package scopes).
 - Provider and model names are first-class and neutral; never rank providers
   in copy.
-- The 0.9.12 shell is not yet released. `web/lib/media-manifest.ts` marks
-  session video `pending`; the site must not ship mockups as screenshots. The
-  one real screenshot on hand is `web/public/codewhale-tui.png` — the
-  founder's 2026-09-04 capture of the v0.9.12 development build (new session,
-  braille C-curl whale, Work mode, Full Access). It is captioned as a
-  development build, never as a release.
+- The homepage explains what Codewhale does, the models and tools it connects
+  to, and how to install it. Keep it straightforward. Invented task briefs,
+  sample reports and terminal view galleries do not belong on the homepage.
+  Show one actual native TUI capture below the introduction. The product page
+  and component explorer can show the other views.
+- Use plain, concrete marketing copy about what people can build and do.
+  Headings name the benefit or action. Avoid robot jokes, choppy slogan
+  fragments, vague promises and internal agent-verification language in the
+  public interface. Keep service claims tied to actual setup and qualification.
+- `web/lib/media-manifest.ts` records the exact captured native build and
+  shared README image. Native views on the product page and getting-started
+  guide retain their original PTY text and colors. An isolated local demo may
+  prove real file edits, checks and delegated review, but does not prove a paid
+  provider call. Session video remains `pending`. Build captions distinguish
+  development builds from releases.
 - `/context-window` does not exist on the current base; do not document it.
 - Subagent role identifiers are those the code accepts (`general`, `explore`,
   `planner`, `reviewer`, `implement`, `test`, `advisor`, `custom`); the older
@@ -75,8 +90,9 @@ no hosted runtime to sell.
 
 ## Brand Commitments
 
-- Voice: quiet, dense, factual. Terminal vocabulary, no marketing superlatives,
-  no fabricated transcripts or reasoning traces.
+- Voice: direct, useful and factual. Lead with what someone can build or
+  accomplish. Use product controls where they help the task; avoid marketing
+  superlatives, fabricated transcripts and reasoning traces.
 - "It doesn't need to look special — it needs to look like Codewhale."
 - Assets: the canonical vector family lives in the CWC repo at
   `codewhale-apps/packages/brand/svg/` (mark, mark-gradient, mark-mono,
@@ -88,15 +104,19 @@ no hosted runtime to sell.
   2026-09-15 in favor of the canonical family. Web copies live in
   `web/public/brand/`.
 - Palette, type, shell direction, and the anti-slop rules are recorded in
-  `docs/design/DESIGN.md`; the colour tokens are owned by `crates/palette/src/rgb.rs`
-  and exported to `web/app/tokens.css`.
+  `docs/design/DESIGN.md`. Shared interface tokens come from
+  `vendor/codewhale-design/tokens.json` and are exported to `web/app/tokens.css`.
+  Website ocean and brand roles live in `web/app/styles/tokens-roles.css`;
+  `crates/palette/src/rgb.rs` owns the terminal presets.
 
 ## Evidence on Hand
 
 - Real: GitHub stars (live), release version and changelog (generated),
-  provider/tool counts (generated), the v0.9.12 development-build screenshot.
+  provider/tool counts (generated), and native capture provenance recorded in
+  the media manifest and public surface facts.
 - Absent, do not fabricate: testimonials, customer logos, benchmarks,
-  pricing, session video, or media of a published 0.9.12 release.
+  pricing or session video. Published downloads and development-source
+  captures are different evidence.
 
 ## Product Principles
 
@@ -113,4 +133,4 @@ no hosted runtime to sell.
 ## Accessibility & Inclusion
 
 WCAG 2.2 AA for text and controls. The audience includes screen-reader and
-keyboard-only developers; the site is also read at 390px on phones.
+keyboard-only users; the site is also read at 390px on phones.

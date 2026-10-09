@@ -14,6 +14,9 @@ ROOT = Path(__file__).resolve().parent
 # role can sit on, including a hovered or selected row.
 GROUNDS = ["background", "surface", "sidebar", "hover", "selected"]
 TEXT = ["foreground", "muted_foreground", "primary", "live", "attention", "danger"]
+# Secondary text carries labels, metadata and status words people must read at
+# small sizes, so it holds 5.5:1 on every ground, above the AA floor.
+TEXT_FLOORS = {"muted_foreground": 5.5}
 EDGES = ["border_strong"]
 FILLED = [("primary_foreground", "primary")]
 
@@ -27,7 +30,7 @@ def contrast(a, b):
     return (hi + 0.05) / (lo + 0.05)
 
 def contrast_violations(colors):
-    pairs = [(fg, bg, 4.5) for fg in TEXT for bg in GROUNDS]
+    pairs = [(fg, bg, TEXT_FLOORS.get(fg, 4.5)) for fg in TEXT for bg in GROUNDS]
     pairs += [(edge, bg, 3.0) for edge in EDGES for bg in GROUNDS]
     pairs += [(fg, bg, 4.5) for fg, bg in FILLED]
     found = []

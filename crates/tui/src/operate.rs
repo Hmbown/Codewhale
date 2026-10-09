@@ -692,21 +692,23 @@ fn keepalive_route(
     } else {
         (
             config
-                .active_provider_identity(config.api_provider())
+                .active_provider_identity()
                 .map_err(anyhow::Error::msg)?,
             config.default_model(),
         )
     };
     if model.trim().eq_ignore_ascii_case("auto") {
         let mut scoped = config.clone();
-        scoped.scope_to_provider_identity(&identity);
-        let credentials = crate::config::has_api_key_for(&scoped, identity.provider);
+        scoped
+            .scope_to_provider_identity(&identity)
+            .map_err(anyhow::Error::msg)?;
+        let credentials = crate::config::has_api_key_for(&scoped, &identity);
         return Ok((identity, "auto".to_string(), credentials));
     }
     let route =
         crate::route_runtime::resolve_runtime_route_for_identity(config, &identity, Some(&model))
             .map_err(anyhow::Error::msg)?;
-    let credentials = crate::config::has_api_key_for(&route.config, route.identity.provider);
+    let credentials = crate::config::has_api_key_for(&route.config, &route.identity);
     Ok((route.identity, route.model, credentials))
 }
 
@@ -1057,12 +1059,7 @@ impl OperationStore {
     }
 
     fn open_lock_file(&self) -> Result<fs::File> {
-        fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.lock_path)
+        crate::session_manager::open_private_lock_file(&self.lock_path)
             .with_context(|| format!("Failed to open {}", self.lock_path.display()))
     }
 
@@ -1478,12 +1475,15 @@ api_key_env = "CW_OPERATE_MISSING_TEST_KEY"
         let _cli = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
         let root = TempDir::new()?;
         let manager = AutomationManager::open_for_test(root.path().join("automations"))?;
-        let config = crate::config::Config {
-            provider: Some("custom".into()),
-            default_text_model: Some("legacy-model".into()),
-            ..Default::default()
-        }
-        .with_legacy_root(None, Some("https://legacy.example.test/v1".into()));
+        let config = crate::config::parse_config_base(
+            r#"provider = "custom"
+[providers.custom]
+kind = "openai-compatible"
+base_url = "https://legacy.example.test/v1"
+model = "legacy-model"
+auth_mode = "none"
+"#,
+        )?;
         upsert_keepalive(&manager, root.path(), false, &config, None)?;
         let record = manager.get_automation(OPERATE_KEEPALIVE_ID)?;
         assert_eq!(record.model.as_deref(), Some("legacy-model"));
@@ -1662,6 +1662,19 @@ api_key_env = "CW_OPERATE_MISSING_TEST_KEY"
                 .filter(|member| member.id == "lead")
                 .all(|member| member.model == "auto")
         );
+        Ok(())
+    }
+
+    /// The cross-process lock sidecar is owner-only like the operation file.
+    #[cfg(unix)]
+    #[test]
+    fn operation_lock_file_is_owner_only() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = TempDir::new()?;
+        let store = OperationStore::open(root.path())?;
+        start_operation(&store, root.path(), None, None, true, "auto")?;
+        let lock = root.path().join("current.json.lock");
+        assert_eq!(fs::metadata(&lock)?.permissions().mode() & 0o777, 0o600);
         Ok(())
     }
 
@@ -2117,11 +2130,11 @@ api_key_env = "CW_OPERATE_MISSING_TEST_KEY"
     #[test]
     fn calls_landed_checker_flags() {
         assert_eq!(
-            check_auto_merge_args("Hmbown/CodeWhale", "1234", "keel"),
+            check_auto_merge_args("codewhale-hq/CodeWhale", "1234", "keel"),
             vec![
                 "scripts/check-auto-merge.py",
                 "--repo",
-                "Hmbown/CodeWhale",
+                "codewhale-hq/CodeWhale",
                 "--pr",
                 "1234",
                 "--agent",
@@ -2129,14 +2142,14 @@ api_key_env = "CW_OPERATE_MISSING_TEST_KEY"
             ]
         );
         assert_eq!(
-            auto_merge_pr_args("Hmbown/CodeWhale", "1234", "keel")[0],
+            auto_merge_pr_args("codewhale-hq/CodeWhale", "1234", "keel")[0],
             "scripts/auto-merge-pr.py"
         );
         let deny = evaluate_auto_merge(
             AutoMergeRequest {
                 pr: "12",
                 role: "keel",
-                repo: "Hmbown/CodeWhale",
+                repo: "codewhale-hq/CodeWhale",
             },
             None,
         );
@@ -2150,7 +2163,7 @@ api_key_env = "CW_OPERATE_MISSING_TEST_KEY"
         let ok = |repo, pr, role| {
             validate_auto_merge_request(&AutoMergeRequest { pr, role, repo }).is_ok()
         };
-        assert!(ok("Hmbown/CodeWhale", "1234", "keel"));
+        assert!(ok("codewhale-hq/CodeWhale", "1234", "keel"));
         assert!(ok("a-b/c.d_e-f", "1", "scout_2"));
         for (repo, pr, role) in [
             ("Hmbown", "1", "keel"),
@@ -2205,7 +2218,7 @@ api_key_env = "CW_OPERATE_MISSING_TEST_KEY"
                 AutoMergeRequest {
                     pr: "42",
                     role: "keel",
-                    repo: "Hmbown/CodeWhale",
+                    repo: "codewhale-hq/CodeWhale",
                 },
                 Some(&checker),
             ),

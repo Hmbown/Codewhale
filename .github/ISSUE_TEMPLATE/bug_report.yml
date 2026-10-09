@@ -7,7 +7,7 @@ body:
       value: |
         Thanks for reporting. English or 中文 are both fine.
 
-        - Security problem? Do not post it here. Use a [private advisory](https://github.com/Hmbown/CodeWhale/security/advisories/new).
+        - Security problem? Do not post it here. Use a [private advisory](https://github.com/codewhale-hq/CodeWhale/security/advisories/new).
         - Already reported? Add a 👍 to that issue instead of opening a new one.
         - Remove API keys and tokens from anything you paste.
 

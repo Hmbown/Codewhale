@@ -24,25 +24,25 @@ const pathsEn = [
     title: "Report a problem",
     description: "File a bug, compatibility problem, or unclear behavior with system details, reproduction steps, and any logs you can share safely.",
     cta: "File an issue",
-    href: "https://github.com/Hmbown/CodeWhale/issues/new/choose",
+    href: "https://github.com/codewhale-hq/CodeWhale/issues/new/choose",
   },
   {
     title: "Improve code or tests",
     description: "Pick one problem with clear edges, write the smallest patch that fixes it, and add a regression test that covers it.",
     cta: "Browse open issues",
-    href: "https://github.com/Hmbown/CodeWhale/issues",
+    href: "https://github.com/codewhale-hq/CodeWhale/issues",
   },
   {
     title: "Improve documentation or translations",
     description: "Fix a wrong sentence, add an example, or help finish a language pack.",
     cta: "Open the localization guide",
-    href: "https://github.com/Hmbown/CodeWhale/blob/main/docs/LOCALIZATION.md",
+    href: "https://github.com/codewhale-hq/CodeWhale/blob/main/docs/LOCALIZATION.md",
   },
   {
     title: "Reproduce and review existing work",
     description: "Try an issue or pull request on your platform and provider. Post the commands you ran, what happened, and what is still wrong.",
     cta: "Browse pull requests",
-    href: "https://github.com/Hmbown/CodeWhale/pulls",
+    href: "https://github.com/codewhale-hq/CodeWhale/pulls",
   },
 ];
 
@@ -51,25 +51,25 @@ const pathsZh = [
     title: "报告问题",
     description: "报告 bug、兼容性问题或不清楚的行为，并附上系统信息、复现步骤和可以安全分享的日志。",
     cta: "提交 issue",
-    href: "https://github.com/Hmbown/CodeWhale/issues/new/choose",
+    href: "https://github.com/codewhale-hq/CodeWhale/issues/new/choose",
   },
   {
     title: "改进代码或测试",
     description: "挑一个范围清楚的问题，写最小的补丁，加一个覆盖改动的回归测试。",
     cta: "查看开放 issues",
-    href: "https://github.com/Hmbown/CodeWhale/issues",
+    href: "https://github.com/codewhale-hq/CodeWhale/issues",
   },
   {
     title: "改进文档或翻译",
     description: "改正说错的地方，补一个示例，或者帮忙完成一个语言包。",
     cta: "查看本地化指南",
-    href: "https://github.com/Hmbown/CodeWhale/blob/main/docs/LOCALIZATION.md",
+    href: "https://github.com/codewhale-hq/CodeWhale/blob/main/docs/LOCALIZATION.md",
   },
   {
     title: "复现并审查现有工作",
     description: "在你的平台和提供商上验证 issue 或 pull request，然后分享你运行的命令、结果和剩余问题。",
     cta: "查看 pull requests",
-    href: "https://github.com/Hmbown/CodeWhale/pulls",
+    href: "https://github.com/codewhale-hq/CodeWhale/pulls",
   },
 ];
 
@@ -107,10 +107,10 @@ export default async function CommunityPage({ params }: { params: Promise<{ loca
         pose="talk"
         actions={
           <>
-            <Link href="https://github.com/Hmbown/CodeWhale/issues/new/choose" className="btn btn-primary btn-lg">
+            <Link href="https://github.com/codewhale-hq/CodeWhale/issues/new/choose" className="btn btn-primary btn-lg">
               {t.fileIssue}
             </Link>
-            <Link href="https://github.com/Hmbown/CodeWhale/pulls" className="btn btn-secondary btn-lg">
+            <Link href="https://github.com/codewhale-hq/CodeWhale/pulls" className="btn btn-secondary btn-lg">
               {t.browsePulls}
             </Link>
             <Link href={p("/contribute")} className="btn btn-ghost btn-lg">
@@ -195,10 +195,10 @@ export default async function CommunityPage({ params }: { params: Promise<{ loca
             ) : null}
           </div>
           <p className="status-line mt-4">
-            <Link href="https://github.com/Hmbown/CodeWhale/blob/main/docs/CONTRIBUTORS.md" className="link">
+            <Link href="https://github.com/codewhale-hq/CodeWhale/blob/main/docs/CONTRIBUTORS.md" className="link">
               {t.fullRecord}
             </Link>
-            <Link href="https://github.com/Hmbown/CodeWhale/blob/main/CHANGELOG.md" className="link">CHANGELOG</Link>
+            <Link href="https://github.com/codewhale-hq/CodeWhale/blob/main/CHANGELOG.md" className="link">CHANGELOG</Link>
           </p>
         </Section>
       </div>

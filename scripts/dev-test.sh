@@ -14,8 +14,8 @@
 #
 # Examples:
 #   scripts/dev-test.sh config
-#   scripts/dev-test.sh tui elapsed::
-#   scripts/dev-test.sh crates/runtime/src/elapsed.rs
+#   scripts/dev-test.sh command-contract elapsed::
+#   scripts/dev-test.sh crates/command-contract/src/elapsed.rs
 #
 # Environment:
 #   CODEWHALE_DEV_NEXTEST  auto|1|0  (default auto: use cargo-nextest when
@@ -44,6 +44,7 @@ app-server        cargo test -p codewhale-app-server --lib --locked
 build-support     cargo test -p codewhale-build-support --lib --locked
 cli               cargo test -p codewhale-cli --lib --locked
 command-contract  cargo test -p codewhale-command-contract --lib --locked
+commands          cargo test -p codewhale-commands --lib --locked
 config            cargo test -p codewhale-config --lib --locked
 core              cargo test -p codewhale-core --lib --locked
 execpolicy        cargo test -p codewhale-execpolicy --lib --locked
@@ -51,6 +52,7 @@ hooks             cargo test -p codewhale-hooks --lib --locked
 lane              cargo test -p codewhale-lane --lib --locked
 mcp               cargo test -p codewhale-mcp --lib --locked
 paths             cargo test -p codewhale-paths --lib --locked
+portable-config-policy cargo test -p codewhale-portable-config-policy --lib --locked
 protocol          cargo test -p codewhale-protocol --lib --locked
 release           cargo test -p codewhale-release --lib --locked
 runtime           cargo test -p codewhale-runtime --lib --locked
@@ -109,6 +111,9 @@ if [ -e "$area" ] || printf '%s' "$area" | grep -q /; then
   rel=${area#./}
   extra=
   case $rel in
+    tests/portable-config-policy/*|tests/portable-config-policy)
+      area=portable-config-policy
+      ;;
     crates/tui/tests/integration/*)
       area=tui-integration
       extra=$(basename "$rel" .rs)
@@ -144,9 +149,9 @@ if [ -e "$area" ] || printf '%s' "$area" | grep -q /; then
     crates/tui/*|crates/tui)
       area=tui
       ;;
-    crates/runtime/src/*)
-      area=runtime
-      extra=$(printf '%s' "${rel#crates/runtime/src/}" | awk -F/ '{print $1}')
+    crates/runtime/src/*|crates/commands/src/*|crates/command-contract/src/*)
+      area=$(printf '%s' "$rel" | awk -F/ '{print $2}')
+      extra=$(printf '%s' "${rel#crates/*/src/}" | awk -F/ '{print $1}')
       extra=${extra%.rs}::
       ;;
     crates/*)
@@ -174,6 +179,7 @@ case $area in
   build-support) pkg=codewhale-build-support ;;
   cli) pkg=codewhale-cli ;;
   command-contract) pkg=codewhale-command-contract ;;
+  commands) pkg=codewhale-commands ;;
   config) pkg=codewhale-config ;;
   core) pkg=codewhale-core ;;
   execpolicy) pkg=codewhale-execpolicy ;;
@@ -181,6 +187,7 @@ case $area in
   lane) pkg=codewhale-lane ;;
   mcp) pkg=codewhale-mcp ;;
   paths) pkg=codewhale-paths ;;
+  portable-config-policy) pkg=codewhale-portable-config-policy ;;
   protocol) pkg=codewhale-protocol ;;
   release) pkg=codewhale-release ;;
   runtime) pkg=codewhale-runtime ;;
@@ -238,6 +245,12 @@ printf '+ cargo %s\n' "$*"
 # topology once, retaining Cargo's build-dir template and any caller overrides.
 CODEWHALE_CACHE_ROOT=$(codewhale_dev_cache_root)
 export CODEWHALE_CACHE_ROOT
+# Engine acceptance launches the canonical CLI, which is not a binary target
+# of the Engine library package. Build it with the same cache/lock topology.
+if [ "$target" = "--test" ]; then
+  "$repo_root/scripts/with-hermetic-test-home.sh" "$repo_root/scripts/dev-cargo.sh" \
+    build -p codewhale-cli --bin codewhale --locked
+fi
 # libtest exits 0 when a filter matches nothing, which has been mistaken for
 # a pass. With an explicit filter, refuse that green. (nextest already fails
 # loud on an empty selection, so the guard only wraps libtest.)

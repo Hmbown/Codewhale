@@ -136,7 +136,7 @@ Repository-maintenance and release-operator helpers (the `gh-*` skills and
 of the end-user starter pack and are never auto-installed; a catalog-matrix
 test pins that boundary. Shipping them as an optional bundle is plugin-delivery
 work tracked separately in
-[#4836](https://github.com/Hmbown/CodeWhale/issues/4836).
+[#4836](https://github.com/codewhale-hq/CodeWhale/issues/4836).
 
 ### Invocation and alias metadata
 
@@ -205,7 +205,7 @@ write does not give that old binary the new identity semantics.
 
 ### Starter-pack parity decisions
 
-The v0.9.2 parity audit in [#4698](https://github.com/Hmbown/CodeWhale/issues/4698)
+The v0.9.2 parity audit in [#4698](https://github.com/codewhale-hq/CodeWhale/issues/4698)
 compared the five `xai-grok-memory` / `xai-grok-shell` reference skills with
 the actual Codewhale bundle. This is a decision matrix, not a request to copy
 reference text or advertise unsupported tools:
@@ -354,7 +354,7 @@ Audit and mutation share a bounded package digest:
 ## Readiness
 
 The audit model has a readiness field and optional provider hook for a future
-readiness cache ([#4407](https://github.com/Hmbown/CodeWhale/issues/4407)).
+readiness cache ([#4407](https://github.com/codewhale-hq/CodeWhale/issues/4407)).
 Today, when no cache is wired, readiness is always **`Unknown`**. The manager
 does not run readiness probes and does not block mutations on readiness.
 

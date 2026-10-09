@@ -1,4 +1,4 @@
-{"request":[{"method":"POST","path":"/codex/responses"}]}
+{"request":[{"method":"POST","path":"/v1/responses"}]}
 {"type":"message_start","message":{"id":"","type":"message","role":"assistant","content":[],"model":"gpt-5.5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}
 {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_conf|fc_conf","name":"get_weather","input":{}}}
 {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"city\":"}}

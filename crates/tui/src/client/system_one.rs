@@ -13,7 +13,7 @@
 //! redaction and bounded retry plumbing; there is no second HTTP client.
 //!
 //! Known limits (written down so nobody assumes them):
-//! * TypeSafe is **not** an [`ApiProvider`]: it serves no chat route, so it is
+//! * TypeSafe is **not** an [`ProviderKind`]: it serves no chat route, so it is
 //!   the decision router's own endpoint + key (`TYPESAFE_API_KEY`, the
 //!   `typesafe` secret-store slot, or `[providers.typesafe] api_key` /
 //!   `api_key_env`). Its tokens enter the shared usage ledger under a frozen
@@ -57,7 +57,7 @@ impl DecisionRouterRoute {
     #[must_use]
     pub(crate) fn parse(provider: &str) -> Option<Self> {
         let provider = provider.trim();
-        if ApiProvider::parse(provider) == Some(ApiProvider::Openrouter) {
+        if ProviderKind::parse(provider) == Some(ProviderKind::Openrouter) {
             Some(Self::Openrouter)
         } else if provider.eq_ignore_ascii_case(TYPESAFE_KEY_NAME)
             || provider.eq_ignore_ascii_case("typesafe-ai")
@@ -88,7 +88,9 @@ impl DecisionRouterRoute {
     #[must_use]
     pub(crate) fn has_key(self, config: &Config) -> bool {
         match self {
-            Self::Openrouter => crate::config::has_api_key_for(config, ApiProvider::Openrouter),
+            Self::Openrouter => config
+                .builtin_provider_identity(ProviderKind::Openrouter)
+                .is_ok_and(|identity| crate::config::has_api_key_for(config, &identity)),
             Self::Typesafe => typesafe_api_key(config).is_some(),
         }
     }
@@ -259,7 +261,7 @@ impl CodewhaleClient {
         match route {
             DecisionRouterRoute::Openrouter => {
                 let mut scoped = config.clone();
-                scoped.provider = Some(ApiProvider::Openrouter.as_str().to_string());
+                scoped.provider = Some(ProviderKind::Openrouter.as_str().to_string());
                 // The decision model id is not a chat route; it travels in the
                 // JSON body only.
                 scoped.default_text_model = None;
@@ -280,7 +282,7 @@ impl CodewhaleClient {
                 client.http_client = Self::http_client_builder_with_auth_mode(
                     &key,
                     &HashMap::new(),
-                    ApiProvider::Custom,
+                    ProviderKind::Custom,
                     &base_url,
                     WireFormat::ChatCompletions,
                     false,
@@ -292,8 +294,27 @@ impl CodewhaleClient {
                 client.http1_client = client.http_client.clone();
                 // Repointing auth/URL must also replace the inherited chat
                 // route identity. No TypeSafe price/product is guessed.
-                client.api_provider = ApiProvider::Custom;
-                client.provider_identity = TYPESAFE_KEY_NAME.to_string();
+                client.api_provider = ProviderKind::Custom;
+                // The fixed decision authority owns this validated key/URL;
+                // ordinary route admission supplies only its exact identity.
+                let mut route_config = config.clone();
+                route_config.provider = Some(TYPESAFE_KEY_NAME.into());
+                route_config
+                    .providers
+                    .get_or_insert_with(crate::config::ProvidersConfig::default)
+                    .custom
+                    .insert(
+                        TYPESAFE_KEY_NAME.into(),
+                        crate::config::ProviderConfig {
+                            kind: Some("openai-compatible".into()),
+                            base_url: Some(client.base_url.clone()),
+                            api_key: Some(key.clone()),
+                            ..crate::config::ProviderConfig::default()
+                        },
+                    );
+                client.admitted_identity = route_config
+                    .active_provider_identity()
+                    .map_err(anyhow::Error::msg)?;
                 client.openrouter_vendor = None;
                 client.billing_surface = None;
                 client.billing_mode = crate::cost_status::RouteBillingMode::Unknown;
@@ -334,7 +355,7 @@ impl CodewhaleClient {
         isolated.retry.max_retries = 0;
         let _inference = isolated.acquire_remote_control_inference_permit().await;
         let _permit = isolated.acquire_provider_request_permit().await;
-        let url = if isolated.api_provider == ApiProvider::Openrouter {
+        let url = if isolated.api_provider == ProviderKind::Openrouter {
             // The OpenRouter Decisions API is a sibling of /api/v1, so keep
             // the configured origin/proxy prefix and replace only /v1.
             let mut url = reqwest::Url::parse(&isolated.base_url)

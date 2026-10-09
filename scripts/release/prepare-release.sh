@@ -9,7 +9,10 @@
 # package and lock, the root npm lock workspace records, the remote-smoke default
 # tag, README*.md install-tag examples when present, the public fact matrix's
 # source-candidate version, Cargo.lock, crates/tui/CHANGELOG.md (via
-# sync-changelog.sh), and web/lib/facts.generated.ts (via derive-facts.mjs).
+# sync-changelog.sh), web/lib/facts.generated.ts (via derive-facts.mjs), and
+# the two version-stamped contract fixtures
+# (crates/config/src/route/providers-export.golden.json and
+# crates/tui/src/commands/contract/fixtures/config_policy/status.json).
 # The website's changelog and install-guide modules are not tracked; the web
 # build and test runs derive them from CHANGELOG.md and docs/INSTALL.md.
 #
@@ -56,6 +59,8 @@ transaction_paths=(
   README.ko-KR.md
   crates/tui/CHANGELOG.md
   web/lib/facts.generated.ts
+  crates/config/src/route/providers-export.golden.json
+  crates/tui/src/commands/contract/fixtures/config_policy/status.json
 )
 for manifest in crates/*/Cargo.toml; do
   transaction_paths+=("${manifest}")
@@ -357,6 +362,32 @@ if facts_after.get("latestPublishedRelease") != published_before:
     sys.exit("error: release preparation must not change latestPublishedRelease")
 facts.write_text(facts_out)
 print("  docs/public-surface-facts.json: 1 source-candidate replacement")
+
+# 7) Version-stamped contract fixtures. The golden export and the config
+#    policy status baseline are compared against the workspace version by
+#    their own tests; check-versions.sh (run below) guards them too. Move
+#    them with every bump or CI's test job reddens on the new version.
+golden_fixture = pathlib.Path("crates/config/src/route/providers-export.golden.json")
+if golden_fixture.exists():
+    text = golden_fixture.read_text()
+    out, n = re.subn(rf'("runtimeVersion"\s*:\s*"){old_re}(")', rf"\g<1>{new}\g<2>", text)
+    if n != 1:
+        sys.exit(f"error: expected exactly one runtimeVersion in {golden_fixture}, made {n}")
+    golden_fixture.write_text(out)
+    print(f"  {golden_fixture}: 1 runtimeVersion replacement")
+status_fixture = pathlib.Path(
+    "crates/tui/src/commands/contract/fixtures/config_policy/status.json"
+)
+if status_fixture.exists():
+    text = status_fixture.read_text()
+    out, n = re.subn(rf"\b(codewhale\s+){old_re}\b", rf"\g<1>{new}", text, count=1)
+    if n != 1:
+        sys.exit(
+            f"error: expected the {status_fixture} header to carry {old}, "
+            f"made {n} replacement(s)"
+        )
+    status_fixture.write_text(out)
+    print(f"  {status_fixture}: 1 version replacement")
 PY
 
   echo "Refreshing Cargo.lock..."

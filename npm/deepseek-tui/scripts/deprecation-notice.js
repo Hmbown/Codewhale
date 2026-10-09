@@ -13,7 +13,7 @@ const notice = [
   "  │                                                                   │",
   "  │  codewhale installs the `codewhale` and `codew` commands.         │",
   "  │  Historical old-name shims ended with v0.8.x. See:                │",
-  "  │  https://github.com/Hmbown/CodeWhale/blob/main/docs/REBRAND.md │",
+  "  │  https://github.com/codewhale-hq/CodeWhale/blob/main/docs/REBRAND.md │",
   "  │                                                                   │",
   "  ╰───────────────────────────────────────────────────────────────────╯",
   "",

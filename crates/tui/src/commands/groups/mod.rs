@@ -15,7 +15,6 @@ macro_rules! cached_command_list {
 
 pub mod config;
 pub mod core;
-pub mod debug;
 pub mod memory;
 pub mod plugins;
 pub mod project;

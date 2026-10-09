@@ -178,7 +178,7 @@ UPSTREAM_FIXTURE = {
                     "limit": {"context": 1048576, "output": 131072},
                     "cost": {"input": 3, "output": 15, "tiers": [{"input": 6}]},
                     "modalities": {"input": ["text", "image"], "output": ["text"]},
-                    "description": "not carried",
+                    "description": "public model description",
                     "client_secret": "sk-row-secret",
                 },
                 "glm-5.2": {"id": "glm-5.2", "reasoning": True},
@@ -216,6 +216,7 @@ class SeedGeneratorTests(unittest.TestCase):
             json.dumps(
                 {
                     "revision": "t",
+                    "reviewed": {"revision": "fixture"},
                     "models": [{"provider": "moonshot", "id": "kimi-k3", "max_output": 131072, "reason": "r"}],
                 }
             ),
@@ -239,7 +240,7 @@ class SeedGeneratorTests(unittest.TestCase):
     def render_cmd(self, *extra: str) -> subprocess.CompletedProcess[str]:
         return run_script(
             "seed", "render", "--spec", str(self.spec), "--lock", str(self.lock),
-            "--out", str(self.out), *extra,
+            "--out", str(self.out), "--corrections", str(self.corrections), *extra,
         )
 
     def test_dry_run_writes_nothing(self) -> None:
@@ -253,13 +254,13 @@ class SeedGeneratorTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         text = self.lock.read_text(encoding="utf-8")
         self.assertNotIn("sk-", text)
-        self.assertNotIn("description", text)
-        self.assertNotIn("tiers", text)
-        self.assertNotIn("benchmarks", text)
         lock = json.loads(text)
         expected = hashlib.sha256(self.upstream.read_bytes()).hexdigest()
         self.assertEqual(lock["source"]["sha256"], expected)
         rows = lock["providers"]["moonshotai"]
+        self.assertEqual(rows["kimi-k3"]["description"], "public model description")
+        self.assertEqual(rows["kimi-k3"]["cost"]["tiers"], [{"input": 6}])
+        self.assertEqual(lock["models"]["vendor/demo-pro"]["benchmarks"], [{"name": "x"}])
         # Case-insensitive match keeps upstream's id in the lock.
         self.assertIn("glm-5.2", rows)
         self.assertNotIn("kimi-new", rows, "only referenced rows are pinned")
@@ -334,6 +335,30 @@ class CommittedSeedTests(unittest.TestCase):
     def test_committed_seed_is_the_rendered_seed(self) -> None:
         proc = run_script("seed", "render", "--check")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_reviewed_source_is_exactly_embedded_without_mutating_lock(self) -> None:
+        data = json.loads(SEED.read_text())
+        source = json.loads((ROOT / "crates/config/assets/catalog_corrections.json").read_text())
+        self.assertEqual(data["_reviewed"], source["reviewed"])
+        self.assertIn("fetched 2026-09-26", data["_meta"]["upstream"])
+        self.assertEqual(len(data["_reviewed"]["public_models"]), 78)
+
+    def test_reviewed_malformed_and_duplicate_public_facts_are_refused(self) -> None:
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import catalog_models_dev as mod
+        data = json.loads((ROOT / "crates/config/assets/catalog_corrections.json").read_text())["reviewed"]
+        for mutate in [
+            lambda row: row.pop("revision"),
+            lambda row: row["intrinsic"]["kimi-k3"].update(context_window=0),
+            lambda row: row["intrinsic"]["kimi-k3"].update(max_output=True),
+            lambda row: row["public_models"].append(row["public_models"][0]),
+            lambda row: row["compatibility_aliases"].update(hostile={"name": "bad\x1bvalue"}),
+            lambda row: row["numeric_refs"]["KIMI_K3_CONTEXT_WINDOW_TOKENS"].update(model="missing-private-name"),
+        ]:
+            fixture = json.loads(json.dumps(data))
+            mutate(fixture)
+            with self.assertRaises(SystemExit):
+                mod.validate_reviewed(fixture)
 
 
 if __name__ == "__main__":

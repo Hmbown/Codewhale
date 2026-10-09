@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,7 +37,7 @@ PATTERNS = {
         r"\bstd::fs::(?:read|read_to_string|write|create_dir|create_dir_all|"
         r"remove_file|remove_dir|remove_dir_all|copy|rename|metadata|"
         r"symlink_metadata|read_dir|canonicalize|exists|set_permissions|"
-        r"hard_link|soft_link|symlink|File|OpenOptions|DirBuilder)\b"
+        r"hard_link|soft_link|symlink|(?:File|OpenOptions|DirBuilder)(?=\s*::))\b"
     ),
     # Method form (`path.canonicalize()`) resolves the path on the calling
     # thread exactly like `std::fs::canonicalize` (#6522 review).
@@ -64,7 +65,7 @@ TOKEN_RE = re.compile(
 )
 
 
-def strip_comments_and_strings(text: str) -> str:
+def strip_comments_and_strings(text: str, *, module_literals: bool = False) -> str:
     """Blank out comments and string/char literal contents, keeping newlines."""
     out = list(text)
     i, n = 0, len(text)
@@ -142,7 +143,9 @@ def strip_comments_and_strings(text: str) -> str:
             i += 2
             continue
         if c == "r":
-            m = re.match(r'r(#+)"', text[i:])
+            # Production counting keeps its baseline masking unchanged. The
+            # module-edge reader additionally recognises zero-hash raw paths.
+            m = re.match(r'r(#*)"' if module_literals else r'r(#+)"', text[i:])
             if m:
                 raw_hashes = len(m.group(1))
                 in_raw = True
@@ -243,40 +246,189 @@ def file_counts(path: Path) -> dict[str, int]:
     return {k: v for k, v in counts.items() if v}
 
 
-CFG_TEST_MOD = re.compile(
-    r"#\[cfg\(test\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;"
-)
-
-
-def cfg_test_module_files() -> set[Path]:
-    """Files that are entire `#[cfg(test)]` modules declared by another file.
-
-    The per-file scanner recognises test scope it can see *inside* a file —
-    `#[test]`, `mod tests`, `fn test_*`. It cannot see that a whole file is
-    test-only, because that fact lives in the parent's `#[cfg(test)] mod
-    foo;` declaration. Extracting a test suite into its own file therefore
-    made an untouched call site look new (#6209 follow-up: PR #6096's
-    `session_export_*_tests.rs`). Excluding these keeps the ratchet's stated
-    contract — "not ... test code" — instead of taxing the extraction.
-    """
-    excluded: set[Path] = set()
-    for path in CRATES.rglob("*.rs"):
+def _rust_path_literal(text: str) -> tuple[str, int] | None:
+    """Only a literal include/path: never evaluate concat or a Rust expression."""
+    normal = re.match(r'"(?:[^"\\]|\\.)*"', text)
+    if normal:
         try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
+            value = json.loads(normal.group())
+        except ValueError:
+            return None
+        return value, normal.end()
+    raw = re.match(r'r(#+|)"', text)
+    if raw:
+        end = text.find('"' + raw.group(1), raw.end())
+        if end >= 0:
+            return text[raw.end():end], end + 1 + len(raw.group(1))
+    return None
+
+
+def _test_module_edges(path: Path, text: str, *, crate_root: bool = False) -> list[tuple[Path, bool]]:
+    """Literal item edges and their actual lexical cfg(test) module scope."""
+    code = strip_comments_and_strings(text, module_literals=True)
+    closes: dict[int, int] = {}
+    braces: list[int] = []
+    for position, char in enumerate(code):
+        if char == "{":
+            braces.append(position)
+        elif char == "}" and braces:
+            closes[braces.pop()] = position
+    modules = list(re.finditer(
+        r"(?P<attrs>(?:#\s*\[[^\]]*\]\s*)*)"
+        r"(?:pub(?:\([^)]*\))?\s+)?mod\s+(?P<name>[A-Za-z_]\w*)\s*(?P<end>[{;])",
+        code,
+    ))
+    inline = [entry for entry in modules if entry.group("end") == "{" and entry.end() - 1 in closes]
+    def test_attribute(entry: re.Match[str]) -> bool:
+        return any(re.fullmatch(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]", attr.group())
+                   for attr in re.finditer(r"#\s*\[[^\]]*\]", entry.group("attrs")))
+    def ancestors(position: int) -> list[re.Match[str]]:
+        return [entry for entry in inline if entry.end() <= position < closes[entry.end() - 1]]
+    def under_test(position: int) -> bool:
+        return any(test_attribute(entry) for entry in ancestors(position))
+    base = path.parent if crate_root or path.name in ("mod.rs", "lib.rs", "main.rs") else path.parent / path.stem
+    edges: list[tuple[Path, bool]] = []
+    for entry in modules:
+        if entry.group("end") != ";":
+            continue
+        parents = ancestors(entry.start())
+        # Path attributes on an inline module can change its directory owner;
+        # refuse to infer such a layout instead of exempting a guessed file.
+        if any(re.search(r"#\s*\[\s*path\s*=", parent.group("attrs")) for parent in parents):
+            continue
+        directory = base.joinpath(*(parent.group("name") for parent in parents))
+        attrs = text[entry.start("attrs"):entry.end("attrs")]
+        configured = re.search(r"#\s*\[\s*path\s*=\s*", attrs)
+        if configured:
+            literal = _rust_path_literal(attrs[configured.end():])
+            if not literal:
+                continue
+            directory = directory if parents else path.parent
+            candidates = [directory / literal[0]]
+        else:
+            name = entry.group("name")
+            candidates = [directory / f"{name}.rs", directory / name / "mod.rs"]
+        found = [candidate.resolve() for candidate in candidates if candidate.is_file()]
+        if len(found) == 1:
+            edges.append((found[0], test_attribute(entry) or under_test(entry.start())))
+    for entry in re.finditer(r"(?<![\w:])include\s*!\s*\(\s*", code):
+        # String contents are masked, so whitespace in `code` also covers the
+        # path. Recover only the original argument immediately after `(`.
+        opening = code.index("(", entry.start(), entry.end())
+        argument = text[opening + 1:].lstrip()
+        literal = _rust_path_literal(argument)
+        if not literal or not re.match(r"\s*,?\s*\)", argument[literal[1]:]):
+            continue
+        target = (path.parent / literal[0]).resolve()
+        if target.is_file():
+            edges.append((target, under_test(entry.start())))
+    return edges
+
+
+def _cargo_crate_roots(scan_root: Path) -> tuple[set[Path], set[Path]]:
+    """Classify actual Cargo entry points; production always wins a conflict."""
+    roots: set[Path] = set()
+    test_roots: set[Path] = set()
+    # Preserve conventional roots even in hermetic scopes without a manifest.
+    for source in (scan_root, *scan_root.rglob("src")):
+        if not source.is_dir():
+            continue
+        candidates = [source / "lib.rs", source / "main.rs"]
+        candidates.extend((source / "bin").glob("*.rs"))
+        candidates.extend((source / "bin").glob("*/main.rs"))
+        roots.update(path.resolve() for path in candidates if path.is_file())
+    for manifest in scan_root.rglob("Cargo.toml"):
+        try:
+            config = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # A malformed/unreadable manifest must not exempt an unknown root.
+            roots.update(path.resolve() for path in manifest.parent.rglob("*.rs"))
+            continue
+        if not isinstance(config.get("package"), dict):
+            continue
+        targets = [config.get("lib", {}), *config.get("bin", [])]
+        for target in targets:
+            if isinstance(target, dict) and isinstance(target.get("path"), str):
+                path = manifest.parent / target["path"]
+                if path.is_file():
+                    roots.add(path.resolve())
+        declared_names = set()
+        for target in config.get("test", []):
+            if not isinstance(target, dict):
+                continue
+            name, path = target.get("name"), target.get("path")
+            if isinstance(name, str):
+                declared_names.add(name)
+            if isinstance(path, str):
+                candidates = [manifest.parent / path]
+            elif isinstance(name, str):
+                candidates = [manifest.parent / "tests" / f"{name}.rs",
+                              manifest.parent / "tests" / name / "main.rs"]
+            else:
+                continue
+            found = [candidate.resolve() for candidate in candidates if candidate.is_file()]
+            if len(found) == 1:
+                test_roots.add(found[0])
+            else:
+                roots.update(found)  # Invalid/ambiguous target cannot exempt code.
+        if config["package"].get("autotests", True):
+            automatic: dict[str, list[Path]] = {}
+            directory = manifest.parent / "tests"
+            for candidate in (*directory.glob("*.rs"), *directory.glob("*/main.rs")):
+                name = candidate.parent.name if candidate.name == "main.rs" else candidate.stem
+                if name not in declared_names and candidate.is_file():
+                    automatic.setdefault(name, []).append(candidate.resolve())
+            for found in automatic.values():
+                if len(found) == 1:
+                    test_roots.add(found[0])
+                else:
+                    roots.update(found)
+    return roots, test_roots
+
+
+def module_file_scopes(scan_root: Path | None = None) -> tuple[set[Path], set[Path]]:
+    """Test-only files and production conflicts from the same literal graph.
+
+    Follow literal includes recursively from actual cfg(test) inline or
+    external modules. A file also included by production remains counted,
+    as do its unguarded descendants. Comments, strings and dynamic include
+    expressions are never an exemption, nor is a `tests`-looking file name.
+    """
+    scan_root = (CRATES if scan_root is None else scan_root).resolve()
+    cargo_production, cargo_tests = _cargo_crate_roots(scan_root)
+    graph: dict[Path, list[tuple[Path, bool]]] = {}
+    for path in scan_root.rglob("*.rs"):
+        try:
+            graph[path.resolve()] = _test_module_edges(
+                path, path.read_text(encoding="utf-8", errors="ignore"),
+                crate_root=path.resolve() in cargo_production | cargo_tests,
+            )
         except OSError:
             continue
-        # `mod foo;` in `mod.rs`/`lib.rs`/`main.rs` resolves beside the file;
-        # in any other `bar.rs` it resolves under `bar/` (non-mod-rs layout).
-        base = (
-            path.parent
-            if path.name in ("mod.rs", "lib.rs", "main.rs")
-            else path.parent / path.stem
-        )
-        for name in CFG_TEST_MOD.findall(text):
-            for candidate in (base / f"{name}.rs", base / name / "mod.rs"):
-                if candidate.is_file():
-                    excluded.add(candidate.resolve())
-    return excluded
+    test_reachable = {target for edges in graph.values() for target, test in edges if test}
+    test_reachable.update(cargo_tests & set(graph))
+    pending = list(test_reachable)
+    while pending:
+        for target, _test in graph.get(pending.pop(), []):
+            if target not in test_reachable:
+                test_reachable.add(target)
+                pending.append(target)
+    crate_roots = cargo_production & set(graph)
+    production = (set(graph) - test_reachable) | crate_roots
+    pending = list(production)
+    while pending:
+        for target, test in graph.get(pending.pop(), []):
+            if not test and target not in production:
+                production.add(target)
+                pending.append(target)
+    # A caller with legacy test-path heuristics must not exempt a known
+    # production/test conflict or a real Cargo entry point by its filename.
+    return test_reachable - production, (test_reachable & production) | crate_roots
+
+
+def cfg_test_module_files(scan_root: Path | None = None) -> set[Path]:
+    """Reuse the literal graph with an explicit scope; default remains CRATES."""
+    return module_file_scopes(scan_root)[0]
 
 
 def collect_current() -> dict[str, dict[str, int]]:

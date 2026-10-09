@@ -2,7 +2,7 @@ event: response.created
 data: {"type":"response.created","response":{"id":"resp_conf_fc","status":"in_progress"}}
 
 event: response.output_item.added
-data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_conf","call_id":"call_conf","name":"get_weather","arguments":""}}
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","namespace":"codewhale","id":"fc_conf","call_id":"call_conf","name":"get_weather","arguments":""}}
 
 event: response.function_call_arguments.delta
 data: {"type":"response.function_call_arguments.delta","item_id":"fc_conf","output_index":0,"delta":"{\"city\":"}
@@ -14,7 +14,7 @@ event: response.function_call_arguments.done
 data: {"type":"response.function_call_arguments.done","item_id":"fc_conf","output_index":0,"arguments":"{\"city\":\"Lima\"}"}
 
 event: response.output_item.done
-data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_conf","call_id":"call_conf","name":"get_weather","arguments":"{\"city\":\"Lima\"}","status":"completed"}}
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","namespace":"codewhale","id":"fc_conf","call_id":"call_conf","name":"get_weather","arguments":"{\"city\":\"Lima\"}","status":"completed"}}
 
 event: response.completed
 data: {"type":"response.completed","response":{"id":"resp_conf_fc","status":"completed","usage":{"input_tokens":25,"output_tokens":9,"total_tokens":34}}}

@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use super::detect::{
-    DetectEnv, DshDetection, DshRunner, classify_version, detect, settings_namespaces,
+    DetectEnv, DshDetection, DshRunner, classify_version, detect, parse_dsh_version,
+    settings_namespaces,
 };
 use super::identity::{
     CodewhaleRouteIdentity, DshAdapter, DshPermissionMode, WireProtocol, dsh_reasoning_effort,
@@ -112,6 +113,100 @@ fn version_classification_is_exact_about_the_verified_line() {
         classify_version("nightly", true),
         DshCompatibility::Unparsed { .. }
     ));
+}
+
+#[test]
+fn real_dsh_prerelease_versions_parse_and_classify_as_unverified() {
+    // Version strings taken from upstream DSH tags (`dsh-v0.1.7-alpha.2`, ...)
+    // and the commander `--version` output (a bare version, no prefix).
+    for raw in [
+        "0.1.7-alpha.2",
+        "0.1.6-alpha.1",
+        "0.1.5-rc.1",
+        "0.1.3-beta.1",
+        "0.2.0-rc.2",
+        "v0.1.7-alpha.2",
+        "  0.1.7-alpha.2\n",
+    ] {
+        assert!(
+            matches!(
+                classify_version(raw, true),
+                DshCompatibility::NewerUnverified { .. }
+            ),
+            "{raw:?} should be newer-unverified"
+        );
+        assert!(
+            matches!(
+                classify_version(raw, false),
+                DshCompatibility::Incompatible { .. }
+            ),
+            "{raw:?} without --patch should be incompatible"
+        );
+    }
+    // Older than the verified 0.1.0-rc.6 stays incompatible, including
+    // alpha/beta of the same core version (alpha < beta < rc < release).
+    for raw in ["0.1.0-rc.5", "0.1.0-beta.9", "0.1.0-alpha.9", "0.0.9"] {
+        assert!(
+            matches!(
+                classify_version(raw, true),
+                DshCompatibility::Incompatible { .. }
+            ),
+            "{raw:?} should be incompatible"
+        );
+    }
+    // Verified is exact: build metadata does not change precedence.
+    assert_eq!(
+        classify_version("0.1.0-rc.6+build.5", true),
+        DshCompatibility::Verified
+    );
+}
+
+#[test]
+fn dsh_version_ordering_follows_semver_precedence() {
+    let ordered = [
+        "0.1.0-alpha.1",
+        "0.1.0-beta.1",
+        "0.1.0-rc.6",
+        "0.1.0",
+        "0.1.6-alpha.1",
+        "0.1.7-alpha.2",
+        "0.1.7-rc.1",
+        "0.2.0-rc.1",
+    ];
+    for pair in ordered.windows(2) {
+        let (lo, hi) = (
+            parse_dsh_version(pair[0]).expect("parses"),
+            parse_dsh_version(pair[1]).expect("parses"),
+        );
+        assert!(
+            lo.cmp_precedence(&hi).is_lt(),
+            "{} should sort before {}",
+            pair[0],
+            pair[1]
+        );
+    }
+}
+
+#[test]
+fn non_version_text_is_unparsed_not_a_version() {
+    for raw in [
+        "",
+        "dsh",
+        "nightly",
+        "0.1",
+        "1.2.3.4",
+        "0.1.0-",
+        "not a version 0.1.0-rc.6",
+        "dsh 0.1.0-rc.6",
+    ] {
+        assert_eq!(
+            classify_version(raw, true),
+            DshCompatibility::Unparsed {
+                raw: raw.trim().to_string()
+            },
+            "{raw:?} should be unparsed"
+        );
+    }
 }
 
 #[test]

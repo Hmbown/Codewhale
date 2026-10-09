@@ -1,0 +1,6 @@
+/* Code tinting reuses the site's semantic inks, so both appearances hold contrast. */
+.rat-tok-comment { color: var(--muted); font-style: italic; }
+.rat-tok-string { color: var(--live); }
+.rat-tok-keyword { color: var(--accent); }
+.rat-tok-number { color: var(--attention); }
+.rat-tok-macro { color: var(--danger); }

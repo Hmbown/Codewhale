@@ -23,8 +23,8 @@ import { getDocsShell, pickText } from "@/lib/i18n/dictionaries";
 import { StatusBadge } from "./status-badge";
 
 const MEDIA_PLAN_DOC =
-  "https://github.com/Hmbown/CodeWhale/blob/main/docs/releases/v0.9.2-media-plan.md";
-const REPO_BLOB_BASE = "https://github.com/Hmbown/CodeWhale/blob/main";
+  "https://github.com/codewhale-hq/CodeWhale/blob/main/docs/releases/v0.9.2-media-plan.md";
+const REPO_BLOB_BASE = "https://github.com/codewhale-hq/CodeWhale/blob/main";
 
 export function SessionMedia({ asset, locale = "en" }: { asset: MediaAsset; locale?: string }) {
   const t = getDocsShell(locale);

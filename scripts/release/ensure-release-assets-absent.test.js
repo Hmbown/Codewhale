@@ -45,7 +45,7 @@ test("release lookup treats only an explicit GitHub 404 as absent", () => {
   });
   assert.equal(isNotFoundError(notFound), true);
   assert.equal(
-    fetchRelease("Hmbown/CodeWhale", "v0.9.1", "gh", () => {
+    fetchRelease("codewhale-hq/CodeWhale", "v0.9.1", "gh", () => {
       throw notFound;
     }),
     null,
@@ -57,7 +57,7 @@ test("release lookup treats only an explicit GitHub 404 as absent", () => {
   });
   assert.throws(
     () =>
-      fetchRelease("Hmbown/CodeWhale", "v0.9.1", "gh", () => {
+      fetchRelease("codewhale-hq/CodeWhale", "v0.9.1", "gh", () => {
         throw forbidden;
       }),
     /Could not inspect GitHub Release v0\.9\.1.*HTTP 403/,
@@ -66,21 +66,21 @@ test("release lookup treats only an explicit GitHub 404 as absent", () => {
 
 test("release lookup parses the exact tag endpoint and validates targets", () => {
   let invocation;
-  const release = fetchRelease("Hmbown/CodeWhale", "v0.9.1", "/fake/gh", (...args) => {
+  const release = fetchRelease("codewhale-hq/CodeWhale", "v0.9.1", "/fake/gh", (...args) => {
     invocation = args;
     return JSON.stringify({ assets: [] });
   });
   assert.deepEqual(release, { assets: [] });
   assert.equal(invocation[0], "/fake/gh");
-  assert.deepEqual(invocation[1], ["api", "repos/Hmbown/CodeWhale/releases/tags/v0.9.1"]);
-  assert.doesNotThrow(() => validateTarget("Hmbown/CodeWhale", "v0.9.1"));
+  assert.deepEqual(invocation[1], ["api", "repos/codewhale-hq/CodeWhale/releases/tags/v0.9.1"]);
+  assert.doesNotThrow(() => validateTarget("codewhale-hq/CodeWhale", "v0.9.1"));
   assert.throws(() => validateTarget("bad repo", "v0.9.1"), /Invalid GitHub repository/);
-  assert.throws(() => validateTarget("Hmbown/CodeWhale", "main"), /Invalid release tag/);
+  assert.throws(() => validateTarget("codewhale-hq/CodeWhale", "main"), /Invalid release tag/);
 });
 
 test("release lookup rejects malformed successful API output", () => {
   assert.throws(
-    () => fetchRelease("Hmbown/CodeWhale", "v0.9.1", "gh", () => "not-json"),
+    () => fetchRelease("codewhale-hq/CodeWhale", "v0.9.1", "gh", () => "not-json"),
     /returned invalid JSON/,
   );
 });

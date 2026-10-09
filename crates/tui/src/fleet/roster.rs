@@ -41,7 +41,7 @@ use codewhale_config::{
 
 use super::profile::{
     AgentProfile, AgentProfileLoadIssue, CLAUDE_AGENT_DIR, claude_user_agent_dir,
-    load_agent_profiles_from_dir_tolerant, load_claude_agent_profiles_from_dir,
+    load_agent_profiles_from_dir_tolerant, load_claude_agent_profiles_from_dir_in,
     load_plugin_agent_profiles_from_component, load_workspace_agent_profiles_tolerant,
     personal_agent_profile_dir,
 };
@@ -268,6 +268,50 @@ impl FleetRoster {
         let mut profile_load_issues = Vec::new();
 
         if let Some(plugins) = plugins {
+            for (preset, authority) in crate::extension_host::native_presets_for_plugins(plugins) {
+                // An ordinary roster member backed by the existing live owner
+                // receipt. Selection is not authority: preparation checks it.
+                let identity = crate::hashing::sha256_hex(
+                    format!("{}:{}", preset.plugin_id, preset.entry.path).as_bytes(),
+                );
+                let metadata = crate::plugins::native_presets::metadata(plugins, &preset);
+                let id = format!(
+                    "{}-native-{}",
+                    authority.plugin_name.chars().take(32).collect::<String>(),
+                    &identity[..16]
+                );
+                let mut profile = FleetProfile::default();
+                profile.role.name = "general".into();
+                profile.role.description = metadata
+                    .as_ref()
+                    .and_then(|data| data.description.clone())
+                    .or_else(|| {
+                        Some(format!(
+                            "Reviewed Native composition from {}",
+                            authority.plugin_name
+                        ))
+                    });
+                let member = AgentProfile {
+                    id,
+                    display_name: Some(
+                        metadata
+                            .as_ref()
+                            .map(|data| data.name.clone().unwrap_or_else(|| data.id.clone()))
+                            .unwrap_or_else(|| authority.plugin_name.clone()),
+                    ),
+                    description: profile.role.description.clone(),
+                    requires: Vec::new(),
+                    profile,
+                    source: PathBuf::from(&preset.entry.path),
+                    origin: ProfileOrigin::Plugin,
+                    plugin_authority: Some(authority),
+                    native_preset: Some(preset),
+                };
+                record_shadow(
+                    merge_member(&mut built_ins, &mut extras, member),
+                    &mut shadowed,
+                );
+            }
             let (sources, errors) = crate::plugins::runtime::active_component_sources(
                 plugins,
                 crate::plugins::activation::PluginActivationCapability::Agents,
@@ -305,6 +349,7 @@ impl FleetRoster {
             profile.role.name = super::profile::canonical_public_role_name(&profile.role.name);
             profile.slot = FleetSlot::from_name(&profile.role.name);
             let member = AgentProfile {
+                native_preset: None,
                 id: id.clone(),
                 display_name: None,
                 description: profile.role.description.clone(),
@@ -374,12 +419,14 @@ impl FleetRoster {
         // Claude Code agent files come last and only fill ids nobody else
         // defined. The project copy (trusted project config only) is read
         // before `~/.claude/agents`, matching Claude Code's own precedence.
+        // Only the project copy is workspace content, so only it is confined
+        // to the workspace; `~/.claude/agents` is the user's own directory.
         let claude_dirs = include_workspace_profiles
-            .then(|| workspace.join(CLAUDE_AGENT_DIR))
+            .then(|| (workspace.join(CLAUDE_AGENT_DIR), Some(workspace)))
             .into_iter()
-            .chain(claude_user_dir.map(Path::to_path_buf));
-        for dir in claude_dirs {
-            match load_claude_agent_profiles_from_dir(&dir) {
+            .chain(claude_user_dir.map(|dir| (dir.to_path_buf(), None)));
+        for (dir, confine_to) in claude_dirs {
+            match load_claude_agent_profiles_from_dir_in(confine_to, &dir) {
                 Ok((profiles, issues)) => {
                     for issue in &issues {
                         tracing::warn!(
@@ -541,6 +588,7 @@ impl FleetRoster {
         ]
         .into_iter()
         .map(|(id, slot, loadout, description, instructions)| AgentProfile {
+            native_preset: None,
             id: id.to_string(),
             display_name: None,
             description: Some(description.to_string()),

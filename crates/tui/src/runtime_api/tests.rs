@@ -16,6 +16,11 @@ use uuid::Uuid;
 
 mod command_catalog;
 mod headless_catalog;
+#[cfg(unix)]
+mod owner_bootstrap;
+mod profile_constitution;
+#[cfg(any(unix, windows))]
+mod runtime_store_convergence;
 mod workspace_instructions;
 
 /// Scale a wait budget for shared CI runners.
@@ -161,6 +166,7 @@ async fn http_and_web_server_thread_manager_installs_configured_workshop_byte_bu
         RuntimeThreadManagerConfig {
             data_dir: temp.path().join("runtime"),
             task_data_dir: temp.path().join("tasks"),
+            sessions_dir: None,
             max_active_threads: 2,
         },
         Arc::new(crate::plugins::PluginRegistry::empty(&workspace)),
@@ -462,6 +468,7 @@ fn messages_from_thread_detail_batches_tool_results() {
         duration_ms: Some(0),
         usage: None,
         model_request_diagnostics: None,
+        operation_activity: None,
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: Some("ask".to_string()),
@@ -980,6 +987,16 @@ async fn spawn_test_server_with_root_token_mobile_workspace(
 
 #[derive(Default)]
 struct TestServerOverrides {
+    automation_handles: Option<
+        oneshot::Sender<(
+            crate::automation_manager::SharedAutomationManager,
+            crate::task_manager::SharedTaskManager,
+        )>,
+    >,
+    /// Publish the exact manager using the production owner/frontend factory.
+    owner_socket: Option<PathBuf>,
+    /// Capture the actual owner's service table for cache/lifetime assertions.
+    workspace_scopes_handle: Option<oneshot::Sender<Arc<RuntimeWorkspaceScopes>>>,
     sub_agent_manager: Option<SharedSubAgentManager>,
     fleet_codewhale_binary: Option<String>,
     config: Option<Config>,
@@ -1121,7 +1138,7 @@ fn spawn_product_stack_server(
         .clone();
     std::thread::Builder::new()
         .name("runtime-api-test-server".to_string())
-        .stack_size(crate::CODEWHALE_MAIN_STACK_BYTES)
+        .stack_size(codewhale_runtime::CODEWHALE_MAIN_STACK_BYTES)
         .spawn(move || {
             // Adopted for the thread's lifetime; the scope's generation check
             // refuses enrollment once the sealing test has ended.
@@ -1141,7 +1158,7 @@ fn spawn_product_stack_server(
                 )
                 .await
                 {
-                    Ok(Some((listener, app, addr, runtime_threads))) => {
+                    Ok(Some((listener, app, addr, runtime_threads, owner_frontend))) => {
                         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
                         if setup_tx
                             .send(Ok(Some((addr, runtime_threads, shutdown_tx))))
@@ -1155,9 +1172,30 @@ fn spawn_product_stack_server(
                             .expect("nonblocking test listener");
                         let listener =
                             TcpListener::from_std(listener).expect("register test listener");
+                        // Stop the owner the way the product does: trigger its
+                        // shutdown and await it while this runtime is alive, so
+                        // the owner receipt is retired before the thread exits.
+                        let owner_handle =
+                            owner_frontend.as_ref().map(|owner| owner.shutdown_handle());
+                        let mut owner_task =
+                            owner_frontend.map(|owner| tokio::spawn(owner.serve()));
                         tokio::select! {
                             _ = serve_runtime_api(listener, app, shutdown) => {}
                             _ = shutdown_rx => {}
+                            _ = async {
+                                match owner_task.as_mut() {
+                                    Some(task) => { let _ = task.await; }
+                                    None => std::future::pending::<()>().await,
+                                }
+                            } => {
+                                owner_task = None;
+                            }
+                        }
+                        if let Some(handle) = owner_handle {
+                            handle.trigger();
+                        }
+                        if let Some(task) = owner_task {
+                            let _ = task.await;
                         }
                     }
                     Ok(None) => {
@@ -1188,6 +1226,7 @@ async fn build_test_server(
         axum::Router,
         SocketAddr,
         SharedRuntimeThreadManager,
+        Option<codewhale_app_server::daemon_socket::DaemonSocket>,
     )>,
 > {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1230,14 +1269,19 @@ async fn build_test_server(
         RuntimeThreadManagerConfig {
             data_dir: root.join("runtime/runtime"),
             task_data_dir: root.join("runtime"),
+            sessions_dir: Some(sessions_dir.clone()),
             max_active_threads: overrides.max_active_threads.unwrap_or(8),
         },
     )?);
+    let sessions_dir = runtime_threads.sessions_dir().to_path_buf();
     runtime_threads.attach_task_manager(manager.clone());
     let automations = Arc::new(Mutex::new(AutomationManager::open_for_test(
         root.join("automations"),
     )?));
     runtime_threads.attach_automation_manager(automations.clone());
+    if let Some(sender) = overrides.automation_handles {
+        let _ = sender.send((automations.clone(), manager.clone()));
+    }
 
     let auth_required = runtime_token.is_some();
     let sub_agent_manager = overrides
@@ -1266,6 +1310,15 @@ async fn build_test_server(
     } else {
         Arc::new(parking_lot::RwLock::new(config))
     };
+    let workspace_scopes =
+        RuntimeWorkspaceScopes::new(runtime_threads.clone(), sub_agent_manager.clone());
+    let workspace_scope = workspace_scopes.admit(workspace.clone()).await?;
+    if let Some(sender) = overrides.workspace_scopes_handle {
+        let _ = sender.send(workspace_scopes.clone());
+    }
+    if let Some(manager) = overrides.lsp_manager {
+        let _ = workspace_scope.lsp.set(manager);
+    }
     let state = RuntimeApiState {
         config,
         workspace,
@@ -1278,7 +1331,8 @@ async fn build_test_server(
         sessions_dir,
         config_path: overrides.config_path.clone(),
         config_profile: overrides.config_profile,
-        mcp_pool: Arc::new(Mutex::new(None)),
+        workspace_scopes,
+        workspace_scope,
         automations,
         sub_agent_manager,
         runtime_token,
@@ -1294,21 +1348,31 @@ async fn build_test_server(
         fleet_codewhale_binary: overrides
             .fleet_codewhale_binary
             .unwrap_or_else(configured_codewhale_binary),
-        lsp_manager: {
-            let cell = std::sync::OnceLock::new();
-            if let Some(manager) = overrides.lsp_manager {
-                let _ = cell.set(manager);
-            }
-            Arc::new(cell)
-        },
         computer: super::computer_display::ComputerState::from_env(),
         shutdown: overrides.shutdown.clone().unwrap_or_default(),
         git_writes: Arc::new(tokio::sync::Mutex::new(())),
         provider_switches: Arc::new(tokio::sync::Mutex::new(())),
         compat_stream_test_hook: overrides.compat_stream_test_hook,
     };
-    let app = build_router(state);
-    Ok(Some((listener, app, addr, runtime_threads)))
+    let (owner_frontend, compatibility) = if let Some(socket) = overrides.owner_socket {
+        let model = runtime_request_model(&state.config.read(), None)
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        let (owner, compatibility) =
+            bind_captured_runtime_frontends(&state, Some(socket), model, 1, false, None).await?;
+        (Some(owner), Some(compatibility))
+    } else {
+        (None, None)
+    };
+    let mut app = build_router(state.clone());
+    if let Some(compatibility) = compatibility {
+        app = app.merge(codewhale_app_server::runtime_compatibility_router(
+            compatibility,
+            &state.cors_origins,
+            state.runtime_token.clone(),
+            Some(state.workspace.clone()),
+        ));
+    }
+    Ok(Some((listener, app, addr, runtime_threads, owner_frontend)))
 }
 
 async fn spawn_test_server() -> Result<
@@ -2385,9 +2449,25 @@ async fn workspace_file_search_auth_matching_and_bounds() -> Result<()> {
 
 #[tokio::test]
 async fn workspace_and_automation_endpoints_work() -> Result<()> {
-    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+    let root = tempfile::tempdir()?;
+    let (automation_tx, automation_rx) = oneshot::channel();
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            root.path().to_path_buf(),
+            root.path().join("sessions"),
+            None,
+            false,
+            root.path().join("workspace"),
+            TestServerOverrides {
+                automation_handles: Some(automation_tx),
+                ..Default::default()
+            },
+        )
+        .await?
+    else {
         return Ok(());
     };
+    let (automations, tasks) = automation_rx.await?;
     let client = crate::tls::reqwest_client();
 
     let workspace: serde_json::Value = client
@@ -2488,6 +2568,48 @@ async fn workspace_and_automation_endpoints_work() -> Result<()> {
         "expected at least one run entry"
     );
 
+    // The admitted occurrence must survive deletion until its real task and
+    // the production scheduler have settled its durable run receipt.
+    let refused = client
+        .delete(format!("http://{addr}/v1/automations/{automation_id}"))
+        .send()
+        .await?;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert!(refused.text().await?.contains("still active"));
+    let task_id = run_now["task_id"].as_str().context("missing task id")?;
+    let run_id = run_now["id"].as_str().context("missing run id")?;
+    let task = crate::task_manager::wait_for_terminal_state(
+        &tasks,
+        task_id,
+        ci_scaled(Duration::from_secs(15)),
+    )
+    .await?;
+    assert_eq!(task.status, crate::task_manager::TaskStatus::Completed);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    let scheduler = spawn_scheduler(
+        automations.clone(),
+        tasks,
+        cancel.clone(),
+        crate::automation_manager::AutomationSchedulerConfig::default(),
+    );
+    tokio::time::timeout(ci_scaled(Duration::from_secs(15)), async {
+        loop {
+            let runs = automations.lock().await.list_runs(&automation_id, None)?;
+            if runs.iter().any(|run| {
+                run.id == run_id
+                    && run.status == crate::automation_manager::AutomationRunStatus::Completed
+            }) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("automation scheduler did not settle the completed task")??;
+    cancel.cancel();
+    scheduler.await?;
+
     let _deleted: serde_json::Value = client
         .delete(format!("http://{addr}/v1/automations/{automation_id}"))
         .send()
@@ -2502,6 +2624,12 @@ async fn workspace_and_automation_endpoints_work() -> Result<()> {
         .await?
         .status();
     assert_eq!(missing_status, StatusCode::NOT_FOUND);
+    let archived = automations
+        .lock()
+        .await
+        .list_archived_runs(&automation_id)?;
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].task_id.as_deref(), Some(task_id));
 
     handle.abort();
     Ok(())
@@ -2872,6 +3000,9 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
             note: "not reported".to_string(),
         },
         usage_source_fingerprints: Default::default(),
+        missing_usage_sources: Default::default(),
+        missing_usage_overflowed: false,
+        legacy_unreported_usage: false,
         has_unreported_usage: false,
         delivery_evidence: Default::default(),
         verification: AgentRunVerificationSummary {
@@ -5640,9 +5771,68 @@ async fn stream_compat_mapping_handles_expected_runtime_events() -> Result<()> {
     assert!(text.contains("\"decision\":\"allow\""));
     assert!(!text.contains("approval-decision-secret"));
 
-    let unknown = RuntimeEventRecord {
+    // A resolution forced by a turn interrupt or turn teardown must
+    // surface the `cancelled` flag so clients clear the pending approval
+    // UI instead of reporting a refusal.
+    let approval_cancelled = RuntimeEventRecord {
         schema_version: 1,
         seq: 9,
+        timestamp: chrono::Utc::now(),
+        thread_id: "thr_test".to_string(),
+        turn_id: Some("turn_test".to_string()),
+        item_id: None,
+        event: "approval.decided".to_string(),
+        payload: json!({
+            "approval_id": "approval_test",
+            "decision": "deny",
+            "cancelled": true,
+        }),
+    };
+    let mapped = map_compat_stream_event(&approval_cancelled)
+        .context("missing cancelled approval.decided event")?;
+    let stream = async_stream::stream! {
+        yield Ok::<_, Infallible>(mapped);
+    };
+    let body =
+        axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX).await?;
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("event: approval.decided"));
+    assert!(
+        text.contains("\"cancelled\":true"),
+        "cancelled resolutions must project the flag through the compat stream: {text}"
+    );
+
+    // The compat stream must also keep surfacing `approval.timeout` (the
+    // decision-budget resolution, and replays of journals written by older
+    // builds that only recorded the legacy event).
+    let legacy_timeout = RuntimeEventRecord {
+        schema_version: 1,
+        seq: 10,
+        timestamp: chrono::Utc::now(),
+        thread_id: "thr_test".to_string(),
+        turn_id: Some("turn_test".to_string()),
+        item_id: None,
+        event: "approval.timeout".to_string(),
+        payload: json!({
+            "approval_id": "approval_legacy",
+            "timeout_secs": 300,
+        }),
+    };
+    let mapped =
+        map_compat_stream_event(&legacy_timeout).context("missing approval.timeout event")?;
+    let stream = async_stream::stream! {
+        yield Ok::<_, Infallible>(mapped);
+    };
+    let body =
+        axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX).await?;
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("event: approval.timeout"));
+    assert!(text.contains("\"approval_id\":\"approval_legacy\""));
+    assert!(text.contains("\"timeout_secs\":300"));
+
+    let unknown = RuntimeEventRecord {
+        schema_version: 1,
+        seq: 11,
         timestamp: chrono::Utc::now(),
         thread_id: "thr_test".to_string(),
         turn_id: Some("turn_test".to_string()),
@@ -9127,6 +9317,107 @@ async fn list_threads_archived_only_filter_matches_only_archived() -> Result<()>
     Ok(())
 }
 
+/// The exact-ID filter must run before the result limit so an owned older
+/// thread remains visible even when newer threads belong to other callers.
+#[tokio::test]
+async fn list_thread_summary_filters_ids_before_limit() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let mut owned_ids = Vec::new();
+
+    for _ in 0..2 {
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        owned_ids.push(
+            created["id"]
+                .as_str()
+                .context("missing thread id")?
+                .to_string(),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    for _ in 0..8 {
+        client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let recent: serde_json::Value = client
+        .get(format!(
+            "http://{addr}/v1/threads/summary?limit=8&include_archived=true"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let recent_ids: Vec<&str> = recent
+        .as_array()
+        .context("summary must be an array")?
+        .iter()
+        .filter_map(|thread| thread["id"].as_str())
+        .collect();
+    assert!(
+        owned_ids
+            .iter()
+            .all(|id| !recent_ids.contains(&id.as_str()))
+    );
+
+    let mut filtered_url = reqwest::Url::parse(&format!(
+        "http://{addr}/v1/threads/summary?limit=8&include_archived=true"
+    ))?;
+    filtered_url
+        .query_pairs_mut()
+        .append_pair("thread_ids", &owned_ids.join(","));
+    let filtered: serde_json::Value = client
+        .get(filtered_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let filtered_ids: Vec<&str> = filtered
+        .as_array()
+        .context("filtered summary must be an array")?
+        .iter()
+        .filter_map(|thread| thread["id"].as_str())
+        .collect();
+    assert_eq!(filtered_ids.len(), owned_ids.len());
+    assert!(
+        owned_ids
+            .iter()
+            .all(|id| filtered_ids.contains(&id.as_str()))
+    );
+
+    let mut oversized_url =
+        reqwest::Url::parse(&format!("http://{addr}/v1/threads/summary?limit=8"))?;
+    oversized_url
+        .query_pairs_mut()
+        .append_pair("thread_ids", &vec!["fixture-id"; 201].join(","));
+    let rejected = client.get(oversized_url).send().await?;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let at_limit = format!(
+        "http://{addr}/v1/threads/summary?limit=8&thread_ids={}",
+        vec!["fixture-id"; 200].join(",")
+    );
+    assert_eq!(client.get(at_limit).send().await?.status(), StatusCode::OK);
+
+    handle.abort();
+    Ok(())
+}
+
 /// #564 / whalescale#261 — `GET /v1/usage` aggregates per-turn token +
 /// cost data. With no threads the response is well-formed and totals are
 /// zero with empty buckets (never a 404).
@@ -9307,6 +9598,58 @@ async fn thread_receipt_routes_require_auth_and_return_the_receipt_shape() -> Re
     Ok(())
 }
 
+/// The four canonical thread-history controls mutate or inspect shared store
+/// state, so they sit behind the same bearer + workspace-scope middleware as
+/// every other `/v1` route: anonymous and wrong-token posts are refused before
+/// the handler runs. Authorized coverage lives in
+/// `runtime_store_convergence.rs`.
+#[tokio::test]
+async fn thread_history_operation_routes_require_auth() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("codewhale-history-auth-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let token = "history-auth-test-token".to_string();
+    let Some((addr, _threads, handle)) =
+        spawn_test_server_with_root_and_token(root, sessions_dir, Some(token.clone())).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    for path in [
+        "/v1/thread-history/operations/lookup",
+        "/v1/thread-history/operations/recover",
+        "/v1/thread-history/mutate",
+        "/v1/thread-history/import",
+    ] {
+        let anonymous = client
+            .post(format!("http://{addr}{path}"))
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{path}");
+        let wrong = client
+            .post(format!("http://{addr}{path}"))
+            .bearer_auth("not-the-runtime-token")
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED, "{path}");
+        // The token gate admits the request; the handler then rejects the
+        // empty body itself, which is the same 4xx the route gave when these
+        // were reachable without auth — anything but 401 proves we reached it.
+        let authorized = client
+            .post(format!("http://{addr}{path}"))
+            .bearer_auth(&token)
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_ne!(authorized.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+
+    handle.abort();
+    Ok(())
+}
+
 /// `GET /v1/approvals` serves the account-wide approval history behind the
 /// approvals log: decided rows carry their outcome + decision time, pending
 /// asks read "pending" with no decision time, newest ask first. A corrupt
@@ -9455,6 +9798,7 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
             ..Usage::default()
         }),
         model_request_diagnostics: None,
+        operation_activity: None,
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
@@ -9471,8 +9815,8 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
         routed_usage: vec![crate::cost_status::EffectiveRouteUsage {
             route: crate::cost_status::EffectiveRouteEnvelope {
                 openrouter_vendor: None,
-                provider: ApiProvider::Deepseek,
-                provider_identity: ApiProvider::Deepseek.as_str().to_string(),
+                provider: ProviderKind::Deepseek,
+                provider_identity: ProviderKind::Deepseek.as_str().to_string(),
                 model: "deepseek-v4-flash".to_string(),
                 billing_surface: Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE.to_string()),
                 endpoint_fingerprint: None,
@@ -9500,8 +9844,8 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
     // Mirror `TurnRecord::persist_effective_route` (private to the runtime
     // threads module): persist the route envelope onto the turn so the
     // recorded-time pricer sees a complete dispatch record.
-    turn.effective_provider = Some(ApiProvider::Deepseek.as_str().to_string());
-    turn.effective_provider_id = Some(ApiProvider::Deepseek.as_str().to_string());
+    turn.effective_provider = Some(ProviderKind::Deepseek.as_str().to_string());
+    turn.effective_provider_id = Some(ProviderKind::Deepseek.as_str().to_string());
     turn.effective_billing_surface =
         Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE.to_string());
     turn.effective_endpoint_fingerprint = None;
@@ -9654,6 +9998,7 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
             ..Usage::default()
         }),
         model_request_diagnostics: None,
+        operation_activity: None,
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
@@ -9670,8 +10015,8 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
         routed_usage: vec![crate::cost_status::EffectiveRouteUsage {
             route: crate::cost_status::EffectiveRouteEnvelope {
                 openrouter_vendor: None,
-                provider: ApiProvider::Deepseek,
-                provider_identity: ApiProvider::Deepseek.as_str().to_string(),
+                provider: ProviderKind::Deepseek,
+                provider_identity: ProviderKind::Deepseek.as_str().to_string(),
                 model: "deepseek-v4-flash".to_string(),
                 billing_surface: Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE.to_string()),
                 endpoint_fingerprint: None,
@@ -9696,8 +10041,8 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
         workspace: None,
         workspace_snapshots: Vec::new(),
     };
-    turn.effective_provider = Some(ApiProvider::Openai.as_str().to_string());
-    turn.effective_provider_id = Some(ApiProvider::Openai.as_str().to_string());
+    turn.effective_provider = Some(ProviderKind::Openai.as_str().to_string());
+    turn.effective_provider_id = Some(ProviderKind::Openai.as_str().to_string());
     turn.effective_billing_surface = Some(crate::pricing::UNCLASSIFIED_BILLING_SURFACE.to_string());
     turn.effective_endpoint_fingerprint = None;
     turn.effective_billing_mode = Some(crate::cost_status::RouteBillingMode::Metered);
@@ -9743,6 +10088,107 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
     assert!(cost.coverage_recorded);
     assert!(!cost.coverage_is_legacy_unknown());
 
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn watch_client_token_refuses_runtime_mutations_and_upgrades() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path());
+    let Some((addr, _, handle)) = spawn_test_server_with_root_and_token(
+        root.path().to_path_buf(),
+        root.path().join("sessions"),
+        Some("watch-scope-fixture-master".to_string()),
+    )
+    .await?
+    else {
+        bail!("the owned client-token HTTP fixture could not bind");
+    };
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+    let info: Value = client
+        .get(format!("{base}/v1/runtime/info"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(info["capabilities"]["client_token_intents"], true);
+    let mint = |body: Value| {
+        client
+            .post(format!("{base}/v1/auth/client-tokens"))
+            .bearer_auth("watch-scope-fixture-master")
+            .json(&body)
+    };
+    let watch: Value = mint(json!({"device_id": "read-device", "label": "cwc-seat:drive"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(watch["intent"], "watch");
+    let watch_token = watch["token"].as_str().context("watch token")?;
+    let reads = client
+        .get(format!("{base}/v1/threads/summary"))
+        .bearer_auth(watch_token)
+        .send()
+        .await?;
+    assert_eq!(reads.status(), StatusCode::OK);
+    for (method, path) in [
+        (Method::POST, "/v1/threads"),
+        (Method::PUT, "/v1/workspace/files"),
+        (Method::DELETE, "/v1/memory"),
+        (Method::POST, "/v1/approvals/not-pending"),
+    ] {
+        let refused = client
+            .request(method, format!("{base}{path}"))
+            .bearer_auth(watch_token)
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+    let upgrade = client
+        .get(format!("{base}/v1/threads/summary"))
+        .bearer_auth(watch_token)
+        .header(header::UPGRADE, "websocket")
+        .send()
+        .await?;
+    assert_eq!(upgrade.status(), StatusCode::FORBIDDEN);
+    let drive: Value = mint(json!({"device_id": "write-device", "intent": "drive"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(drive["intent"], "drive");
+    let created = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth(drive["token"].as_str().context("drive token")?)
+        .json(&json!({}))
+        .send()
+        .await?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let invalid = mint(json!({"device_id": "bad-device", "intent": "admin"}))
+        .send()
+        .await?;
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let revoked = client
+        .delete(format!(
+            "{base}/v1/auth/client-tokens/{}",
+            watch["id"].as_str().context("watch id")?
+        ))
+        .bearer_auth("watch-scope-fixture-master")
+        .send()
+        .await?;
+    assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+    let expired_read = client
+        .get(format!("{base}/v1/threads/summary"))
+        .bearer_auth(watch_token)
+        .send()
+        .await?;
+    assert_eq!(expired_read.status(), StatusCode::UNAUTHORIZED);
     handle.abort();
     Ok(())
 }
@@ -10901,6 +11347,7 @@ fn seed_summary_search_transcript(
             duration_ms: Some(0),
             usage: None,
             model_request_diagnostics: None,
+            operation_activity: None,
             routing_settlement: false,
             effective_route_usage: None,
             permission_posture: None,
@@ -11660,9 +12107,7 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
 #[test]
 fn resolve_skills_dir_rejects_symlink_escaping_workspace() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _env_lock = crate::test_support::lock_test_env();
-    let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
-    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+    let _home = crate::test_support::SealedHome::at(tmp.path());
     let workspace_root = tmp.path().join("workspace");
     let escape_target = tmp.path().join("escape_target");
     fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -11693,9 +12138,7 @@ fn resolve_skills_dir_rejects_symlink_escaping_workspace() {
 #[test]
 fn resolve_skills_dir_ignores_untrusted_workspace_skills() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _env_lock = crate::test_support::lock_test_env();
-    let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
-    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+    let _home = crate::test_support::SealedHome::at(tmp.path());
     let codewhale_only = Config {
         skills: Some(crate::config::SkillsConfig {
             scan_codewhale_only: Some(true),
@@ -11742,9 +12185,7 @@ fn resolve_skills_dir_ignores_untrusted_workspace_skills() {
 #[test]
 fn resolve_skills_dir_rejects_codewhale_only_symlink_escaping_workspace() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _env_lock = crate::test_support::lock_test_env();
-    let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
-    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+    let _home = crate::test_support::SealedHome::at(tmp.path());
     let workspace_root = tmp.path().join("workspace");
     let escape_target = tmp.path().join("escape_target");
     fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -12708,7 +13149,9 @@ async fn provider_catalog_and_switch_preserve_each_listed_route_identity() -> Re
             );
         }
     }
-    for invalid in ["deepseek-cn", "antigravity", "not-a-provider"] {
+    let legacy_alias = get_provider_models(&client, &addr, "deepseek-cn").await;
+    assert_eq!(legacy_alias["provider"], "deepseek-cn");
+    for invalid in ["deepseek-cn-unknown", "antigravity", "not-a-provider"] {
         let response = client
             .get(format!("http://{addr}/v1/providers/{invalid}/models"))
             .send()
@@ -12933,30 +13376,71 @@ async fn provider_models_expose_exact_image_input_facts_and_thread_selection_sta
 fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries() {
     let _lock = crate::test_support::lock_test_env();
     let root = tempfile::tempdir().unwrap();
-    let _codex_home = crate::test_support::EnvVarGuard::set("CODEX_HOME", root.path());
-    let config = Config {
+    let canonical_home = root
+        .path()
+        .canonicalize()
+        .expect("canonical private fixture home");
+    let _codex_home = crate::test_support::EnvVarGuard::set("CODEX_HOME", &canonical_home);
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &canonical_home);
+    let mut config = Config {
         provider: Some("openai-codex".to_string()),
         ..Config::default()
     };
-    let cache_path = root.path().join("models_cache.json");
-    let cache = json!({
-        "fetched_at": chrono::Utc::now(),
-        "models": [
-            {"slug": "gpt-6-astra", "supported_reasoning_levels": [
-                {"effort": "low"}, {"effort": "medium"}, {"effort": "high"},
-                {"effort": "xhigh"}, {"effort": "max"}, {"effort": "ultra"},
-                {"effort": "unexpected-private-value"}
-            ]},
-            {"slug": "gpt-5.5", "supported_reasoning_levels": [{"effort": "high"}, {"effort": "xhigh"}]},
-            {"slug": "no-reasoning", "supported_reasoning_levels": []},
-            {"slug": "optional-reasoning", "supported_reasoning_levels": [{"effort": "none"}, {"effort": "minimal"}, {"effort": "low"}]},
-            {"slug": "no-effort-metadata"},
-            {"slug": "unrecognized-efforts", "supported_reasoning_levels": [{"effort": "future-value"}]}
+    let access_token = crate::oauth::install_test_chatgpt_registration(&mut config).unwrap();
+    crate::codex_model_cache::install_test_chatgpt_roster_with_metadata(
+        &config,
+        [
+            (
+                "gpt-6-astra",
+                None,
+                vec![
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra",
+                    "unexpected-private-value",
+                ],
+            ),
+            ("gpt-5.5", None, vec!["high", "xhigh"]),
+            ("no-reasoning", Some(false), vec![]),
+            ("optional-reasoning", None, vec!["none", "minimal", "low"]),
+            ("no-effort-metadata", None, vec![]),
+            ("unrecognized-efforts", None, vec!["future-value"]),
         ]
-    });
-    fs::write(&cache_path, serde_json::to_vec(&cache).unwrap()).unwrap();
-    let astra =
-        provider_model_entry_for_api(&config, ApiProvider::OpenaiCodex, "gpt-6-astra".to_string());
+        .into_iter()
+        .map(
+            |(id, reasoning, efforts)| crate::codex_model_cache::CodexModelMetadata {
+                id: id.into(),
+                display_name: None,
+                context_window: None,
+                reasoning,
+                efforts: efforts.into_iter().map(str::to_string).collect(),
+            },
+        )
+        .collect(),
+    )
+    .unwrap();
+    // Locate the one snapshot actually created by the account-scoped helper;
+    // an external CODEX_HOME cache is not an account roster authority.
+    let catalog_path = crate::models_dev_live::cache_path().unwrap();
+    let snapshots: Vec<_> = fs::read_dir(catalog_path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("chatgpt-plan-"))
+        })
+        .collect();
+    assert_eq!(snapshots.len(), 1);
+    let cache_path = &snapshots[0];
+    let astra = provider_model_entry_for_api(
+        &config,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
+        "gpt-6-astra".to_string(),
+    );
     assert_eq!(
         astra.reasoning_effort,
         codewhale_config::route::CapabilityState::Supported
@@ -12965,7 +13449,7 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
         astra.reasoning_effort_levels,
         ["low", "medium", "high", "xhigh", "max", "ultra"]
     );
-    assert_eq!(astra.reasoning_effort_source, Some("codex_cli_cache"));
+    assert_eq!(astra.reasoning_effort_source, Some("chatgpt_plan_api"));
     // The relay preserves the same model facts without elevating them into
     // a tool-execution or account-entitlement receipt.
     let _token = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
@@ -12982,15 +13466,19 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
         relayed_astra["reasoningEffortLevels"],
         json!(astra.reasoning_effort_levels)
     );
-    assert_eq!(relayed_astra["reasoningEffortSource"], "codex_cli_cache");
+    assert_eq!(relayed_astra["reasoningEffortSource"], "chatgpt_plan_api");
     assert_eq!(relay["runtime"]["capabilities"]["tool_execution"], false);
     assert!(!relay.to_string().contains("test-token"));
-    let older =
-        provider_model_entry_for_api(&config, ApiProvider::OpenaiCodex, "gpt-5.5".to_string());
+    assert!(!relay.to_string().contains(&access_token));
+    let older = provider_model_entry_for_api(
+        &config,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
+        "gpt-5.5".to_string(),
+    );
     assert_eq!(older.reasoning_effort_levels, ["high", "xhigh"]);
     let unsupported = provider_model_entry_for_api(
         &config,
-        ApiProvider::OpenaiCodex,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
         "no-reasoning".to_string(),
     );
     assert_eq!(
@@ -13000,7 +13488,7 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
     assert!(unsupported.reasoning_effort_levels.is_empty());
     let optional = provider_model_entry_for_api(
         &config,
-        ApiProvider::OpenaiCodex,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
         "optional-reasoning".to_string(),
     );
     assert_eq!(optional.reasoning_effort_levels, ["low"]);
@@ -13009,8 +13497,11 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
         codewhale_config::route::CapabilityState::Supported
     );
     for id in ["no-effort-metadata", "unrecognized-efforts"] {
-        let unknown =
-            provider_model_entry_for_api(&config, ApiProvider::OpenaiCodex, id.to_string());
+        let unknown = provider_model_entry_for_api(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
+            id.to_string(),
+        );
         assert_eq!(
             unknown.reasoning_effort,
             codewhale_config::route::CapabilityState::Unknown
@@ -13019,7 +13510,7 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
     }
     let missing = provider_model_entry_for_api(
         &config,
-        ApiProvider::OpenaiCodex,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
         "unknown-model".to_string(),
     );
     assert_eq!(
@@ -13029,20 +13520,27 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
     assert!(missing.reasoning_effort_levels.is_empty());
     let mut custom = config.clone();
     custom
-        .provider_config_for_mut(ApiProvider::OpenaiCodex)
+        .provider_config_for_mut(&custom.test_identity_for_kind(ProviderKind::OpenaiCodex))
+        .unwrap()
         .base_url = Some("https://proxy.example.test/v1".to_string());
-    let proxy =
-        provider_model_entry_for_api(&custom, ApiProvider::OpenaiCodex, "gpt-6-astra".to_string());
+    let proxy = provider_model_entry_for_api(
+        &custom,
+        &(custom).test_identity_for_kind(ProviderKind::OpenaiCodex),
+        "gpt-6-astra".to_string(),
+    );
     assert_eq!(
         proxy.reasoning_effort,
         codewhale_config::route::CapabilityState::Unknown
     );
     assert!(proxy.reasoning_effort_levels.is_empty());
-    let mut stale = cache;
+    let mut stale: Value = serde_json::from_slice(&fs::read(cache_path).unwrap()).unwrap();
     stale["fetched_at"] = json!(chrono::Utc::now() - chrono::Duration::hours(48));
-    fs::write(&cache_path, serde_json::to_vec(&stale).unwrap()).unwrap();
-    let stale =
-        provider_model_entry_for_api(&config, ApiProvider::OpenaiCodex, "gpt-6-astra".to_string());
+    fs::write(cache_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+    let stale = provider_model_entry_for_api(
+        &config,
+        &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
+        "gpt-6-astra".to_string(),
+    );
     assert_eq!(
         stale.reasoning_effort,
         codewhale_config::route::CapabilityState::Unknown
@@ -13117,15 +13615,22 @@ fn provider_catalog_keeps_official_deepseek_facts_but_not_custom_proxy_claims() 
             default_text_model: Some("deepseek-v4-pro".to_string()),
             ..Config::default()
         };
-        let provider_config = config.provider_config_for_mut(ApiProvider::Deepseek);
+        let provider_config = config
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Deepseek))
+            .unwrap();
         provider_config.base_url = Some(official_base_url.to_string());
         provider_config.model = Some("deepseek-v4-pro".to_string());
 
         assert!(
-            !config.provider_uses_custom_endpoint(ApiProvider::Deepseek),
+            !config.provider_uses_custom_endpoint(
+                &config.test_identity_for_kind(ProviderKind::Deepseek)
+            ),
             "official DeepSeek endpoint must retain the shared model catalog: {official_base_url}"
         );
-        let models = provider_models_for_api(&config, ApiProvider::Deepseek, ApiProvider::Deepseek);
+        let models = provider_models_for_api(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::Deepseek),
+        );
         assert!(
             models
                 .iter()
@@ -13139,29 +13644,42 @@ fn provider_catalog_keeps_official_deepseek_facts_but_not_custom_proxy_claims() 
         default_text_model: Some("private-deepseek-deployment".to_string()),
         ..Config::default()
     };
-    let provider_config = custom.provider_config_for_mut(ApiProvider::Deepseek);
+    let provider_config = custom
+        .provider_config_for_mut(&custom.test_identity_for_kind(ProviderKind::Deepseek))
+        .unwrap();
     provider_config.base_url = Some("https://deepseek-proxy.example.test/v1".to_string());
     provider_config.model = Some("private-deepseek-deployment".to_string());
 
-    assert!(custom.provider_uses_custom_endpoint(ApiProvider::Deepseek));
+    assert!(
+        custom
+            .provider_uses_custom_endpoint(&custom.test_identity_for_kind(ProviderKind::Deepseek))
+    );
     assert_eq!(
-        provider_models_for_api(&custom, ApiProvider::Deepseek, ApiProvider::Deepseek),
+        provider_models_for_api(
+            &custom,
+            &(custom).test_identity_for_kind(ProviderKind::Deepseek)
+        ),
         vec!["private-deepseek-deployment".to_string()],
         "a real custom endpoint must expose only its explicitly configured model namespace"
     );
 
     custom.default_text_model = Some("deepseek-v4-flash-vision-exp".to_string());
-    custom.provider_config_for_mut(ApiProvider::Deepseek).model =
-        Some("deepseek-v4-flash-vision-exp".to_string());
+    custom
+        .provider_config_for_mut(&custom.test_identity_for_kind(ProviderKind::Deepseek))
+        .unwrap()
+        .model = Some("deepseek-v4-flash-vision-exp".to_string());
     assert_eq!(
-        provider_models_for_api(&custom, ApiProvider::Deepseek, ApiProvider::Deepseek),
+        provider_models_for_api(
+            &custom,
+            &(custom).test_identity_for_kind(ProviderKind::Deepseek)
+        ),
         vec!["deepseek-v4-flash-vision-exp".to_string()],
         "a custom proxy may legitimately reuse a first-party model id"
     );
     assert_eq!(
         provider_model_image_input_for_api(
             &custom,
-            ApiProvider::Deepseek,
+            &(custom).test_identity_for_kind(ProviderKind::Deepseek),
             "deepseek-v4-flash-vision-exp",
         ),
         codewhale_config::route::CapabilityState::Unknown,
@@ -13611,23 +14129,35 @@ base_url = "http://127.0.0.1:18191/v1"
         route["has_model_catalog"], true,
         "the flag must describe what this route's own model endpoint returns"
     );
-    assert!(
-        catalog
-            .iter()
-            .all(|entry| entry["model_provider_id"] != "not-a-routable-route"),
-        "a table without the openai-compatible kind is not a routable route: {providers}"
+    let unavailable: Vec<_> = catalog
+        .iter()
+        .filter(|entry| entry["model_provider_id"] == "not-a-routable-route")
+        .collect();
+    assert_eq!(unavailable.len(), 1);
+    assert_eq!(
+        unavailable[0]["display_name"],
+        "not-a-routable-route (unavailable)"
     );
-    // Only the selected route carries an exact id. An inactive entry that
-    // borrowed the active route's id would be read by a client as the route
-    // that is selected — which is worse than carrying none.
+    assert_eq!(unavailable[0]["has_model_catalog"], false);
+    assert_eq!(unavailable[0]["credentialState"], "legacy");
+    assert_eq!(unavailable[0]["credentialWritable"], false);
+    // Every admitted built-in carries its own exact id, including inactive
+    // entries. None may borrow the selected route's id.
     for entry in catalog {
         if entry["id"] != "deepseek" && entry["id"] != "custom" {
-            assert!(
-                entry["model_provider_id"].is_null(),
-                "an inactive provider must not carry an exact id: {entry}"
+            assert_eq!(
+                entry["model_provider_id"], entry["id"],
+                "an inactive provider must carry its own exact id: {entry}"
             );
         }
     }
+    let unavailable_models = client
+        .get(format!(
+            "http://{addr}/v1/providers/custom/models?model_provider_id=not-a-routable-route"
+        ))
+        .send()
+        .await?;
+    assert_eq!(unavailable_models.status(), StatusCode::BAD_REQUEST);
 
     // The route's model catalog is reachable with the identity the catalog
     // just published — no other spelling is needed by a client.
@@ -13877,9 +14407,8 @@ async fn set_config_base_url_moves_the_root_route_endpoint() -> Result<()> {
 
 #[tokio::test]
 async fn set_config_base_url_refuses_a_named_route_with_guidance() -> Result<()> {
-    // A user-defined `[providers.<name>]` route keeps its endpoint in the table
-    // it is named by. This path cannot write it, and saying so beats writing a
-    // key that changes nothing while reporting success.
+    // Keep the existing selector while adopting the canonical named-table
+    // writer: the endpoint moves only in that exact table, after reload.
     let root = std::env::temp_dir().join(format!(
         "codewhale-config-base-url-custom-{}",
         Uuid::new_v4()
@@ -13913,17 +14442,40 @@ model = "glm-5.3"
         true,
     )
     .await;
-    assert_ne!(status, StatusCode::OK, "body: {body}");
-    let message = body["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("providers.<name>") || message.contains("named"),
-        "the refusal must say where the endpoint lives, got: {message}"
+    assert_eq!(status, StatusCode::OK, "named-table write should succeed");
+    assert_eq!(body["persisted"], true);
+    assert_eq!(body["requires_reload"], true);
+    let before_reload = get_config(&client, &addr).await;
+    assert_eq!(
+        before_reload["base_url"],
+        "https://open.bigmodel.cn/api/paas/v4"
     );
     let persisted = fs::read_to_string(&config_file)?;
-    assert!(
-        !persisted.contains("active_route_base_url") && !persisted.contains("moved.example.test"),
-        "a refused write changes nothing:\n{persisted}"
+    let saved: toml::Value = toml::from_str(&persisted)?;
+    assert_eq!(
+        saved["providers"]["bigmodel-cn"]["base_url"].as_str(),
+        Some("https://moved.example.test/v1")
     );
+    assert_eq!(
+        saved["providers"]["bigmodel-cn"]["model"].as_str(),
+        Some("glm-5.3")
+    );
+    assert!(saved.get("base_url").is_none());
+    assert!(
+        !persisted.contains("active_route_base_url"),
+        "no dead endpoint key may be written"
+    );
+    let (status, _) = post_set_config(&client, &addr, "provider", "missing-route", true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(fs::read_to_string(&config_file)?, persisted);
+    let reload = client
+        .post(format!("http://{addr}/v1/config/reload"))
+        .send()
+        .await?;
+    assert_eq!(reload.status(), StatusCode::OK);
+    let after_reload = get_config(&client, &addr).await;
+    assert_eq!(after_reload["provider"], "bigmodel-cn");
+    assert_eq!(after_reload["base_url"], "https://moved.example.test/v1");
 
     handle.abort();
     Ok(())
@@ -14373,8 +14925,8 @@ model = "glm-2"
     // Validating the root alias instead of the selection returned 500 here.
     let reloaded = Config::load(Some(config_file.clone()), None)?;
     assert_eq!(
-        reloaded.api_provider(),
-        crate::config::ApiProvider::Deepseek
+        reloaded.active_provider_identity().unwrap().provider,
+        crate::config::ProviderKind::Deepseek
     );
     assert_eq!(reloaded.default_model(), "deepseek-v4-pro");
 
@@ -15049,7 +15601,7 @@ async fn set_config_model_follows_persisted_provider_before_reload() -> Result<(
     // The persisted value is the normalized wire id (lowercase), not the
     // display spelling of DEFAULT_VOLCENGINE_FLASH_MODEL.
     let expected_wire = crate::config::normalize_model_name_for_provider(
-        crate::config::ApiProvider::Volcengine,
+        crate::config::ProviderKind::Volcengine,
         target_model,
     )
     .expect("volcengine flash model should normalize");
@@ -15057,10 +15609,13 @@ async fn set_config_model_follows_persisted_provider_before_reload() -> Result<(
         config_body.contains(&format!("model = \"{expected_wire}\"")),
         "volcengine model should be written to the provider table as its wire id"
     );
-    assert!(
-        config_body.contains("default_text_model = \"deepseek-v4-pro\""),
-        "switching provider model must not overwrite DeepSeek's root default_text_model"
+    let saved: toml::Value = toml::from_str(&config_body)?;
+    assert_eq!(
+        saved["providers"]["deepseek"]["model"].as_str(),
+        Some("deepseek-v4-pro"),
+        "switching provider model must preserve DeepSeek's migrated model table"
     );
+    assert!(saved.get("default_text_model").is_none());
 
     let reload_resp = client
         .post(format!("http://{addr}/v1/config/reload"))
@@ -16750,6 +17305,245 @@ fn create_managed_skill(root_dir: &std::path::Path, name: &str) -> Result<(PathB
 }
 
 #[tokio::test]
+async fn skill_detail_returns_body_and_routing_metadata() -> Result<()> {
+    let _env = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().to_path_buf();
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", tmp.path().join("config.toml"));
+    crate::test_support::trust_workspace(&workspace);
+    let sessions_dir = root.join("sessions");
+    fs::create_dir_all(&root)?;
+
+    // A skill with routing metadata and a body a client can activate.
+    let skill_dir = workspace
+        .join(".codewhale")
+        .join("skills")
+        .join("activatable");
+    fs::create_dir_all(&skill_dir)?;
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: activatable\ndescription: Activate me\naliases-for: activate-me\nargument-hint: <target>\n---\nDo the thing.\n",
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace(
+            root,
+            sessions_dir,
+            None,
+            false,
+            workspace,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills/activatable"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    assert_eq!(detail["name"], "activatable");
+    assert_eq!(detail["description"], "Activate me");
+    assert_eq!(detail["source"], "native");
+    assert_eq!(detail["invocation"], "model+user");
+    assert_eq!(detail["aliases"][0], "activate-me");
+    assert!(
+        detail["body"]
+            .as_str()
+            .is_some_and(|b| b.contains("Do the thing.")),
+        "detail body must carry the SKILL.md instructions, got {:?}",
+        detail["body"]
+    );
+    assert!(
+        detail["path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with("SKILL.md")),
+        "native skill detail must name its SKILL.md path"
+    );
+    // The alias resolves to the same body, so a client can activate by either
+    // spelling without a second lookup table.
+    let by_alias: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills/activate-me"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(by_alias["name"], "activatable");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn skill_detail_404s_for_unknown_skill() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let resp = client
+        .get(format!("http://{addr}/v1/skills/no-such-skill"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn skill_list_rows_carry_routing_metadata() -> Result<()> {
+    let _env = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().to_path_buf();
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", tmp.path().join("config.toml"));
+    crate::test_support::trust_workspace(&workspace);
+    let sessions_dir = root.join("sessions");
+    fs::create_dir_all(&root)?;
+
+    let skill_dir = workspace.join(".codewhale").join("skills").join("listed");
+    fs::create_dir_all(&skill_dir)?;
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: listed\ndescription: Listed skill\ninvocation: explicit-only\n---\nbody\n",
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace(
+            root,
+            sessions_dir,
+            None,
+            false,
+            workspace,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let list: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let listed = list["skills"]
+        .as_array()
+        .expect("skills array")
+        .iter()
+        .find(|sk| sk["name"] == "listed")
+        .expect("listed skill present");
+    assert_eq!(listed["invocation"], "explicit-only");
+    assert_eq!(listed["is_bundled"], false);
+    // A custom skill has no curated tier; the field is present but null.
+    assert!(listed["bundled_tier"].is_null());
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn listed_tier_belongs_to_the_bundled_copy_only() -> Result<()> {
+    let _env = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().to_path_buf();
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", tmp.path().join("config.toml"));
+    crate::test_support::trust_workspace(&workspace);
+    let sessions_dir = root.join("sessions");
+    fs::create_dir_all(&root)?;
+
+    // A bundled name at the bundled path: the shipped skill, grouped.
+    let bundled = workspace.join(".codewhale").join("skills").join("help");
+    fs::create_dir_all(&bundled)?;
+    fs::write(
+        bundled.join("SKILL.md"),
+        "---\nname: help\ndescription: Shipped\n---\nbody\n",
+    )?;
+    // A bundled *name* somewhere else: a community skill that shares the name
+    // of a shipped one. It is not the shipped copy, so it is not in the
+    // shipped tier either — the two fields have to agree.
+    let impostor = workspace.join(".agents").join("skills").join("pdf");
+    fs::create_dir_all(&impostor)?;
+    fs::write(
+        impostor.join("SKILL.md"),
+        "---\nname: pdf\ndescription: Mine, not the shipped one\n---\nbody\n",
+    )?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace(
+            root,
+            sessions_dir,
+            None,
+            false,
+            workspace,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let list: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let rows = list["skills"].as_array().expect("skills array");
+    let row = |name: &str| {
+        rows.iter()
+            .find(|sk| sk["name"] == name)
+            .unwrap_or_else(|| panic!("{name} must be listed"))
+    };
+    assert_eq!(row("help")["is_bundled"], true);
+    assert_eq!(row("help")["bundled_tier"], "tools");
+    assert_eq!(row("pdf")["is_bundled"], false);
+    assert!(
+        row("pdf")["bundled_tier"].is_null(),
+        "a non-bundled copy of a bundled name must not claim the shipped tier: {}",
+        row("pdf")["bundled_tier"]
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_info_advertises_skill_detail_capability() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let info: serde_json::Value = client
+        .get(format!("http://{addr}/v1/runtime/info"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        info["capabilities"]["skill_detail"], true,
+        "runtime/info must advertise skill_detail capability"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn skill_lifecycle_uninstall_removes_installed_skill() -> Result<()> {
     let _env = lock_test_env();
     let tmp = tempfile::tempdir()?;
@@ -17116,6 +17910,9 @@ async fn skill_lifecycle_endpoints_require_auth_when_token_is_set() -> Result<()
         ("POST", "/v1/skills/any/update"),
         ("DELETE", "/v1/skills/any"),
         ("POST", "/v1/skills/any/trust"),
+        // The detail route hands back a SKILL.md body, so it is as sensitive
+        // as the listing plus the file it names.
+        ("GET", "/v1/skills/any"),
     ] {
         let resp = client
             .request(
@@ -17641,6 +18438,7 @@ async fn plugin_api_404s_for_unknown_selector() -> Result<()> {
 
 #[tokio::test]
 async fn dsh_package_preview_then_exact_install_over_http() -> Result<()> {
+    let _home = crate::test_support::SealedHome::new();
     let tmp = tempfile::tempdir()?;
     let root = tmp.path().join("runtime");
     let workspace = tmp.path().join("ws");
@@ -17660,14 +18458,27 @@ async fn dsh_package_preview_then_exact_install_over_http() -> Result<()> {
     };
     let client = crate::tls::reqwest_client();
 
-    let preview: serde_json::Value = client
+    let mut preview_response = client
         .post(format!("http://{addr}/v1/apps/plugins/import/dsh/preview"))
         .json(&serde_json::json!({"path": package.display().to_string()}))
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
+    if !preview_response.status().is_success() {
+        let status = preview_response.status();
+        let mut diagnostic = Vec::new();
+        while let Some(chunk) = preview_response.chunk().await? {
+            let remaining = 1024 - diagnostic.len();
+            diagnostic.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            if diagnostic.len() == 1024 {
+                break;
+            }
+        }
+        anyhow::bail!(
+            "DSH fixture preview {status}: {}",
+            String::from_utf8_lossy(&diagnostic)
+        );
+    }
+    let preview: serde_json::Value = preview_response.json().await?;
     assert_eq!(preview["conversion"]["plugin_name"], "docs-dsh");
     assert_eq!(
         preview["conversion"]["network_hosts"],
@@ -18053,7 +18864,9 @@ vendor = "{vendor}"
         )?;
         let old_config = manager.read_config().clone();
         let old_vendor = old_config.openrouter_vendor()?;
-        let old_client = if old_config.api_provider() == crate::config::ApiProvider::Openrouter {
+        let old_client = if old_config.active_provider_identity().unwrap().provider
+            == crate::config::ProviderKind::Openrouter
+        {
             Some(crate::client::CodewhaleClient::new(&old_config)?)
         } else {
             None
@@ -18090,14 +18903,21 @@ fn oauth_pass_through_provider_lists_catalog_models_without_a_live_listing() {
     };
     // Before the OAuth opt-in, a pass-through provider with no live listing
     // offers only its configured model.
-    assert!(provider_models_for_api(&config, ApiProvider::Deepseek, ApiProvider::Xai).is_empty());
+    assert!(
+        provider_models_for_api(&config, &(config).test_identity_for_kind(ProviderKind::Xai))
+            .is_empty()
+    );
 
-    config.provider_config_for_mut(ApiProvider::Xai).auth_mode = Some("oauth".into());
+    config
+        .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Xai))
+        .unwrap()
+        .auth_mode = Some("oauth".into());
     assert!(crate::provider_lake::live_catalog_unavailable(
         &config,
-        ApiProvider::Xai
+        &(config).test_identity_for_kind(ProviderKind::Xai)
     ));
-    let models = provider_models_for_api(&config, ApiProvider::Deepseek, ApiProvider::Xai);
+    let models =
+        provider_models_for_api(&config, &(config).test_identity_for_kind(ProviderKind::Xai));
     assert!(
         models.iter().any(|model| model == "grok-4.7"),
         "OAuth xAI must fall back to the bundled catalog: {models:?}"
@@ -18117,18 +18937,24 @@ fn api_provider_default_and_model_list_follow_exact_local_catalog() {
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
     crate::provider_catalog_live::reset_cache_for_test();
     crate::provider_lake::clear_live_snapshot();
-    let provider = ApiProvider::Ollama;
+    let provider = ProviderKind::Ollama;
     let endpoint = "http://localhost:11455/v1";
     let mut config = Config {
         provider: Some("ollama".into()),
         ..Default::default()
     };
-    config.provider_config_for_mut(provider).base_url = Some(endpoint.into());
+    config
+        .provider_config_for_mut(&config.test_identity_for_kind(provider))
+        .unwrap()
+        .base_url = Some(endpoint.into());
     assert_eq!(
-        provider_default_model_for_api(&config, provider, provider),
+        provider_default_model_for_api(&config, &(config).test_identity_for_kind(provider)),
         ""
     );
-    assert!(!provider_models_for_api(&config, provider, provider).contains(&"unknown".to_string()));
+    assert!(
+        !provider_models_for_api(&config, &(config).test_identity_for_kind(provider))
+            .contains(&"unknown".to_string())
+    );
     assert!(runtime_request_model(&config, None).is_err());
     assert_eq!(
         runtime_request_model(&config, Some("auto")).unwrap(),
@@ -18161,11 +18987,11 @@ fn api_provider_default_and_model_list_follow_exact_local_catalog() {
         },
     );
     assert_eq!(
-        provider_default_model_for_api(&config, provider, provider),
+        provider_default_model_for_api(&config, &(config).test_identity_for_kind(provider)),
         "local-default:tag"
     );
     assert_eq!(
-        provider_models_for_api(&config, provider, provider),
+        provider_models_for_api(&config, &(config).test_identity_for_kind(provider)),
         vec!["local-default:tag"]
     );
     assert_eq!(
@@ -18173,12 +18999,15 @@ fn api_provider_default_and_model_list_follow_exact_local_catalog() {
         "local-default:tag"
     );
     let mut other = config.clone();
-    other.provider_config_for_mut(provider).base_url = Some("http://localhost:11456/v1".into());
+    other
+        .provider_config_for_mut(&other.test_identity_for_kind(provider))
+        .unwrap()
+        .base_url = Some("http://localhost:11456/v1".into());
     assert_eq!(
-        provider_default_model_for_api(&other, provider, provider),
+        provider_default_model_for_api(&other, &(other).test_identity_for_kind(provider)),
         ""
     );
-    assert!(provider_models_for_api(&other, provider, provider).is_empty());
+    assert!(provider_models_for_api(&other, &(other).test_identity_for_kind(provider)).is_empty());
     crate::provider_catalog_live::record_failure_if_current(
         &ticket,
         "ollama",
@@ -18186,13 +19015,18 @@ fn api_provider_default_and_model_list_follow_exact_local_catalog() {
         CatalogRefreshError::Network,
     );
     assert_eq!(
-        provider_default_model_for_api(&config, provider, provider),
+        provider_default_model_for_api(&config, &(config).test_identity_for_kind(provider)),
         ""
     );
     assert!(runtime_request_model(&config, None).is_err());
-    config.set_provider_model_override(provider, Some("chosen:tag".into()));
+    config
+        .set_provider_model_override(
+            &config.test_identity_for_kind(provider),
+            Some("chosen:tag".into()),
+        )
+        .unwrap();
     assert_eq!(
-        provider_default_model_for_api(&config, provider, provider),
+        provider_default_model_for_api(&config, &(config).test_identity_for_kind(provider)),
         "chosen:tag"
     );
     crate::provider_catalog_live::reset_cache_for_test();
@@ -18248,7 +19082,7 @@ async fn api_config_reports_local_default_availability_without_blocking_config_r
     let fetched_at = now_unix();
     let fingerprint = base_url_fingerprint(endpoint);
     let ticket = crate::provider_catalog_live::begin_refresh_for_identity(
-        ApiProvider::Ollama,
+        ProviderKind::Ollama,
         "ollama",
         endpoint,
     );
@@ -18639,7 +19473,7 @@ async fn native_notification_replay_rechecks_requests_settled_during_the_read() 
             "input_summary": "silent settlement fixture", "created_at": Utc::now()
         }))?;
         manager.test_store().save_turn(&turn)?;
-        let mock = crate::core::engine::mock_engine_handle();
+        let mut mock = crate::core::engine::mock_engine_handle();
         manager
             .install_test_engine(&thread.id, mock.handle.clone())
             .await?;
@@ -18705,7 +19539,12 @@ async fn native_notification_replay_rechecks_requests_settled_during_the_read() 
                 ExternalApprovalDecision::Allow { remember: false }
             );
         } else {
-            assert!(manager.cancel_user_input(&thread.id, "request").await?);
+            let (canceled, consumed) = tokio::join!(
+                manager.cancel_user_input(&thread.id, "request"),
+                mock.recv_user_input_cancellation(),
+            );
+            assert!(canceled?);
+            assert_eq!(consumed.as_deref(), Some("request"));
         }
         let settled = manager.get_thread_detail(&thread.id).await?;
         assert!(settled.pending_approvals.is_empty());
@@ -18755,10 +19594,12 @@ async fn runtime_image_http_rejects_before_dispatch_and_accepts_large_canonical_
         ..Default::default()
     }
     .with_legacy_root(Some("synthetic-image-key".into()), None);
-    config.set_provider_model_override(
-        ApiProvider::Deepseek,
-        Some("deepseek-v4-flash-vision-exp".into()),
-    );
+    config
+        .set_provider_model_override(
+            &config.test_identity_for_kind(ProviderKind::Deepseek),
+            Some("deepseek-v4-flash-vision-exp".into()),
+        )
+        .unwrap();
     let (addr, manager, server) = spawn_test_server_with_root_token_mobile_workspace_and_overrides(
         dir.path().to_path_buf(),
         dir.path().join("sessions"),
@@ -18877,10 +19718,12 @@ async fn runtime_image_stream_rejection_does_not_leave_empty_threads() -> Result
         ..Default::default()
     }
     .with_legacy_root(Some("synthetic-image-key".into()), None);
-    config.set_provider_model_override(
-        ApiProvider::Deepseek,
-        Some("deepseek-v4-flash-vision-exp".into()),
-    );
+    config
+        .set_provider_model_override(
+            &config.test_identity_for_kind(ProviderKind::Deepseek),
+            Some("deepseek-v4-flash-vision-exp".into()),
+        )
+        .unwrap();
     let (addr, manager, server) = spawn_test_server_with_root_token_mobile_workspace_and_overrides(
         dir.path().to_path_buf(),
         dir.path().join("sessions"),
@@ -19007,14 +19850,15 @@ async fn runtime_image_named_catalog_resolves_and_echoes_exact_configured_identi
             StatusCode::BAD_REQUEST
         );
     }
-    let legacy: Value = client
+    let legacy = client
         .get(format!("http://{addr}/v1/providers/custom/models"))
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
-    assert!(legacy.get("model_provider_id").is_none());
+    assert_eq!(legacy.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        get_config(&client, &addr).await["provider"],
+        "vision-personal"
+    );
     server.abort();
     Ok(())
 }
@@ -19154,13 +19998,17 @@ fn output_cap_catalog_reports_exact_transport_support() {
     let _env = crate::test_support::lock_test_env();
     let config = Config::default();
     assert_eq!(
-        provider_model_output_token_limit_for_api(&config, ApiProvider::OpenaiCodex, "gpt-5.5"),
+        provider_model_output_token_limit_for_api(
+            &config,
+            &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
+            "gpt-5.5"
+        ),
         CapabilityState::Unsupported
     );
     assert_eq!(
         provider_model_output_token_limit_for_api(
             &config,
-            ApiProvider::Deepseek,
+            &(config).test_identity_for_kind(ProviderKind::Deepseek),
             "deepseek-v4-pro"
         ),
         CapabilityState::Supported
@@ -19269,6 +20117,60 @@ async fn workspace_file_put_keeps_the_edited_files_mode() -> Result<()> {
     }
 
     handle.abort();
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn workspace_file_concurrent_creates_preserve_the_first_publication() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let relative = Path::new("notes/new.txt");
+    fs::write(tmp.path().join("unrelated.txt"), b"keep me\n")?;
+
+    // Admit both creators while the destination is absent, before either
+    // publishes. This makes the stale-create race independent of scheduling.
+    let files = [
+        crate::fleet::files::WorkspaceFile::open_shared(tmp.path(), relative, true)?,
+        crate::fleet::files::WorkspaceFile::open_shared(tmp.path(), relative, true)?,
+    ];
+    assert!(!tmp.path().join(relative).exists());
+    let payloads = [
+        b"first creator\n".as_slice(),
+        b"second creator\n".as_slice(),
+    ];
+    let barrier = std::sync::Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = files
+            .into_iter()
+            .zip(payloads)
+            .map(|(file, bytes)| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    workspace::publish_workspace_file(&file, bytes, true)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("creator worker must not panic"))
+            .collect::<Vec<_>>()
+    });
+
+    let winners: Vec<_> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(index, result)| result.is_ok().then_some(index))
+        .collect();
+    assert_eq!(winners.len(), 1, "exactly one create may publish");
+    let error = results
+        .iter()
+        .find_map(|result| result.as_ref().err())
+        .unwrap();
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert!(error.message.contains("read it before overwriting"));
+    assert_eq!(fs::read(tmp.path().join(relative))?, payloads[winners[0]]);
+    assert_eq!(fs::read(tmp.path().join("unrelated.txt"))?, b"keep me\n");
     Ok(())
 }
 
@@ -20070,6 +20972,399 @@ async fn turn_artifact_routes_list_and_read_by_reference() -> Result<()> {
     Ok(())
 }
 
+/// One tool call's changes, read from the workspace restore points the engine
+/// recorded around it: a shell command's own writes belong to that command,
+/// every path and revision comes from the span's own two trees rather than
+/// from the work tree as it is now, and a call the engine never bounded — or
+/// whose closing snapshot was lost — says so instead of handing back an empty
+/// list that would read as "this call changed nothing".
+#[tokio::test]
+async fn call_change_route_reads_one_calls_workspace_span() -> Result<()> {
+    if git_missing() {
+        return Ok(());
+    }
+    let _env = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("home"));
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    fs::write(workspace.join("kept.md"), "kept\n")?;
+    let rev = |bytes: &[u8]| crate::hashing::sha256_hex(bytes);
+    // The model endpoint's own id for the call, verbatim: the shape a gateway
+    // really hands back, `|` and all. A record-id charset check would refuse it
+    // and answer "no such call" for a call the turn plainly recorded, so this
+    // literal is the regression this test exists for.
+    const SHELL_CALL: &str =
+        "call_01_f3d82rL5aT1NDbpsh4w63727|f8912d4c-2f79-46eb-91d4-9ed4998156f9";
+    // A call whose receipts survived while the trees they name did not: the
+    // side repo keeps only its newest snapshots, so an older turn's span is
+    // regularly unreachable.
+    const PRUNED_CALL: &str = "call_00_prunedForTest";
+    // A call on a workspace whose snapshot store does not exist at all: the
+    // receipts survived, the whole store did not.
+    const STORELESS_CALL: &str = "call_00_storelessForTest";
+
+    let (addr, runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("call-changes-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("call change test requires a loopback listener")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest {
+            workspace: Some(workspace.clone()),
+            ..Default::default()
+        })
+        .await?;
+
+    // The call's own span: its `tool:` receipt before the command ran and its
+    // `post-tool` partner after. `out.md` is the command's own write;
+    // `script.py` is a path it modified. Afterwards the work tree moves on
+    // again — the route must report the span, not what is on disk now.
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    fs::write(workspace.join("script.py"), "print('v1')\n")?;
+    let tool = repo.take_snapshot(&format!("tool:{SHELL_CALL}"), Some(&thread.id))?;
+    fs::write(workspace.join("out.md"), "written by the command\n")?;
+    fs::write(workspace.join("script.py"), "print('v2')\n")?;
+    let post_tool = repo.take_snapshot(&format!("post-tool:{SHELL_CALL}"), Some(&thread.id))?;
+    fs::write(workspace.join("out.md"), "edited long after the call\n")?;
+    fs::write(workspace.join("after.md"), "after the span\n")?;
+
+    // A second thread on its own workspace, which never had a snapshot store.
+    let storeless_workspace = tmp.path().join("storeless-workspace");
+    fs::create_dir_all(&storeless_workspace)?;
+    let storeless_thread = runtime_threads
+        .create_thread(CreateThreadRequest {
+            workspace: Some(storeless_workspace),
+            ..Default::default()
+        })
+        .await?;
+
+    let store = runtime_threads.test_store();
+    let shell_item: crate::runtime_threads::TurnItemRecord = serde_json::from_value(json!({
+        "id": "item_shell", "turn_id": "turn_call_changes", "kind": "command_execution",
+        "status": "completed", "summary": "exec_shell started",
+        "metadata": { "tool_use_id": SHELL_CALL, "tool_name": "exec_shell" },
+    }))?;
+    store.save_item(&shell_item)?;
+    // A call the engine judged read-only: the turn has its item, and no
+    // restore point was ever taken for it.
+    let read_item: crate::runtime_threads::TurnItemRecord = serde_json::from_value(json!({
+        "id": "item_read", "turn_id": "turn_call_changes", "kind": "command_execution",
+        "status": "completed", "summary": "exec_shell started",
+        "metadata": { "tool_use_id": "call_read", "tool_name": "exec_shell" },
+    }))?;
+    store.save_item(&read_item)?;
+    let pruned_item: crate::runtime_threads::TurnItemRecord = serde_json::from_value(json!({
+        "id": "item_pruned", "turn_id": "turn_call_changes", "kind": "command_execution",
+        "status": "completed", "summary": "bash started",
+        "metadata": { "tool_use_id": PRUNED_CALL, "tool_name": "bash" },
+    }))?;
+    store.save_item(&pruned_item)?;
+    // A call whose closing snapshot was lost: the opening receipt is recorded
+    // and the span will never resolve.
+    let half_item: crate::runtime_threads::TurnItemRecord = serde_json::from_value(json!({
+        "id": "item_half", "turn_id": "turn_call_half", "kind": "command_execution",
+        "status": "completed", "summary": "exec_shell started",
+        "metadata": { "tool_use_id": "call_half", "tool_name": "exec_shell" },
+    }))?;
+    store.save_item(&half_item)?;
+    let storeless_item: crate::runtime_threads::TurnItemRecord = serde_json::from_value(json!({
+        "id": "item_storeless", "turn_id": "turn_storeless", "kind": "command_execution",
+        "status": "completed", "summary": "bash started",
+        "metadata": { "tool_use_id": STORELESS_CALL, "tool_name": "bash" },
+    }))?;
+    store.save_item(&storeless_item)?;
+
+    let turn: TurnRecord = serde_json::from_value(json!({
+        "id": "turn_call_changes", "thread_id": thread.id, "status": "completed",
+        "input_summary": "run the script", "created_at": Utc::now(),
+        "item_ids": ["item_shell", "item_read", "item_pruned"],
+        "workspace_snapshots": [
+            {
+                "kind": "tool", "snapshot_id": tool.id.as_str(), "tree_id": tool.tree.as_str(),
+                "session_id": thread.id, "tool_call_id": SHELL_CALL,
+                "write_paths": null,
+            },
+            {
+                "kind": "post_tool", "snapshot_id": post_tool.id.as_str(),
+                "tree_id": post_tool.tree.as_str(), "session_id": thread.id,
+                "tool_call_id": SHELL_CALL, "changed_paths": ["out.md", "script.py"],
+            },
+            {
+                "kind": "tool", "snapshot_id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "tree_id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "session_id": thread.id, "tool_call_id": PRUNED_CALL,
+            },
+            {
+                "kind": "post_tool", "snapshot_id": "feedfacefeedfacefeedfacefeedfacefeedface",
+                "tree_id": "feedfacefeedfacefeedfacefeedfacefeedface",
+                "session_id": thread.id, "tool_call_id": PRUNED_CALL,
+                "changed_paths": ["gone.txt"],
+            },
+        ],
+        "workspace": { "state": "settled" },
+    }))?;
+    store.save_turn(&turn)?;
+    let half_turn: TurnRecord = serde_json::from_value(json!({
+        "id": "turn_call_half", "thread_id": thread.id, "status": "completed",
+        "input_summary": "run the script", "created_at": Utc::now(),
+        "item_ids": ["item_half"],
+        "workspace_snapshots": [{
+            "kind": "tool", "snapshot_id": tool.id.as_str(), "tree_id": tool.tree.as_str(),
+            "session_id": thread.id, "tool_call_id": "call_half",
+        }],
+        "workspace": { "state": "unavailable", "reason": "snapshot_failed" },
+    }))?;
+    store.save_turn(&half_turn)?;
+    // The same pair of receipts, on a workspace whose store is gone rather
+    // than merely pruned: one answer, not an internal error.
+    let storeless_turn: TurnRecord = serde_json::from_value(json!({
+        "id": "turn_storeless", "thread_id": storeless_thread.id, "status": "completed",
+        "input_summary": "run the script", "created_at": Utc::now(),
+        "item_ids": ["item_storeless"],
+        "workspace_snapshots": [
+            {
+                "kind": "tool", "snapshot_id": "aa".repeat(20), "tree_id": "aa".repeat(20),
+                "session_id": storeless_thread.id, "tool_call_id": STORELESS_CALL,
+            },
+            {
+                "kind": "post_tool", "snapshot_id": "bb".repeat(20), "tree_id": "bb".repeat(20),
+                "session_id": storeless_thread.id, "tool_call_id": STORELESS_CALL,
+                "changed_paths": ["gone.txt"],
+            },
+        ],
+        "workspace": { "state": "settled" },
+    }))?;
+    store.save_turn(&storeless_turn)?;
+
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+    let url = |thread_id: &str, turn_id: &str, call: &str| {
+        format!("{base}/v1/threads/{thread_id}/turns/{turn_id}/calls/{call}/changes")
+    };
+    let get = |thread_id: &str,
+               turn_id: &str,
+               call: &str|
+     -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value>> + Send + '_>,
+    > {
+        let client = client.clone();
+        let url = url(thread_id, turn_id, call);
+        Box::pin(async move {
+            Ok(client
+                .get(url)
+                .bearer_auth("call-changes-token")
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?)
+        })
+    };
+
+    // The item's persisted lifecycle owns the wait: an opening receipt with
+    // no partner is normal while queued or running, not a permanent loss.
+    let mut active_turn = half_turn.clone();
+    active_turn.id = "turn_call_active".to_string();
+    active_turn.status = RuntimeTurnStatus::InProgress;
+    active_turn.item_ids = vec!["item_active".to_string()];
+    active_turn.workspace = None;
+    store.save_turn(&active_turn)?;
+    let mut active_item = half_item.clone();
+    active_item.id = "item_active".to_string();
+    active_item.turn_id = active_turn.id.clone();
+    for status in [
+        TurnItemLifecycleStatus::Queued,
+        TurnItemLifecycleStatus::InProgress,
+    ] {
+        active_item.status = status;
+        store.save_item(&active_item)?;
+        let pending = get(&thread.id, &active_turn.id, "call_half").await?;
+        assert_eq!(pending["state"], "pending");
+        assert_eq!(pending["reason"], Value::Null);
+        assert_eq!(pending["files"].as_array().unwrap().len(), 0);
+    }
+    active_turn
+        .workspace_snapshots
+        .push(serde_json::from_value(json!({
+            "kind": "post_tool", "snapshot_id": post_tool.id.as_str(),
+            "tree_id": post_tool.tree.as_str(), "session_id": thread.id,
+            "tool_call_id": "call_half", "changed_paths": ["out.md", "script.py"],
+        }))?);
+    active_turn.status = RuntimeTurnStatus::Completed;
+    active_item.status = TurnItemLifecycleStatus::Completed;
+    store.save_item(&active_item)?;
+    store.save_turn(&active_turn)?;
+    let settled = get(&thread.id, &active_turn.id, "call_half").await?;
+    assert_eq!(settled["state"], "captured");
+    assert_eq!(settled["reason"], Value::Null);
+    assert_eq!(settled["files"].as_array().unwrap().len(), 2);
+
+    let body = get(&thread.id, "turn_call_changes", SHELL_CALL).await?;
+    assert_eq!(body["state"], "captured");
+    assert_eq!(body["reason"], Value::Null);
+    assert_eq!(body["tool_name"], "exec_shell");
+    assert_eq!(body["truncated"], false);
+    let files = body["files"].as_array().expect("files");
+    let paths: Vec<&str> = files
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        ["out.md", "script.py"],
+        "the span's own paths, in git's order: {files:?}"
+    );
+
+    let created = &files[0];
+    assert_eq!(created["change"], "created");
+    assert_eq!(created["added"], 1);
+    assert_eq!(created["removed"], 0);
+    // The span's end, not the work tree's newer bytes.
+    assert_eq!(created["revision"], rev(b"written by the command\n"));
+    assert_eq!(created["size"].as_u64(), Some(23));
+    assert_eq!(
+        created["restore_snapshot_id"],
+        tool.tree.as_str(),
+        "the revert point is the call's own `tool:` receipt"
+    );
+    assert!(
+        created["diff"]
+            .as_str()
+            .unwrap()
+            .contains("+written by the command"),
+        "{}",
+        created["diff"]
+    );
+    assert_eq!(created["diff_truncated"], false);
+
+    let modified = &files[1];
+    assert_eq!(modified["change"], "updated");
+    assert_eq!(modified["added"], 1);
+    assert_eq!(modified["removed"], 1);
+    let patch = modified["diff"].as_str().unwrap();
+    assert!(patch.contains("-print('v1')"), "{patch}");
+    assert!(patch.contains("+print('v2')"), "{patch}");
+    assert!(
+        !body.to_string().contains("after.md"),
+        "a write after the span is not the call's: {body}"
+    );
+
+    // A call the turn recorded but the engine never bounded: known, and not
+    // reported as "changed nothing".
+    let unbounded = get(&thread.id, "turn_call_changes", "call_read").await?;
+    assert_eq!(unbounded["state"], "unavailable");
+    assert_eq!(unbounded["reason"], "call_not_bounded");
+    assert_eq!(unbounded["files"].as_array().unwrap().len(), 0);
+
+    // A span whose trees have been pruned is a fact about the store, not a
+    // failure of the read: the receipt's own path list is what a client keeps.
+    let pruned = get(&thread.id, "turn_call_changes", PRUNED_CALL).await?;
+    assert_eq!(pruned["state"], "unavailable");
+    assert_eq!(pruned["reason"], "snapshots_pruned");
+    assert_eq!(pruned["files"].as_array().unwrap().len(), 0);
+
+    // A workspace with no snapshot store at all answers the same way: the
+    // receipts cannot be resolved, and that is not a server failure.
+    let storeless: Value = client
+        .get(url(&storeless_thread.id, "turn_storeless", STORELESS_CALL))
+        .bearer_auth("call-changes-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(storeless["state"], "unavailable");
+    assert_eq!(storeless["reason"], "snapshots_pruned");
+
+    // A span whose closing receipt is gone will never resolve, and says why.
+    let half = get(&thread.id, "turn_call_half", "call_half").await?;
+    assert_eq!(half["state"], "unavailable");
+    assert_eq!(half["reason"], "post_snapshot_missing");
+
+    // A corrupt item cannot turn a known call into an unavailable span.
+    let item_path = tmp
+        .path()
+        // This harness roots the Runtime store at <root>/runtime/runtime.
+        .join("runtime")
+        .join("runtime")
+        .join("runtime")
+        .join("items")
+        .join(format!("{}.json", half_item.id));
+    let saved_item = fs::read(&item_path)?;
+    fs::write(&item_path, b"invalid runtime item JSON\n")?;
+    let response = client
+        .get(url(&thread.id, "turn_call_half", "call_half"))
+        .bearer_auth("call-changes-token")
+        .send()
+        .await;
+    fs::write(&item_path, saved_item)?;
+    let response = response?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let error: Value = response.json().await?;
+    assert!(
+        error.to_string().contains("Failed to parse item"),
+        "{error}"
+    );
+
+    // A call this turn never ran, an unknown turn, and a turn of another
+    // thread are 404s rather than empty answers.
+    for (thread_id, turn_id, call) in [
+        (thread.id.as_str(), "turn_call_changes", "call_never"),
+        (thread.id.as_str(), "turn_missing", "call_shell"),
+        (thread.id.as_str(), "turn_call_half", "call_shell"),
+        ("thread_missing", "turn_call_changes", SHELL_CALL),
+    ] {
+        let status = client
+            .get(url(thread_id, turn_id, call))
+            .bearer_auth("call-changes-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{thread_id}/{turn_id}/{call}"
+        );
+    }
+    let status = client
+        .get(format!(
+            "{}?limit=0",
+            url(&thread.id, "turn_call_changes", SHELL_CALL)
+        ))
+        .bearer_auth("call-changes-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A store is present, but git cannot read its metadata. Preserve the
+    // operational failure rather than telling clients these trees were pruned.
+    let head = repo.git_dir().join("HEAD");
+    let saved_head = fs::read(&head)?;
+    fs::write(&head, b"invalid snapshot repository metadata\n")?;
+    let response = client
+        .get(url(&thread.id, "turn_call_changes", SHELL_CALL))
+        .bearer_auth("call-changes-token")
+        .send()
+        .await;
+    fs::write(&head, saved_head)?;
+    let response = response?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let error: Value = response.json().await?;
+    assert!(
+        error.to_string().contains("snapshot tree lookup failed"),
+        "{error}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // /v1/jobs: client-owned shell jobs on the thread's shared ShellManager.
 // ---------------------------------------------------------------------------
@@ -20407,7 +21702,8 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cwhome"));
     let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
     let _cli_key = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
-    let _provider_keys: Vec<_> = ApiProvider::Deepseek
+    let _provider_keys: Vec<_> = ProviderKind::Deepseek
+        .provider()
         .env_vars()
         .iter()
         .copied()
@@ -20502,7 +21798,7 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
         let live = live_config.read();
         assert_eq!(live.auth_mode, None);
         assert_eq!(
-            live.provider_config_for(ApiProvider::OpenaiCodex)
+            live.provider_config_for(&live.test_identity_for_kind(ProviderKind::OpenaiCodex))
                 .and_then(|entry| entry.auth_mode.as_deref()),
             None
         );
@@ -20558,12 +21854,12 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
         let live = live_config.read();
         assert_eq!(live.auth_mode, None);
         assert_eq!(
-            live.provider_config_for(ApiProvider::Deepseek)
+            live.provider_config_for(&live.test_identity_for_kind(ProviderKind::Deepseek))
                 .and_then(|entry| entry.auth_mode.as_deref()),
             None
         );
         assert_eq!(
-            live.provider_config_for(ApiProvider::Openai)
+            live.provider_config_for(&live.test_identity_for_kind(ProviderKind::Openai))
                 .and_then(|entry| entry.auth_mode.as_deref()),
             Some("api_key")
         );
@@ -20597,7 +21893,7 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
         let live = live_config.read();
         assert_eq!(live.auth_mode.as_deref(), Some("api_key"));
         assert_eq!(
-            live.provider_config_for(ApiProvider::Deepseek)
+            live.provider_config_for(&live.test_identity_for_kind(ProviderKind::Deepseek))
                 .and_then(|entry| entry.auth_mode.as_deref()),
             Some("api_key")
         );
@@ -20629,7 +21925,7 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
         let live = live_config.read();
         assert_eq!(live.auth_mode.as_deref(), Some("api_key"));
         assert_eq!(
-            live.provider_config_for(ApiProvider::Openrouter)
+            live.provider_config_for(&live.test_identity_for_kind(ProviderKind::Openrouter))
                 .and_then(|entry| entry.auth_mode.as_deref()),
             None
         );
@@ -22312,7 +23608,7 @@ api_key = "refresh-fixture-key"
         "custom/models/refresh?model_provider_id=",
         "custom/models/refresh?model_provider_id=missing",
         "openai/models/refresh?model_provider_id=second",
-        "deepseek-cn/models/refresh",
+        "deepseek-cn-unknown/models/refresh",
         "custom/models/refresh?base_url=https://untrusted.invalid",
     ] {
         assert_eq!(
@@ -22813,12 +24109,21 @@ async fn mcp_server_management_blocks_credential_retargeting() -> Result<()> {
     Ok(())
 }
 
+/// Like `error_for_status`, but keeps the server's `ApiError` body so a hosted
+/// failure names the refusing handler instead of only its status.
+async fn mcp_test_success(response: reqwest::Response) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let url = response.url().clone();
+    let body = response.text().await.unwrap_or_default();
+    bail!("{status} for {url}: {body}")
+}
+
 async fn mcp_test_revision(client: &reqwest::Client, base: &str) -> Result<String> {
-    let listing: Value = client
-        .get(base)
-        .send()
+    let listing: Value = mcp_test_success(client.get(base).send().await?)
         .await?
-        .error_for_status()?
         .json()
         .await?;
     Ok(format!(

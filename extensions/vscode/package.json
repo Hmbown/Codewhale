@@ -2,21 +2,21 @@
   "name": "codewhale-vscode",
   "displayName": "Codewhale",
   "description": "Official Codewhale VS Code extension: agentic chat in the secondary sidebar over the local Engine Runtime API, with editor context, streaming turns, approvals, and terminal parity.",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "publisher": "codewhale",
   "license": "MIT",
   "preview": true,
   "icon": "media/icon.png",
-  "homepage": "https://github.com/Hmbown/CodeWhale#readme",
+  "homepage": "https://github.com/codewhale-hq/CodeWhale#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Hmbown/CodeWhale.git",
+    "url": "https://github.com/codewhale-hq/CodeWhale.git",
     "directory": "extensions/vscode"
   },
   "bugs": {
-    "url": "https://github.com/Hmbown/CodeWhale/issues"
+    "url": "https://github.com/codewhale-hq/CodeWhale/issues"
   },
-  "qna": "https://github.com/Hmbown/CodeWhale/issues",
+  "qna": "https://github.com/codewhale-hq/CodeWhale/issues",
   "engines": {
     "vscode": "^1.96.2"
   },
@@ -202,7 +202,7 @@
   "devDependencies": {
     "@types/node": "^20.19.27",
     "@types/vscode": "1.96.0",
-    "@vscode/vsce": "^3.7.0",
+    "@vscode/vsce": "^4.0.0",
     "typescript": "^5.9.3"
   }
 }

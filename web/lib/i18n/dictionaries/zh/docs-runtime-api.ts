@@ -68,7 +68,7 @@ curl -N "$API/v1/threads/$THREAD/events?since_seq=0" -H "$AUTH"`,
           ],
         },
         {
-          p: "[docs/RUNTIME_API.md](https://github.com/Hmbown/CodeWhale/blob/main/docs/RUNTIME_API.md) 列出了所有路由、请求体和事件。",
+          p: "[docs/RUNTIME_API.md](https://github.com/codewhale-hq/CodeWhale/blob/main/docs/RUNTIME_API.md) 列出了所有路由、请求体和事件。",
         },
       ],
     },

@@ -15,7 +15,7 @@ machines running Windows.
 | 1 | Confirm Windows version: `winver` → 10 build 17763+ or 11 | ☐ |
 | 2 | Ensure the user account is a **standard user** (not a local admin). The installer does not require elevation. | ☐ |
 | 3 | Verify outbound HTTPS (port 443) is open to `api.openai.com` (or whichever LLM provider the course uses). | ☐ |
-| 4 | Obtain the installer: download `CodeWhaleSetup.exe` from a v0.8.50+ [release](https://github.com/Hmbown/CodeWhale/releases/latest) or from your department mirror. | ☐ |
+| 4 | Obtain the installer: download `CodeWhaleSetup.exe` from a v0.8.50+ [release](https://github.com/codewhale-hq/CodeWhale/releases/latest) or from your department mirror. | ☐ |
 | 5 | Verify SHA-256 hash against `codewhale-artifacts-sha256.txt` before deploying. | ☐ |
 | 6 | Note that the public installer is currently unsigned and may trigger Windows SmartScreen unless your organization signs it before deployment. | ☐ |
 
@@ -53,9 +53,9 @@ $binDir = "$env:LOCALAPPDATA\Programs\CodeWhale\bin"
 New-Item -ItemType Directory -Force -Path $binDir
 
 # 2. Download binaries (adjust URL to your mirror or release tag)
-$tag = (Invoke-RestMethod -Uri "https://api.github.com/repos/Hmbown/CodeWhale/releases/latest").tag_name
-Invoke-WebRequest -Uri "https://github.com/Hmbown/CodeWhale/releases/download/$tag/codewhale-windows-x64.exe"     -OutFile "$binDir\codewhale.exe"
-Invoke-WebRequest -Uri "https://github.com/Hmbown/CodeWhale/releases/download/$tag/codew-windows-x64.exe"         -OutFile "$binDir\codew.exe"
+$tag = (Invoke-RestMethod -Uri "https://api.github.com/repos/codewhale-hq/CodeWhale/releases/latest").tag_name
+Invoke-WebRequest -Uri "https://github.com/codewhale-hq/CodeWhale/releases/download/$tag/codewhale-windows-x64.exe"     -OutFile "$binDir\codewhale.exe"
+Invoke-WebRequest -Uri "https://github.com/codewhale-hq/CodeWhale/releases/download/$tag/codew-windows-x64.exe"         -OutFile "$binDir\codew.exe"
 
 # 3. Add to user PATH (persistent)
 $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")

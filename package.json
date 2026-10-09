@@ -10,12 +10,8 @@
     "npm/deepseek-tui",
     "npm/runtime-sdk"
   ],
-  "devDependencies": {
-    "wrangler": "^4.103.0"
-  },
   "overrides": {
     "esbuild": "0.28.1",
-    "sharp": "0.35.4",
     "ws": "8.21.0",
     "undici": "7.29.1"
   }

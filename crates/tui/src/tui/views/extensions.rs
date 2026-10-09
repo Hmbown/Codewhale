@@ -1274,7 +1274,7 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                 })
                 .flatten();
             // `connecting` is the engine's real in-flight set (#6033): under
-            // lazy boot a configured-but-unstarted server reads "not started",
+            // lazy boot a configured-but-unstarted server reads "not connected",
             // never "connecting".
             let initializing = retry.is_some()
                 || (enabled
@@ -1297,11 +1297,15 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                 tr(locale, MessageId::ExtensionsStateError)
             } else if stale {
                 // Switched on in the file, still off in the live pool.
-                tr(locale, MessageId::SetupStatusNotStarted)
+                tr(locale, MessageId::McpStateDisconnected)
             } else if observed.is_none() {
                 tr(locale, MessageId::ExtensionsStateNotInspected)
             } else if observed.is_some_and(|server| !server.started()) {
-                tr(locale, MessageId::SetupStatusNotStarted)
+                // Nothing in this session has needed it yet. "Not started"
+                // read as a failure to someone whose `codewhale mcp tools`
+                // had just listed its tools from the shell, which is a
+                // separate process with its own connection.
+                tr(locale, MessageId::McpStateDisconnected)
             } else {
                 tr(locale, MessageId::ExtensionsStateDisconnected)
             }
@@ -1309,6 +1313,12 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
             let not_started = enabled
                 && !initializing
                 && (stale || observed.is_none_or(|server| !server.started()));
+            // The live pool knows this server and has simply not needed it:
+            // it has no tool counts to show, only what happens next.
+            let waiting_for_first_use = enabled
+                && !initializing
+                && !stale
+                && observed.is_some_and(|server| !server.started());
             let oauth_capable = config.is_some_and(crate::mcp::mcp_server_oauth_capable);
             let recovery = match observed {
                 Some(server) => server.recovery_kind(oauth_capable),
@@ -1426,6 +1436,9 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                     |(plugin, server)| format!("{plugin}/{server}"),
                 ),
                 description: observed.map_or_else(String::new, |server| {
+                    if waiting_for_first_use {
+                        return server.transport.clone();
+                    }
                     localize(
                         locale,
                         MessageId::ExtensionsMcpSummary,
@@ -1444,6 +1457,10 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                     observed.map_or_else(
                         || tr(locale, MessageId::ExtensionsMcpNotInspected).into_owned(),
                         |server| {
+                            if waiting_for_first_use {
+                                return tr(locale, MessageId::ExtensionsMcpNotConnectedYet)
+                                    .into_owned();
+                            }
                             server.error.clone().unwrap_or_else(|| {
                                 localize(
                                     locale,
@@ -2645,10 +2662,25 @@ mod tests {
         assert_eq!((group, github.state.as_str()), ("servers", "connected"));
         assert_eq!(command(github), None);
 
+        // Lazy boot has not needed it: the row says so and says what happens
+        // next, not "not started" over a row of zero counts.
         let (group, playwright) = row("playwright");
         assert_eq!(
             (group, playwright.state.as_str()),
-            ("servers", "not started")
+            ("servers", "not connected")
+        );
+        assert_eq!(playwright.description, "stdio");
+        assert!(
+            playwright
+                .detail
+                .ends_with("Not connected in this session yet. Connects when a tool is needed, or connect it now."),
+            "{}",
+            playwright.detail
+        );
+        assert!(
+            !playwright.detail.contains("tools: 0"),
+            "{}",
+            playwright.detail
         );
         assert_eq!(playwright.tone, ExtensionTone::Idle);
         assert_eq!(
@@ -2944,7 +2976,14 @@ mod tests {
         );
         assert!(!builtin.trusted());
         assert!(!builtin.enabled);
-        assert_eq!(group.items.iter().filter(|row| matches!(&row.action, Some(ExtensionAction::Command { command, .. }) if command.starts_with("/plugin marketplace install "))).count(), 5);
+        assert!(
+            group.items.iter().any(|row| matches!(
+                &row.action,
+                Some(ExtensionAction::Command { command, .. })
+                    if command == "/plugin marketplace install codewhale whalewiki"
+            )),
+            "an absent catalog bundle should still offer installation"
+        );
     }
 
     #[test]

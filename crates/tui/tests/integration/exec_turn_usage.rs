@@ -14,7 +14,6 @@
 #![cfg(unix)]
 
 use std::io::Read;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -162,17 +161,17 @@ fn run_exec_stream_json(server: &MockServer) -> Vec<Value> {
         .collect()
 }
 
-/// Run `codewhale-tui exec <exec_args>` against `server` and return stdout.
+/// Run `codewhale exec <exec_args>` against `server` and return stdout.
 fn run_exec(server: &MockServer, exec_args: &[&str]) -> String {
     let (success, stdout, stderr) = run_exec_unchecked(server, exec_args);
     assert!(
         success,
-        "codewhale-tui exec failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "codewhale exec failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     stdout
 }
 
-/// Run `codewhale-tui exec <exec_args>` and return whether it exited
+/// Run `codewhale exec <exec_args>` and return whether it exited
 /// successfully, its stdout and its stderr.
 fn run_exec_unchecked(server: &MockServer, exec_args: &[&str]) -> (bool, String, String) {
     run_exec_in_home(server, exec_args, |_| {})
@@ -198,7 +197,7 @@ fn run_exec_with_stdin(
     let workspace = TempDir::new().expect("workspace tempdir");
     let home = TempDir::new().expect("home tempdir");
 
-    let mut command = Command::new(codewhale_tui_binary());
+    let mut command = Command::new(crate::binary::codewhale());
     preserve_host_env(&mut command);
     command
         .current_dir(workspace.path())
@@ -236,7 +235,7 @@ fn run_exec_with_stdin(
     if stdin.is_some() {
         command.stdin(Stdio::piped());
     }
-    let mut child = command.spawn().expect("spawn codewhale-tui exec");
+    let mut child = command.spawn().expect("spawn codewhale exec");
     let stdin_writer = stdin.map(|bytes| {
         let mut pipe = child.stdin.take().expect("stdin pipe");
         std::thread::spawn(move || {
@@ -248,10 +247,7 @@ fn run_exec_with_stdin(
     let stdout_reader = read_pipe_in_background(child.stdout.take().expect("stdout pipe"));
     let stderr_reader = read_pipe_in_background(child.stderr.take().expect("stderr pipe"));
 
-    let status = match child
-        .wait_timeout(RUN_TIMEOUT)
-        .expect("wait for codewhale-tui")
-    {
+    let status = match child.wait_timeout(RUN_TIMEOUT).expect("wait for codewhale") {
         Some(status) => status,
         None => {
             let _ = child.kill();
@@ -259,7 +255,7 @@ fn run_exec_with_stdin(
             let stdout = join_pipe_reader(stdout_reader, "stdout");
             let stderr = join_pipe_reader(stderr_reader, "stderr");
             panic!(
-                "codewhale-tui exec timed out after {RUN_TIMEOUT:?}\nstdout:\n{}\nstderr:\n{}",
+                "codewhale exec timed out after {RUN_TIMEOUT:?}\nstdout:\n{}\nstderr:\n{}",
                 String::from_utf8_lossy(&stdout),
                 String::from_utf8_lossy(&stderr)
             );
@@ -296,23 +292,6 @@ fn join_pipe_reader(
         .join()
         .unwrap_or_else(|_| panic!("{stream_name} reader thread panicked"))
         .unwrap_or_else(|err| panic!("failed to read {stream_name}: {err}"))
-}
-
-fn codewhale_tui_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-
-    let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
-    path
 }
 
 fn events_of_type<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> {
@@ -629,6 +608,135 @@ async fn plain_exec_bounds_output_limit_continuations() {
             );
         }
     }
+}
+
+/// SSE for a response that reports `finish_reason: stop` while its usage says
+/// the whole requested output allowance was used (#6889). `completion_tokens`
+/// echoes the ceiling the request carried, whichever key it used.
+fn stop_at_ceiling_response(content: Option<&'static str>) -> impl wiremock::Respond {
+    move |request: &wiremock::Request| {
+        let body: Value = serde_json::from_slice(&request.body).expect("request body JSON");
+        let ceiling = body
+            .get("max_tokens")
+            .or_else(|| body.get("max_completion_tokens"))
+            .and_then(Value::as_u64)
+            .expect("the request names an output ceiling");
+        let delta = content.map_or_else(|| json!({}), |text| json!({ "content": text }));
+        sse_response(
+            [
+                sse_chunk(json!({
+                    "id": "chatcmpl-ceiling",
+                    "object": "chat.completion.chunk",
+                    "model": TEST_MODEL,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
+                })),
+                sse_chunk(json!({
+                    "id": "chatcmpl-ceiling",
+                    "object": "chat.completion.chunk",
+                    "model": TEST_MODEL,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 20,
+                        "completion_tokens": ceiling,
+                        "total_tokens": ceiling + 20
+                    }
+                })),
+                "data: [DONE]\n\n".to_string(),
+            ]
+            .join(""),
+        )
+    }
+}
+
+/// #6889: a provider can cut a response at the requested ceiling and still
+/// report `finish_reason: stop`. Its own usage gives it away: the completion
+/// tokens equal the ceiling. That response follows the same policy as a
+/// `length` stop, so the partial answer is kept and the model is asked to
+/// continue instead of the cut-off answer passing for a finished one.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_exec_continues_past_a_stop_that_used_the_whole_output_allowance() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(json_response(json!({
+            "object": "list",
+            "data": [{ "id": TEST_MODEL, "object": "model" }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(stop_at_ceiling_response(Some("first half")))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse_response(answer_sse_without_usage(" second half")))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let json_stdout = run_exec(
+        &server,
+        &["--json", "--model", TEST_MODEL, "answer briefly"],
+    );
+    let receipt: Value = serde_json::from_str(&json_stdout)
+        .unwrap_or_else(|err| panic!("--json receipt should parse: {err}\n{json_stdout}"));
+    assert_eq!(receipt["success"], true, "{receipt}");
+    let output = receipt["output"].as_str().unwrap_or_default();
+    assert!(
+        output.contains("first half") && output.contains("second half"),
+        "{receipt}"
+    );
+
+    let bodies = chat_bodies(&server).await;
+    assert_eq!(bodies.len(), 2, "one continuation request: {bodies:#?}");
+    assert!(
+        bodies[1]["messages"]
+            .to_string()
+            .contains("stopped generation at its output limit"),
+        "the continuation names the truncation: {}",
+        bodies[1]["messages"]
+    );
+}
+
+/// #6889: when the allowance was spent before any answer was written, the
+/// response is empty and still says `stop`. Asking again reproduces it, so
+/// the run fails after that one request instead of re-requesting it.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_exec_does_not_re_request_an_empty_stop_at_the_output_ceiling() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(json_response(json!({
+            "object": "list",
+            "data": [{ "id": TEST_MODEL, "object": "model" }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(stop_at_ceiling_response(None))
+        .mount(&server)
+        .await;
+
+    let (success, stdout, stderr) = run_exec_unchecked(
+        &server,
+        &["--json", "--model", TEST_MODEL, "answer briefly"],
+    );
+    assert!(
+        !success,
+        "an answerless response must not exit 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let bodies = chat_bodies(&server).await;
+    assert_eq!(
+        bodies.len(),
+        1,
+        "a stop at the ceiling is not re-requested: {bodies:#?}"
+    );
 }
 
 /// A stdio MCP server that reads `initialize`, closes its stdin, answers, and

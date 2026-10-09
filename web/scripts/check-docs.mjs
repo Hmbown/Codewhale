@@ -113,7 +113,7 @@ function checkInstallSnippets() {
   // matches the repository slug exactly. Keep the following `cd` command
   // case-correct so source installation works on case-sensitive filesystems.
   const sourceCheckout = src.match(
-    /git clone[^\n]*https:\/\/github\.com\/Hmbown\/([^\s`]+)\s*\ncd\s+([^\s`]+)/,
+    /git clone[^\n]*https:\/\/github\.com\/codewhale-hq\/([^\s`]+)\s*\ncd\s+([^\s`]+)/,
   );
   const checkout = sourceCheckout
     ? {

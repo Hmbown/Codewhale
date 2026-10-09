@@ -10,12 +10,17 @@ import url from "node:url";
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
 const results = [];
+const skipped = [];
 
 function log(name, pass, detail = "") {
   results.push({ name, pass, detail: String(detail).slice(0, 500) });
   console.log(`${pass ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`);
 }
 
+// Optional: the one app whose consent this run may exercise (for example
+// CU_SMOKE_APP=mousepad). Unset, the consent-gated checks are reported as
+// skipped rather than faked.
+const smokeApp = process.env.CU_SMOKE_APP?.trim() || null;
 const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "cu-smoke-state-"));
 const recDir = fs.mkdtempSync(path.join(os.tmpdir(), "cu-smoke-rec-"));
 
@@ -36,6 +41,14 @@ server.stdout.on("data", (d) => {
     if (!line) continue;
     try {
       const msg = JSON.parse(line);
+      if (msg.method === "elicitation/create" && msg.id) {
+        // The consent decision the operator asked for: only the app named in
+        // CU_SMOKE_APP, recorded for this session. Anything else is declined.
+        const approved = smokeApp && msg.params?.message === `Computer Use asks for your decision: consent_allow {"app":"${smokeApp}"}`;
+        console.log(`[smoke] consent prompt ${approved ? "approved" : "declined"}: ${msg.params?.message}`);
+        server.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { action: approved ? "accept" : "decline" } }) + "\n");
+        continue;
+      }
       if (msg.id && pending.has(msg.id)) {
         pending.get(msg.id)(msg);
         pending.delete(msg.id);
@@ -64,7 +77,7 @@ async function tool(name, args = {}) {
 
 try {
   // --- protocol ---
-  const init = await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {} });
+  const init = await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: { elicitation: {} } });
   log("initialize", !!init.result?.serverInfo?.name, `server=${init.result?.serverInfo?.name} v${init.result?.serverInfo?.version}`);
   await rpc("notifications/initialized", undefined, 5_000).catch(() => {});
   const tl = await rpc("tools/list", {});
@@ -82,17 +95,25 @@ try {
   let r = await tool("computer_list");
   log("computer_list", r.parsed?.ok === true && r.parsed?.computers?.length >= 1, `active=${r.parsed?.active}`);
 
+  // Registering a computer is the user's own decision: a model call is refused.
   r = await tool("computer_register", { computer: "pad", transport: "hdc", label: "Harmony device" });
-  log("computer_register(hdc)", r.parsed?.ok === true, JSON.stringify(r.parsed?.registered ?? r.parsed?.error));
+  // consent_declined: this client answered the registration prompt with a
+  // decline. consent_needs_user: the host offered no prompt at all. Either way
+  // the registration did not happen.
+  log("computer_register refused without the user's decision", ["consent_declined", "consent_needs_user"].includes(r.parsed?.error?.code), `code=${r.parsed?.error?.code}`);
 
+  // An unregistered computer must fail closed, both to switch and to act.
   r = await tool("computer_switch", { computer: "pad" });
-  log("computer_switch", r.parsed?.ok === true && r.parsed?.active === "pad", `active=${r.parsed?.active}`);
+  const listed = await tool("computer_list");
+  log("computer_switch to an unregistered computer fails closed", r.parsed?.ok === false && r.parsed?.error?.code === "unknown_computer" && listed.parsed?.active === "local", `code=${r.parsed?.error?.code} active=${listed.parsed?.active}`);
 
-  r = await tool("list_apps");
-  log("harmony fail-closed (no hdc device)", r.parsed?.ok === false, `code=${r.parsed?.error?.code}`);
+  r = await tool("list_apps", { computer: "pad" });
+  log("harmony fail-closed (no registered device)", r.parsed?.ok === false && r.parsed?.computer?.id !== "pad", `code=${r.parsed?.error?.code}`);
 
+  // Switching by use is sticky, but a screenshot on the already-active computer
+  // reports no switch. The receipt must name the computer it acted on.
   r = await tool("screenshot", { computer: "local" });
-  log("switch-by-use (computer:local on screenshot)", r.parsed?.ok === true && r.parsed?.switched === true && r.parsed?.computer?.id === "local", `file=${path.basename(r.parsed?.file ?? "")}`);
+  log("screenshot names its computer (computer:local)", r.parsed?.ok === true && r.parsed?.computer?.id === "local", `file=${path.basename(r.parsed?.file ?? "")} switched=${r.parsed?.switched}`);
 
   // --- local darwin live tools ---
   r = await tool("request_access");
@@ -104,22 +125,31 @@ try {
   r = await tool("list_apps");
   log("list_apps", r.parsed?.ok === true && r.parsed?.apps?.length > 0, `${r.parsed?.apps?.length} apps`);
 
-  // No backend reports windowCount today, so fall back to the app in front —
-  // it is the one guaranteed to have a window worth observing.
+  // Consent is exercised only on the app the operator named (CU_SMOKE_APP).
+  // Without it, these checks are listed as skipped, never reported as passed.
   const apps = r.parsed?.apps ?? [];
-  const someApp = apps.find((a) => a.windowCount > 0) ?? apps.find((a) => a.frontmost) ?? apps[0];
-  if (someApp) {
-    // The consent ledger gates first app contact on the local computer —
-    // smoke exercises the real flow: refuse, record the user's allow, retry.
-    const gated = await tool("get_app_state", { app_ref: { pid: someApp.pid } });
-    log("consent_required on first app contact", gated.parsed?.error?.code === "consent_required", `code=${gated.parsed?.error?.code}`);
-    const c = await tool("consent", { action: "allow", app: `pid:${someApp.pid}` });
-    log("consent allow", c.parsed?.ok === true, `${someApp.name}: keys=${JSON.stringify(c.parsed?.keys ?? c.parsed?.error)}`);
-    const st = await tool("get_app_state", { app_ref: { pid: someApp.pid } });
-    log("get_app_state", st.parsed?.ok === true && st.parsed?.elements?.length > 0, `${someApp.name}: ${st.parsed?.elements?.length} elements, state_id=${st.parsed?.state_id}`);
-    globalThis.__state = st.parsed;
+  const target = smokeApp ? apps.find((a) => (a.name ?? "").toLowerCase() === smokeApp.toLowerCase()) : null;
+  if (!smokeApp) {
+    skipped.push("consent-gated app checks (set CU_SMOKE_APP to the one app this run may drive)");
+  } else if (!target) {
+    log("consent target running", false, `no running app named "${smokeApp}" — start it and rerun`);
   } else {
-    log("get_app_state", false, "list_apps returned no applications to observe");
+    const ref = { name: target.name };
+    // First contact refuses until the user decides; the decision is recorded
+    // through elicitation, so the operator approves the exact call.
+    const gated = await tool("get_app_state", { app_ref: ref });
+    log("consent_required on first app contact", gated.parsed?.error?.code === "consent_required", `code=${gated.parsed?.error?.code}`);
+    const c = await tool("consent", { action: "allow", app: target.name });
+    log("consent allow (approved by the operator via elicitation)", c.parsed?.ok === true, `${target.name}: ${JSON.stringify(c.parsed?.keys ?? c.parsed?.error?.code)}`);
+    const st = await tool("get_app_state", { app_ref: ref });
+    log("get_app_state after consent", st.parsed?.ok === true && st.parsed?.elements?.length > 0, `${target.name}: ${st.parsed?.elements?.length} elements`);
+    const other = apps.find((a) => a.name && a.name.toLowerCase() !== smokeApp.toLowerCase());
+    if (other) {
+      const blocked = await tool("get_app_state", { app_ref: { name: other.name } });
+      log("unapproved app stays blocked", blocked.parsed?.error?.code === "consent_required", `${other.name}: code=${blocked.parsed?.error?.code}`);
+    } else {
+      skipped.push("unapproved-app block (no second running app to test against)");
+    }
   }
 
   r = await tool("cursor_position");
@@ -168,12 +198,13 @@ try {
   log("smoke-run", false, err.stack ?? err.message);
 } finally {
   server.kill("SIGTERM");
-  const receipt = { at: new Date().toISOString(), host: `${process.platform} ${os.release()}`, results };
+  const receipt = { at: new Date().toISOString(), host: `${process.platform} ${os.release()}`, results, skipped };
   const outDir = path.join(ROOT, "receipts");
   fs.mkdirSync(outDir, { recursive: true });
   const out = path.join(outDir, `smoke-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
   fs.writeFileSync(out, JSON.stringify(receipt, null, 2));
   const failed = results.filter((r) => !r.pass);
+  for (const item of skipped) console.log(`SKIP  ${item}`);
   console.log(`\n${results.length - failed.length}/${results.length} passed. Receipt: ${out}`);
   try { fs.rmSync(stateDir, { recursive: true, force: true }); } catch {}
   process.exit(failed.length ? 1 : 0);

@@ -75,8 +75,7 @@ pub(crate) fn toggle_help_view(app: &mut App) {
     if app.view_stack.top_kind() == Some(ModalKind::Help) {
         app.view_stack.pop();
     } else {
-        let help = HelpView::new_for_shortcuts(app.ui_locale, &app.workspace, &app.cached_skills)
-            .with_groups_expanded(app.help_expand_groups);
+        let help = HelpView::new_for_app(app, true).with_groups_expanded(app.help_expand_groups);
         app.view_stack.push(help);
     }
     app.needs_redraw = true;
@@ -246,7 +245,7 @@ pub(crate) async fn open_onboarding_provider_picker(
     app.view_stack.push(
         crate::tui::provider_picker::ProviderPickerView::new_for_onboarding(
             app.api_provider,
-            recover_configured_route.then_some(app.onboarding_provider),
+            recover_configured_route.then(|| app.onboarding_provider.as_str().into()),
             config,
             runtime_status,
         )
@@ -313,6 +312,22 @@ pub(crate) fn open_text_pager(app: &mut App, title: String, content: String) {
         &content,
         width.saturating_sub(2),
     ));
+}
+
+/// Open a unified diff in a pager, rendered like an edit in the transcript.
+pub(crate) fn open_diff_pager(app: &mut App, title: String, diff: &str) {
+    let width = app
+        .viewport
+        .last_transcript_area
+        .map(|area| area.width)
+        .unwrap_or(80);
+    // A patch is file content. Keep the terminal-injection boundary
+    // `PagerView::from_text` applies to every other pager body.
+    let mut sanitized = String::with_capacity(diff.len());
+    crate::tui::osc8::strip_ansi_into(diff, &mut sanitized);
+    let lines = crate::tui::diff_render::render_diff(&sanitized, width.saturating_sub(2));
+    app.view_stack
+        .push(PagerView::new(title, lines).with_copy_text(sanitized));
 }
 
 pub(crate) fn open_context_inspector(app: &mut App) {
@@ -395,13 +410,17 @@ pub(crate) fn toggle_live_transcript_overlay(app: &mut App) {
 pub(crate) fn open_model_picker_for_provider(
     app: &mut App,
     config: &Config,
-    provider: crate::config::ApiProvider,
+    identity: &crate::config::ProviderIdentity,
 ) {
+    if let Err(reason) = config.verify_provider_identity(identity) {
+        app.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+        return;
+    }
     if app.view_stack.top_kind() != Some(ModalKind::ModelPicker) {
         app.view_stack
             .push(crate::tui::model_picker::ModelPickerView::new(app, config));
     }
-    for ch in provider.display_name().chars() {
+    for ch in identity.key.as_str().chars() {
         // Char input updates the query and never emits a ViewEvent, so the
         // returned (empty) event list is safe to drop.
         let _ = app.view_stack.handle_key(crossterm::event::KeyEvent::new(
@@ -528,6 +547,17 @@ pub(crate) fn push_approval_request_view(
         if let Some(agent_id) = crate::tui::pending_requests::child_agent_id(id) {
             request.owner = Some(crate::tui::pending_requests::owner_for(app, agent_id));
         }
+    } else if !request.is_repo_law_prompt() {
+        // The same edit runs without a card inside a git repository. Say why
+        // this folder asks, so two folders behaving differently is explained
+        // on the card. The engine already decided to ask; this only labels it.
+        request.asks_without_git = crate::core::authority::file_write_asks_without_git(
+            app.mode,
+            app.approval_mode,
+            &app.workspace,
+            tool_name,
+            tool_input,
+        );
     }
     app.view_stack.push(
         ApprovalView::new_with_default_selection(request, app.ui_locale, default_selection)

@@ -69,7 +69,7 @@ pub(super) async fn get_thread_context(
     let provider = thread
         .model_provider
         .as_deref()
-        .and_then(crate::config::ApiProvider::parse);
+        .and_then(crate::config::ProviderKind::parse);
     let window_tokens = provider.map(|provider| {
         u64::from(crate::route_budget::route_context_window_tokens(
             provider,

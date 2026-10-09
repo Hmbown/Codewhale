@@ -15,7 +15,7 @@
     "@larksuiteoapi/node-sdk": "^1.52.0"
   },
   "overrides": {
-    "axios": "^1.18.1",
+    "axios": "^1.20.0",
     "qs": ">=6.16.0"
   },
   "engines": {

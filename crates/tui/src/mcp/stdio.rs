@@ -1,90 +1,16 @@
-use std::collections::VecDeque;
-use std::sync::Arc;
-use std::time::Duration;
+//! MCP newline framing over the broker-owned reviewed stdio process.
+use anyhow::Result;
+use tokio::process::ChildStdout;
 
-use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::Mutex as TokioMutex;
-
-use super::wire::MAX_MCP_RESPONSE_BYTES;
+use super::process_broker::BrokerSession;
+use super::wire::{MAX_MCP_RESPONSE_BYTES, read_line_capped};
 use super::{McpServerConfig, McpTransport};
-use crate::child_env;
 
 pub(super) struct StdioTransport {
-    pub(super) child: Arc<TokioMutex<Child>>,
-    pub(super) stdin: ChildStdin,
-    pub(super) reader: tokio::io::BufReader<ChildStdout>,
+    pub(super) session: BrokerSession,
+    reader: tokio::io::BufReader<ChildStdout>,
     /// Partial frame bytes survive cancellation of the receive future.
     pub(super) pending_line: Vec<u8>,
-    /// Tail of stderr lines from the spawned MCP server. A background task
-    /// drains the child's stderr into this buffer so a mid-run crash leaves
-    /// some context behind instead of `Stdio::null` swallowing it.
-    pub(super) stderr_tail: Arc<StderrTail>,
-    /// Plugin authority can change in another process while this child is
-    /// idle. The connection-level cancellation token therefore also owns a
-    /// process watcher instead of waiting for a later tool call to drop the
-    /// transport.
-    pub(super) authority_cancel_watch: Option<tokio::task::JoinHandle<()>>,
-    /// Holds reviewed executable/script handles for the process lifetime.
-    pub(super) _reviewed_launch: Option<super::ReviewedStdioLaunch>,
-    /// Everything the server started: its own process group on Unix, a Job
-    /// Object on Windows. Termination signals the whole tree, so a server's
-    /// grandchild (an `npx` wrapper's node, a shell's background job) dies
-    /// with it on shutdown and on plugin revocation. The last clone's drop
-    /// kills whatever is left. `None` only for a transport built around an
-    /// uncontained child (tests).
-    pub(super) process_tree: Option<Arc<crate::process_tree::ProcessTree>>,
-}
-
-/// How long `StdioTransport::shutdown` waits for the child to exit on SIGTERM
-/// before `kill_on_drop` fires SIGKILL. Tuned short so a hung MCP server
-/// can't stall TUI exit; well-behaved servers almost always exit within
-/// a few hundred ms.
-pub(super) const STDIO_SHUTDOWN_GRACE: Duration = Duration::from_millis(2_000);
-
-/// How many lines of MCP-server stderr to keep around for crash diagnostics.
-/// Bounded so a chatty server can't grow this without limit; large enough to
-/// catch typical Node/Python startup or panic output.
-const STDERR_TAIL_CAPACITY: usize = 64;
-
-/// Bounded ring buffer for the most recent stderr lines from a spawned MCP
-/// server. Used by `StdioTransport` to surface server-side context when the
-/// transport read side fails (server crashed, exited early, etc).
-#[derive(Default)]
-pub(super) struct StderrTail {
-    lines: TokioMutex<VecDeque<String>>,
-}
-
-impl StderrTail {
-    pub(super) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            lines: TokioMutex::new(VecDeque::with_capacity(STDERR_TAIL_CAPACITY)),
-        })
-    }
-
-    pub(super) async fn push(&self, line: String) {
-        let mut buf = self.lines.lock().await;
-        if buf.len() >= STDERR_TAIL_CAPACITY {
-            buf.pop_front();
-        }
-        buf.push_back(line);
-    }
-
-    async fn snapshot(&self) -> Vec<String> {
-        self.lines.lock().await.iter().cloned().collect()
-    }
-
-    async fn last_line(&self) -> Option<String> {
-        self.lines
-            .lock()
-            .await
-            .iter()
-            .rev()
-            .map(|line| line.trim())
-            .find(|line| !line.is_empty())
-            .map(str::to_string)
-    }
 }
 
 impl StdioTransport {
@@ -94,337 +20,24 @@ impl StdioTransport {
         config: &McpServerConfig,
         cancel_token: tokio_util::sync::CancellationToken,
     ) -> Result<Self> {
-        let reviewed_launch = if let Some(reviewed_plugin) = config.reviewed_plugin.as_ref() {
-            // This is deliberately the last trust check before constructing
-            // and spawning the lazy stdio child. It re-reads only the
-            // Codewhale-owned plugin bundle, never user MCP/provider config or
-            // credential files, and fails closed on any content/capability
-            // drift after pool construction.
-            Some(reviewed_plugin.prepare_stdio_launch(
-                server_name,
-                command,
-                &config.args,
-                config.cwd.as_deref(),
-            )?)
-        } else {
-            None
-        };
-        let mut cmd = reviewed_launch.as_ref().map_or_else(
-            || {
-                let mut command_process = tokio::process::Command::new(command);
-                command_process.args(&config.args);
-                command_process
-            },
-            |launch| {
-                let mut command_process = tokio::process::Command::new(&launch.command);
-                command_process.args(&launch.args);
-                command_process
-            },
-        );
-        crate::utils::suppress_tokio_console_window(&mut cmd);
-        cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        let launch_cwd = reviewed_launch
-            .as_ref()
-            .and_then(|launch| launch.cwd.as_ref())
-            .or(config.cwd.as_ref().filter(|_| reviewed_launch.is_none()));
-        if let Some(cwd) = launch_cwd {
-            cmd.current_dir(cwd);
-        }
-        #[cfg(unix)]
-        if let Some(cwd_fd) = reviewed_launch
-            .as_ref()
-            .and_then(|launch| launch.cwd_fd.as_ref())
-        {
-            use std::os::fd::AsRawFd as _;
-            let fd = cwd_fd.as_raw_fd();
-            // SAFETY: the closure calls only async-signal-safe `fchdir` on an
-            // inherited directory descriptor before exec.
-            unsafe {
-                cmd.pre_exec(move || {
-                    if libc::fchdir(fd) == 0 {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::last_os_error())
-                    }
-                });
-            }
-        }
-
-        // Expand `${NAME}` placeholders so secret env values can be sourced
-        // from the process environment instead of being stored in cleartext
-        // in the MCP config. The child env is allowlist-sanitized below, so
-        // these vars would not otherwise be inherited by the child.
-        let expanded_env = super::expanded_mcp_stdio_env(config)
-            .with_context(|| format!("MCP server '{server_name}' env expansion failed"))?;
-
-        // User-configured MCP keeps the compatibility-oriented Node/Python
-        // bootstrap allowlist (#1244). Reviewed plugins receive only the base
-        // secret-scrubbed child environment plus their explicitly reviewed
-        // mappings, so namespaces such as NPM_CONFIG_* are never inherited
-        // ambiently across the consent boundary.
-        if let Some(reviewed_plugin) = config.reviewed_plugin.as_ref() {
-            cmd.env_clear();
-            for (key, value) in child_env::sanitized_plugin_mcp_env_from(
-                reviewed_plugin.host_environment.entries().iter().cloned(),
-                child_env::string_map_env(&expanded_env),
-            ) {
-                cmd.env(key, value);
-            }
-        } else {
-            child_env::apply_to_tokio_command_mcp(
-                &mut cmd,
-                child_env::string_map_env(&expanded_env),
-            );
-        }
-        // Lead a process group of its own so teardown can reach descendants.
-        #[cfg(unix)]
-        cmd.process_group(0);
-
-        let mut child = cmd.spawn().map_err(|error| {
-            let message = if error.kind() == std::io::ErrorKind::NotFound
-                && super::is_node_command(command)
-                && launch_cwd.is_none_or(|directory| directory.is_dir())
-            {
-                format!("MCP server {server_name} could not start because Node.js was not found. Install Node.js from https://nodejs.org/ and restart Codewhale with node on PATH. Built-in Computer Use requires Node.js 20 or newer.")
-            } else if config.reviewed_plugin.is_some() {
-                format!(
-                    "MCP stdio spawn failed (transport=stdio server={server_name} reviewed-plugin argv_count={} env_count={})",
-                    config.args.len(),
-                    expanded_env.len(),
-                )
-            } else {
-                let env_keys: Vec<&str> = expanded_env.keys().map(String::as_str).collect();
-                format!(
-                    "MCP stdio spawn failed (transport=stdio server={server_name} cmd={command:?} args={:?} env_keys={env_keys:?})",
-                    config.args,
-                )
-            };
-            anyhow::Error::new(error).context(message)
-        })?;
-
-        let process_tree = match crate::process_tree::ProcessTree::attach_tokio(&child) {
-            Ok(tree) => Arc::new(tree),
-            Err(error) => {
-                let _ = child.start_kill();
-                return Err(anyhow::Error::new(error).context(format!(
-                    "MCP server {server_name} could not be contained with its child processes"
-                )));
-            }
-        };
-
-        let stdin = child.stdin.take().context("Failed to get MCP stdin")?;
-        let stdout = child.stdout.take().context("Failed to get MCP stdout")?;
-        let stderr = child.stderr.take().context("Failed to get MCP stderr")?;
-
-        // Drain stderr into a bounded ring buffer so a crash mid-run leaves
-        // diagnostic breadcrumbs instead of disappearing into `Stdio::null`.
-        // The task exits naturally when the child closes its stderr
-        // (kill_on_drop / exit / explicit shutdown).
-        let stderr_tail = StderrTail::new();
-        {
-            let tail = Arc::clone(&stderr_tail);
-            // A reviewed plugin child receives environment-backed values that
-            // are intentionally absent from its manifest. Still drain its
-            // stderr to avoid blocking, but do not retain or surface arbitrary
-            // child output that could echo those credentials into a chat or
-            // persisted transcript.
-            let capture = config.reviewed_plugin.is_none().then_some(tail);
-            tokio::spawn(drain_stderr(stderr, capture));
-        }
-
-        let child = Arc::new(TokioMutex::new(child));
-        let authority_cancel_watch = config.reviewed_plugin.as_ref().map(|_| {
-            let watched_child = Arc::clone(&child);
-            let watched_tree = Arc::clone(&process_tree);
-            tokio::spawn(async move {
-                cancel_token.cancelled().await;
-                terminate_child_for_authority_change(&watched_child, &watched_tree).await;
-            })
-        });
-
+        let (session, stdout) = BrokerSession::spawn(server_name, command, config, cancel_token)?;
         Ok(Self {
-            child,
-            stdin,
+            session,
             reader: tokio::io::BufReader::new(stdout),
             pending_line: Vec::new(),
-            stderr_tail,
-            authority_cancel_watch,
-            _reviewed_launch: reviewed_launch,
-            process_tree: Some(process_tree),
         })
-    }
-}
-
-/// Longest stderr line retained in the tail, in bytes after decoding. An
-/// overlong line keeps its end, where the error usually is, and the start is
-/// drained and discarded so a newline-free progress stream cannot grow memory.
-const STDERR_LINE_CAP: usize = 4 * 1024;
-
-/// Drain a child's stderr until EOF, retaining lossily decoded, length-capped
-/// lines in `tail` when given. Stderr is not a protocol channel: a non-UTF-8
-/// byte or an endless line must never stop the drain, because dropping the
-/// pipe makes the child's next stderr write fail (EPIPE/SIGPIPE) and hides
-/// the context this tail exists to keep.
-async fn drain_stderr<R>(stderr: R, tail: Option<Arc<StderrTail>>)
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut reader = tokio::io::BufReader::new(stderr);
-    let mut line = Vec::new();
-    loop {
-        let (consumed, line_ended) = {
-            let available = match reader.fill_buf().await {
-                Ok(available) => available,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            };
-            if available.is_empty() {
-                break;
-            }
-            let (consumed, line_ended) = match available.iter().position(|&b| b == b'\n') {
-                Some(pos) => (pos + 1, true),
-                None => (available.len(), false),
-            };
-            if tail.is_some() {
-                let content = &available[..consumed - usize::from(line_ended)];
-                let keep = content.len().min(STDERR_LINE_CAP);
-                let overflow = (line.len() + keep).saturating_sub(STDERR_LINE_CAP);
-                line.drain(..overflow);
-                line.extend_from_slice(&content[content.len() - keep..]);
-            }
-            (consumed, line_ended)
-        };
-        reader.consume(consumed);
-        if line_ended {
-            push_stderr_line(tail.as_deref(), &mut line).await;
-        }
-    }
-    if !line.is_empty() {
-        push_stderr_line(tail.as_deref(), &mut line).await;
-    }
-}
-
-async fn push_stderr_line(tail: Option<&StderrTail>, line: &mut Vec<u8>) {
-    if let Some(tail) = tail {
-        let bytes: &[u8] = line;
-        let text = String::from_utf8_lossy(bytes.strip_suffix(b"\r").unwrap_or(bytes));
-        // Lossy decoding can triple invalid bytes; hold the retained size to
-        // the cap too, again keeping the end.
-        let mut start = text.len().saturating_sub(STDERR_LINE_CAP);
-        while !text.is_char_boundary(start) {
-            start += 1;
-        }
-        tail.push(text[start..].to_owned()).await;
-    }
-    line.clear();
-}
-
-/// Format the captured stderr tail for inclusion in an error message. Empty
-/// tails return `None` so the caller can fall back to its original message.
-async fn format_stderr_context(tail: &StderrTail) -> Option<String> {
-    let lines = tail.snapshot().await;
-    if lines.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "MCP server stderr (last {} line{}):\n{}",
-        lines.len(),
-        if lines.len() == 1 { "" } else { "s" },
-        lines.join("\n"),
-    ))
-}
-
-/// Best-effort SIGTERM. On Unix uses `libc::kill`, addressed to the child's
-/// whole process group when it leads one (`contained`); on Windows there's no
-/// equivalent so we let `kill_on_drop` (TerminateProcess) and the Job Object
-/// handle it. Returns whether a signal was actually sent.
-fn send_sigterm(child: &Child, contained: bool) -> bool {
-    #[cfg(unix)]
-    {
-        if let Some(pid) = child.id() {
-            let pid = pid as i32;
-            let target = if contained { -pid } else { pid };
-            // SAFETY: pid was just obtained from `child.id()` of an unreaped
-            // child, so neither it nor the group it leads can have been
-            // recycled. `libc::kill` with `SIGTERM` is async-signal-safe and
-            // never observes invalid memory. ESRCH is deliberately ignored.
-            unsafe {
-                let _ = libc::kill(target, libc::SIGTERM);
-            }
-            return true;
-        }
-        false
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (child, contained);
-        false
-    }
-}
-
-async fn terminate_child_for_authority_change(
-    child: &Arc<TokioMutex<Child>>,
-    tree: &crate::process_tree::ProcessTree,
-) {
-    let mut child = child.lock().await;
-    terminate_child(&mut child, Some(tree)).await;
-}
-
-async fn terminate_child(child: &mut Child, tree: Option<&crate::process_tree::ProcessTree>) {
-    // Reap an already-exited child before resolving its PID. Until it is
-    // reaped, the OS cannot recycle that identity; after it is reaped there is
-    // nothing left to signal. This avoids a PID-only watcher ever targeting an
-    // unrelated process after rapid PID reuse.
-    if child.try_wait().is_ok_and(|status| status.is_some()) {
-        // The server is gone, but what it started may not be.
-        if let Some(tree) = tree {
-            let _ = tree.kill();
-        }
-        return;
-    }
-
-    #[cfg(unix)]
-    send_sigterm(child, tree.is_some());
-
-    #[cfg(not(unix))]
-    let _ = child.start_kill();
-
-    match tokio::time::timeout(STDIO_SHUTDOWN_GRACE, child.wait()).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(_)) | Err(_) => {
-            // SIGTERM is advisory. Revocation and explicit shutdown must not
-            // leave the reviewed child alive indefinitely.
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
-    }
-    // Descendants that outlived the grace (or ignored SIGTERM) go now.
-    if let Some(tree) = tree {
-        let _ = tree.kill();
     }
 }
 
 #[async_trait::async_trait]
 impl McpTransport for StdioTransport {
     async fn last_stderr_line(&self) -> Option<String> {
-        // The child usually writes its reason to stderr just before the error
-        // reply; give the drain task a bounded moment to catch up.
-        tokio::task::yield_now().await;
-        if let Some(line) = self.stderr_tail.last_line().await {
-            return Some(line);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        self.stderr_tail.last_line().await
+        self.session.last_stderr_line().await
     }
 
     async fn send(&mut self, mut msg: Vec<u8>) -> Result<()> {
         msg.push(b'\n');
-        self.stdin.write_all(&msg).await?;
-        self.stdin.flush().await?;
-        Ok(())
+        self.session.write(&msg).await
     }
 
     /// Non-blocking liveness probe: a reaped child means the transport is
@@ -432,10 +45,7 @@ impl McpTransport for StdioTransport {
     /// trait contract forbids awaiting the lock, so a contended lock reads
     /// as alive — the read side observes the death on the next call.
     fn probe_dead(&self) -> bool {
-        match self.child.try_lock() {
-            Ok(mut child) => matches!(child.try_wait(), Ok(Some(_))),
-            Err(_) => false,
-        }
+        self.session.probe_dead()
     }
 
     async fn recv(&mut self) -> Result<Vec<u8>> {
@@ -451,7 +61,7 @@ impl McpTransport for StdioTransport {
             {
                 Ok(b) => b,
                 Err(err) => {
-                    if let Some(stderr) = format_stderr_context(&self.stderr_tail).await {
+                    if let Some(stderr) = self.session.stderr_context().await {
                         anyhow::bail!("Stdio transport read error: {err}\n{stderr}");
                     }
                     return Err(err.into());
@@ -463,9 +73,9 @@ impl McpTransport for StdioTransport {
                 // retained, so the status is the only reason the operator
                 // gets when the child dies before the handshake (#5916).
                 tokio::task::yield_now().await;
-                let exit = self.child.lock().await.try_wait().ok().flatten();
+                let exit = self.session.exit_status().await;
                 let exit = exit.map_or_else(String::new, |status| format!(" ({status})"));
-                if let Some(stderr) = format_stderr_context(&self.stderr_tail).await {
+                if let Some(stderr) = self.session.stderr_context().await {
                     anyhow::bail!("Stdio transport closed{exit}\n{stderr}");
                 }
                 anyhow::bail!("Stdio transport closed{exit}");
@@ -485,248 +95,6 @@ impl McpTransport for StdioTransport {
     /// Send SIGTERM and wait up to `STDIO_SHUTDOWN_GRACE` for graceful exit,
     /// then force termination and reap the child as the backstop.
     async fn shutdown(&mut self) {
-        let mut child = self.child.lock().await;
-        terminate_child(&mut child, self.process_tree.as_deref()).await;
-    }
-}
-
-/// Session changes can drop a pool without explicitly awaiting shutdown.
-/// Keep the owned child alive for the same bounded cleanup as explicit
-/// shutdown, so servers can release input and recording resources. Runtime
-/// teardown still drops the cleanup future and invokes `kill_on_drop`.
-impl Drop for StdioTransport {
-    fn drop(&mut self) {
-        if let Some(watch) = self.authority_cancel_watch.take() {
-            watch.abort();
-        }
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let child = Arc::clone(&self.child);
-            let reviewed_launch = self._reviewed_launch.take();
-            // The task owns the tree so it is not killed before the grace.
-            let tree = self.process_tree.take();
-            runtime.spawn(async move {
-                let _reviewed_launch = reviewed_launch;
-                let mut child = child.lock().await;
-                terminate_child(&mut child, tree.as_deref()).await;
-            });
-            return;
-        }
-        if let Ok(mut child) = self.child.try_lock()
-            && !child.try_wait().is_ok_and(|status| status.is_some())
-        {
-            send_sigterm(&child, self.process_tree.is_some());
-        }
-        // No runtime: dropping the tree below SIGKILLs the group / closes the
-        // job, the same backstop `kill_on_drop` gives the direct child.
-    }
-}
-
-/// Continue one newline-terminated line in caller-owned `out`, aborting if it
-/// exceeds `max` bytes. Cancellation retains consumed bytes; the caller clears
-/// the buffer only after receiving a complete frame. Returns the total bytes
-/// accumulated; 0 means EOF.
-pub(crate) async fn read_line_capped<R>(
-    reader: &mut R,
-    out: &mut Vec<u8>,
-    max: usize,
-) -> std::io::Result<usize>
-where
-    R: tokio::io::AsyncBufRead + Unpin,
-{
-    use tokio::io::AsyncBufReadExt;
-    loop {
-        let (chunk, consumed, done) = {
-            let available = reader.fill_buf().await?;
-            if available.is_empty() {
-                (Vec::new(), 0usize, true)
-            } else if let Some(pos) = available.iter().position(|&b| b == b'\n') {
-                (available[..=pos].to_vec(), pos + 1, true)
-            } else {
-                (available.to_vec(), available.len(), false)
-            }
-        };
-        if consumed > 0 {
-            reader.consume(consumed);
-        }
-        out.extend_from_slice(&chunk);
-        if out.len() > max {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("MCP stdio line exceeded {max} bytes"),
-            ));
-        }
-        if done {
-            break;
-        }
-    }
-    Ok(out.len())
-}
-
-#[cfg(test)]
-mod stderr_drain_tests {
-    use super::{STDERR_LINE_CAP, StderrTail, drain_stderr};
-    use tokio::io::AsyncWriteExt;
-
-    #[tokio::test]
-    async fn invalid_utf8_and_long_lines_do_not_stop_the_drain() {
-        let (mut writer, reader) = tokio::io::duplex(64);
-        let tail = StderrTail::new();
-        let drain = tokio::spawn(drain_stderr(reader, Some(tail.clone())));
-        writer.write_all(b"starting\r\n").await.unwrap();
-        writer.write_all(b"caf\xe9 \xff\xfe\n").await.unwrap();
-        writer
-            .write_all(&vec![b'#'; STDERR_LINE_CAP * 3])
-            .await
-            .unwrap();
-        writer.write_all(b"\npanic: boom").await.unwrap();
-        drop(writer);
-        drain.await.unwrap();
-        let lines = tail.snapshot().await;
-        assert_eq!(lines.len(), 4, "{lines:?}");
-        assert_eq!(lines[0], "starting");
-        assert_eq!(lines[1], "caf\u{fffd} \u{fffd}\u{fffd}");
-        assert_eq!(lines[2].len(), STDERR_LINE_CAP);
-        assert_eq!(lines[3], "panic: boom");
-    }
-
-    #[tokio::test]
-    async fn overlong_lines_keep_their_end_within_the_cap() {
-        let (mut writer, reader) = tokio::io::duplex(64);
-        let tail = StderrTail::new();
-        let drain = tokio::spawn(drain_stderr(reader, Some(tail.clone())));
-        // A long prefix, then the actual failure at the end of the line.
-        writer
-            .write_all(&vec![b'.'; STDERR_LINE_CAP * 3])
-            .await
-            .unwrap();
-        writer.write_all(b"error: config missing\n").await.unwrap();
-        // Invalid bytes decode to three-byte U+FFFD each.
-        writer
-            .write_all(&vec![0xff; STDERR_LINE_CAP])
-            .await
-            .unwrap();
-        writer.write_all(b"\n").await.unwrap();
-        drop(writer);
-        drain.await.unwrap();
-        let lines = tail.snapshot().await;
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(
-            lines[0].ends_with("error: config missing"),
-            "{:?}",
-            &lines[0][lines[0].len() - 40..]
-        );
-        assert_eq!(lines[0].len(), STDERR_LINE_CAP);
-        assert!(lines[1].len() <= STDERR_LINE_CAP, "{}", lines[1].len());
-        assert!(lines[1].chars().all(|c| c == '\u{fffd}'));
-    }
-
-    #[tokio::test]
-    async fn uncaptured_stderr_is_still_drained_to_eof() {
-        let (mut writer, reader) = tokio::io::duplex(16);
-        let drain = tokio::spawn(drain_stderr(reader, None));
-        // A non-UTF-8 line, then far more than the pipe buffer: a drain that
-        // stopped at the bad line would fail this write with a broken pipe.
-        writer.write_all(b"\xff\n").await.unwrap();
-        writer.write_all(&[b'x'; 4096]).await.unwrap();
-        drop(writer);
-        drain.await.unwrap();
-    }
-}
-
-#[cfg(test)]
-mod read_cap_tests {
-    use super::read_line_capped;
-
-    #[tokio::test]
-    async fn cancelled_partial_read_preserves_next_frame() {
-        use futures_util::FutureExt;
-        use tokio::io::AsyncWriteExt;
-        let (mut writer, reader) = tokio::io::duplex(4096);
-        let mut reader = tokio::io::BufReader::new(reader);
-        let prefix = br#"{"jsonrpc":"2.0","id":"1","result":"#;
-        writer.write_all(prefix).await.unwrap();
-        let mut pending = Vec::new();
-        // Poll through the consumed prefix to Pending, then drop the future.
-        assert!(
-            read_line_capped(&mut reader, &mut pending, 1024)
-                .now_or_never()
-                .is_none()
-        );
-        assert_eq!(pending, prefix);
-        writer.write_all(b"null}\n").await.unwrap();
-        read_line_capped(&mut reader, &mut pending, 1024)
-            .await
-            .unwrap();
-        let first: serde_json::Value =
-            serde_json::from_slice(&std::mem::take(&mut pending)).unwrap();
-        assert_eq!(first["id"], "1");
-        writer
-            .write_all(b"{\"id\":\"2\",\"result\":true}\n")
-            .await
-            .unwrap();
-        read_line_capped(&mut reader, &mut pending, 1024)
-            .await
-            .unwrap();
-        let second: serde_json::Value = serde_json::from_slice(&pending).unwrap();
-        assert_eq!(second["id"], "2");
-        assert_eq!(second["result"], true);
-    }
-
-    #[tokio::test]
-    async fn resumed_frame_still_enforces_cap_at_newline() {
-        use futures_util::FutureExt;
-        use tokio::io::AsyncWriteExt;
-        let (mut writer, reader) = tokio::io::duplex(4096);
-        let mut reader = tokio::io::BufReader::new(reader);
-        let mut pending = Vec::new();
-        writer.write_all(b"1234").await.unwrap();
-        assert!(
-            read_line_capped(&mut reader, &mut pending, 6)
-                .now_or_never()
-                .is_none()
-        );
-        writer.write_all(b"567\n").await.unwrap();
-        assert_eq!(
-            read_line_capped(&mut reader, &mut pending, 6)
-                .await
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::InvalidData
-        );
-    }
-
-    #[tokio::test]
-    async fn reads_a_line_and_reports_eof() {
-        let data = b"hello\nworld\n".to_vec();
-        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(data));
-        let mut out = Vec::new();
-        assert_eq!(
-            read_line_capped(&mut reader, &mut out, 1024).await.unwrap(),
-            6
-        );
-        assert_eq!(out, b"hello\n");
-        out.clear();
-        assert_eq!(
-            read_line_capped(&mut reader, &mut out, 1024).await.unwrap(),
-            6
-        );
-        assert_eq!(out, b"world\n");
-        out.clear();
-        // EOF.
-        assert_eq!(
-            read_line_capped(&mut reader, &mut out, 1024).await.unwrap(),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn aborts_on_newline_free_line_over_cap() {
-        let data = vec![b'x'; 4096]; // no newline
-        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(data));
-        let mut out = Vec::new();
-        let err = read_line_capped(&mut reader, &mut out, 1024)
-            .await
-            .unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        self.session.shutdown().await;
     }
 }

@@ -4,6 +4,7 @@
 //! content block kind tracking, streamed tool-use buffers, transparent retry
 //! policy, and scrubbers for text that looks like a forged tool-call wrapper.
 
+use crate::core::events::TurnOutcomeStatus;
 use codewhale_models::ToolCaller;
 use std::time::Duration;
 
@@ -52,7 +53,90 @@ pub(super) async fn reserve_event_capacity(
     }
 }
 
+/// Selective quiet affects only attempt observations; completed summaries and
+/// counters survive. Admission and delivery use the same existing queue guard.
+async fn emit_retry_status(
+    tx: &tokio::sync::mpsc::Sender<super::Event>,
+    cancel: &tokio_util::sync::CancellationToken,
+    quiet: bool,
+    message: String,
+) -> Result<(), EventSendError> {
+    let attempt = message.starts_with("Retry attempt:");
+    if quiet && attempt {
+        return Ok(());
+    }
+    let policy = if attempt {
+        EventReservationPolicy::Strict
+    } else {
+        EventReservationPolicy::Receipt
+    };
+    let permit = reserve_event_capacity(tx, Some(cancel), policy).await?;
+    permit.send(super::Event::status(message));
+    Ok(())
+}
+
 impl super::Engine {
+    pub(super) fn request_retry_observation(&self) -> crate::llm_client::RequestRetryObservation {
+        let tx = self.tx_event.clone();
+        let cancel = self.cancel_token.clone();
+        let quiet = self.api_config.notifications_config().quiet;
+        crate::llm_client::RequestRetryObservation {
+            retries: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            emit: std::sync::Arc::new(move |message| {
+                let tx = tx.clone();
+                let cancel = cancel.clone();
+                Box::pin(async move {
+                    let _ = emit_retry_status(&tx, &cancel, quiet, message).await;
+                })
+            }),
+        }
+    }
+
+    // The existing turn owns these cumulative counters. Closing observations
+    // describe its actual outcome, without attributing a later tool failure
+    // to an earlier provider response or changing any recovery budget.
+    pub(super) async fn send_answer_retry_summary(
+        &self,
+        diagnostics: &crate::tool_inspection::TurnStopDiagnostics,
+        status: TurnOutcomeStatus,
+    ) {
+        let (prefix, outcome) = match status {
+            TurnOutcomeStatus::Completed => ("Retry recovery", "turn completed"),
+            TurnOutcomeStatus::Failed => ("Retry stopped", "turn failed"),
+            TurnOutcomeStatus::Interrupted => ("Retry interrupted", "turn interrupted"),
+        };
+        for (kind, retries, limit) in [
+            (
+                "reasoning-only",
+                diagnostics.reasoning_only_reprompts,
+                self.config.reasoning_only_max_reprompts,
+            ),
+            (
+                "empty-stop",
+                diagnostics.empty_stop_retries,
+                super::turn_loop::EMPTY_STOP_MAX_RETRIES,
+            ),
+        ] {
+            if retries > 0 {
+                let _ = self
+                    .send_retry_status(format!(
+                        "{prefix}: {kind} used {retries}/{limit} retries; {outcome}"
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    pub(super) async fn send_retry_status(&self, message: String) -> Result<(), EventSendError> {
+        emit_retry_status(
+            &self.tx_event,
+            &self.cancel_token,
+            self.api_config.notifications_config().quiet,
+            message,
+        )
+        .await
+    }
+
     /// Stream observations always belong to the decoder's current turn,
     /// including direct test/embedding calls that do not enqueue an Op.
     pub(super) async fn send_stream_event(&self, event: super::Event) -> bool {
@@ -281,6 +365,101 @@ impl StreamRetryBudget {
     /// still-bounded budget.
     pub(super) fn reset(&mut self) {
         self.spent = 0;
+    }
+}
+
+/// Failures in a row, on one model with one upstream HTTP status, at which the
+/// error starts saying so (#6889). Every counted failure has already spent its
+/// transport retries, so two means two full rounds of them.
+pub(super) const REPEATED_UPSTREAM_FAILURE_NOTICE_AT: u32 = 2;
+
+/// Model requests that failed the same way with nothing succeeding in
+/// between: same model, same upstream HTTP status (#6889). One 502 is a
+/// transient fault worth retrying. The same 502 on every request is a model
+/// that is listed but not serving, and no amount of retrying fixes that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RepeatedUpstreamFailure {
+    model: String,
+    status: u16,
+    count: u32,
+}
+
+/// Record one upstream failure for `model`. Returns the line to add to its
+/// error once the same failure has repeated
+/// [`REPEATED_UPSTREAM_FAILURE_NOTICE_AT`] times. A different model or status
+/// starts a new count; the caller clears the streak when a request succeeds
+/// or fails some other way.
+pub(super) fn note_upstream_failure(
+    streak: &mut Option<RepeatedUpstreamFailure>,
+    model: &str,
+    status: u16,
+) -> Option<String> {
+    let count = match streak {
+        Some(prior) if prior.model == model && prior.status == status => {
+            prior.count = prior.count.saturating_add(1);
+            prior.count
+        }
+        _ => {
+            *streak = Some(RepeatedUpstreamFailure {
+                model: model.to_string(),
+                status,
+                count: 1,
+            });
+            1
+        }
+    };
+    (count >= REPEATED_UPSTREAM_FAILURE_NOTICE_AT).then(|| {
+        format!(
+            "`{model}` has now failed {count} times in a row with HTTP {status}, after retries each time. A provider can list a model that is not serving requests. If this keeps happening, choose another model with /model."
+        )
+    })
+}
+
+#[cfg(test)]
+mod repeated_upstream_failure_tests {
+    use super::{REPEATED_UPSTREAM_FAILURE_NOTICE_AT, note_upstream_failure};
+
+    #[test]
+    fn the_same_upstream_failure_is_named_once_it_repeats() {
+        let mut streak = None;
+        for _ in 1..REPEATED_UPSTREAM_FAILURE_NOTICE_AT {
+            assert_eq!(note_upstream_failure(&mut streak, "model-a", 502), None);
+        }
+        let notice = note_upstream_failure(&mut streak, "model-a", 502)
+            .expect("a repeated identical failure is named");
+        assert!(notice.contains("`model-a`"), "{notice}");
+        assert!(notice.contains("HTTP 502"), "{notice}");
+        assert!(
+            notice.contains(&format!(
+                "{REPEATED_UPSTREAM_FAILURE_NOTICE_AT} times in a row"
+            )),
+            "{notice}"
+        );
+        assert!(notice.contains("/model"), "{notice}");
+
+        // It keeps counting while nothing changes.
+        let next = note_upstream_failure(&mut streak, "model-a", 502).expect("still repeating");
+        assert!(
+            next.contains(&format!(
+                "{} times in a row",
+                REPEATED_UPSTREAM_FAILURE_NOTICE_AT + 1
+            )),
+            "{next}"
+        );
+    }
+
+    #[test]
+    fn a_different_model_or_status_or_a_success_starts_over() {
+        let mut streak = None;
+        assert_eq!(note_upstream_failure(&mut streak, "model-a", 502), None);
+        // Another status is another failure, not a repeat of the first.
+        assert_eq!(note_upstream_failure(&mut streak, "model-a", 503), None);
+        // So is another model.
+        assert_eq!(note_upstream_failure(&mut streak, "model-b", 503), None);
+        // The caller clears the streak on a success.
+        streak = None;
+        assert_eq!(note_upstream_failure(&mut streak, "model-b", 503), None);
+        assert!(note_upstream_failure(&mut streak, "model-b", 503).is_some());
     }
 }
 

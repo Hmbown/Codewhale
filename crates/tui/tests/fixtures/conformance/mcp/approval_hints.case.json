@@ -1,0 +1,82 @@
+{
+  "description": "Tool annotations and the approval path. Pins Rust approval_hint_for / McpPool::record_tool_approval_hints through McpPool::to_api_tools: a server-declared destructiveHint makes the tool Destructive (each call keeps its prompt), but a readOnlyHint on an ordinary (non-reviewed-plugin) server relaxes nothing: annotations are claims, not proof. destructiveHint wins over readOnlyHint. The trusted-read-only hint needs a reviewed plugin and is not reachable from a transcript.",
+  "server_name": "conformance",
+  "server": {
+    "initialize": {
+      "result": {
+        "protocolVersion": "2025-06-18",
+        "serverInfo": {
+          "name": "catalog-fixture",
+          "version": "1.0.0"
+        },
+        "capabilities": {
+          "tools": {}
+        }
+      }
+    },
+    "tools/list": {
+      "result": {
+        "tools": [
+          {
+            "name": "plain",
+            "inputSchema": {
+              "type": "object"
+            }
+          },
+          {
+            "name": "reader",
+            "inputSchema": {
+              "type": "object"
+            },
+            "annotations": {
+              "readOnlyHint": true
+            }
+          },
+          {
+            "name": "deleter",
+            "inputSchema": {
+              "type": "object"
+            },
+            "annotations": {
+              "destructiveHint": true
+            }
+          },
+          {
+            "name": "confused",
+            "inputSchema": {
+              "type": "object"
+            },
+            "annotations": {
+              "readOnlyHint": true,
+              "destructiveHint": true
+            }
+          },
+          {
+            "name": "gentle_writer",
+            "inputSchema": {
+              "type": "object"
+            },
+            "annotations": {
+              "destructiveHint": false
+            }
+          }
+        ]
+      }
+    }
+  },
+  "steps": [
+    {
+      "op": "catalog"
+    },
+    {
+      "op": "approval_hints",
+      "tools": [
+        "mcp_conformance_plain",
+        "mcp_conformance_reader",
+        "mcp_conformance_deleter",
+        "mcp_conformance_confused",
+        "mcp_conformance_gentle_writer"
+      ]
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 /** The helper has its own release lifecycle, independent of the Codewhale CLI. */
-export const COMPUTER_USE_REPO = "https://github.com/Hmbown/codewhale-cu-plugin";
-const API = "https://api.github.com/repos/Hmbown/codewhale-cu-plugin";
+export const COMPUTER_USE_REPO = "https://github.com/codewhale-hq/codewhale-cu-plugin";
+const API = "https://api.github.com/repos/codewhale-hq/codewhale-cu-plugin";
 /** Hosts GitHub redirects release downloads through; anything else is refused. */
 const RELEASE_HOSTS = new Set(["github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"]);
 

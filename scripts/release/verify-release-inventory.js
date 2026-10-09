@@ -24,6 +24,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const { allReleaseAssetNames, CHECKSUM_MANIFEST } = require("../../npm/codewhale/scripts/artifacts");
+const compiledHosts = require("../../npm/codewhale/scripts/compiled-hosts");
 const { validateTarget } = require("./ensure-release-assets-absent");
 
 function usage() {
@@ -144,7 +145,13 @@ function run(argv, gh = ghRunner(), log = console.log) {
   }
   const [repo, tag] = positional;
   const release = findRelease(repo, tag, { draft: flags.draft }, gh);
-  const expected = flags.manifest ? manifestInventory(repo, tag, gh) : allReleaseAssetNames();
+  let catalog;
+  if (!flags.manifest && release.assets.some((asset) => asset.name === compiledHosts.HOST_CATALOG)) {
+    if (!flags.assetDir) throw new Error("compiled-host release verification requires --asset-dir; verify exact local qualification/catalog bytes before publication");
+    catalog = compiledHosts.parseCatalog(fs.readFileSync(path.join(flags.assetDir, compiledHosts.HOST_CATALOG), "utf8"), tag.replace(/^v/, ""));
+    compiledHosts.verifyDirectory(flags.assetDir, catalog);
+  }
+  const expected = flags.manifest ? manifestInventory(repo, tag, gh) : allReleaseAssetNames(catalog);
   const count = assertInventory(release, tag, expected, flags.assetDir);
   log(`Verified ${count} assets on the ${flags.draft ? "draft" : "published"} release ${tag}`);
   if (!flags.publish) return;

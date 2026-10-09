@@ -11,6 +11,45 @@ pub fn rlm_system_prompt() -> SystemPrompt {
     SystemPrompt::Text(RLM_SYSTEM_PROMPT.trim().to_string())
 }
 
+/// Add task guidance to the policy captured by the serving Core turn. It never
+/// replaces that policy or loads a second prompt from ambient workspace state.
+pub(crate) fn captured_rlm_prompt(
+    policy: &SystemPrompt,
+    mode: crate::core::engine::rlm_host::RlmMode,
+    task: Option<&str>,
+) -> anyhow::Result<SystemPrompt> {
+    let task = task.filter(|s| !s.trim().is_empty());
+    anyhow::ensure!(
+        task.is_none_or(|s| s.len() <= 4096),
+        "RLM task guidance exceeds 4096 bytes"
+    );
+    let mut blocks = match policy {
+        SystemPrompt::Text(text) => vec![codewhale_models::SystemBlock {
+            block_type: "text".into(),
+            text: text.clone(),
+            cache_control: None,
+        }],
+        SystemPrompt::Blocks(blocks) => blocks.clone(),
+    };
+    if mode != crate::core::engine::rlm_host::RlmMode::Completion {
+        blocks.push(codewhale_models::SystemBlock {
+            block_type: "text".into(),
+            text: RLM_SYSTEM_PROMPT.trim().to_string(),
+            cache_control: None,
+        });
+    }
+    if let Some(task) = task {
+        blocks.push(codewhale_models::SystemBlock {
+            block_type: "text".into(),
+            text: format!(
+                "Additional RLM task guidance (subject to the captured Core policy):\n{task}"
+            ),
+            cache_control: None,
+        });
+    }
+    Ok(SystemPrompt::Blocks(blocks))
+}
+
 const RLM_SYSTEM_PROMPT: &str = r#"You are the root of a Recursive Language Model (RLM). The input is loaded into a long-running Python REPL. You hold a live context handle, not the raw body. Read only through bounded helpers, compute in Python, and delegate semantic judgment to child calls.
 
 The point is symbolic recursion. Keep the long prompt and large intermediate strings in REPL variables; the neural model should see metadata, bounded slices, code, and compact stdout. Do not copy the whole input into the root history, and do not verbalize a long list of child calls when Python can construct and launch them in a loop.
@@ -198,5 +237,48 @@ mod tests {
         assert!(s.contains("symbolic recursion"));
         assert!(s.contains("REPL variables"));
         assert!(s.contains("Do not copy the whole input"));
+    }
+    #[test]
+    fn captured_policy_blocks_and_cache_facts_survive_bounded_additive_guidance() {
+        let policy = SystemPrompt::Blocks(vec![codewhale_models::SystemBlock {
+            block_type: "text".into(),
+            text: "operator policy".into(),
+            cache_control: Some(codewhale_models::CacheControl {
+                cache_type: "ephemeral".into(),
+            }),
+        }]);
+        for mode in [
+            crate::core::engine::rlm_host::RlmMode::Completion,
+            crate::core::engine::rlm_host::RlmMode::Recursive { depth_remaining: 1 },
+        ] {
+            let result = captured_rlm_prompt(&policy, mode, Some("task guidance")).unwrap();
+            let SystemPrompt::Blocks(actual) = result else {
+                panic!("blocks preserved");
+            };
+            let SystemPrompt::Blocks(expected) = &policy else {
+                unreachable!();
+            };
+            assert_eq!(
+                serde_json::to_value(&actual[0]).unwrap(),
+                serde_json::to_value(&expected[0]).unwrap()
+            );
+            assert!(
+                actual
+                    .last()
+                    .unwrap()
+                    .text
+                    .contains("subject to the captured Core policy")
+            );
+            assert_eq!(actual.last().unwrap().cache_control, None);
+        }
+        assert!(
+            captured_rlm_prompt(
+                &policy,
+                crate::core::engine::rlm_host::RlmMode::Completion,
+                Some(&"界".repeat(1366))
+            )
+            .is_err(),
+            "byte bound includes multi-byte text"
+        );
     }
 }

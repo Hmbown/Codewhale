@@ -5,6 +5,10 @@
 Codewhale publishes a multi-arch Linux image to GitHub Container Registry
 for each release.
 
+The latest published image is 0.10.0 at `ghcr.io/hmbown/codewhale`.
+To test the current `main` source, use [Building locally](#building-locally)
+in a checkout of [`codewhale-hq/Codewhale`](https://github.com/codewhale-hq/Codewhale).
+
 ```bash
 docker pull ghcr.io/hmbown/codewhale:latest
 ```
@@ -32,11 +36,10 @@ docker run --rm -it \
   -v codewhale-home:/home/codewhale/.codewhale \
   -v "$PWD:/workspace" \
   -w /workspace \
-  ghcr.io/hmbown/codewhale:vX.Y.Z
+  ghcr.io/hmbown/codewhale:v0.10.0
 ```
 
-Replace `vX.Y.Z` with a tag from
-[GitHub Releases](https://github.com/Hmbown/CodeWhale/releases).
+The pinned example uses the [0.10.0 release](https://github.com/codewhale-hq/Codewhale/releases/tag/v0.10.0).
 
 ## Default image contract
 
@@ -64,7 +67,7 @@ environments:
 
 ```bash
 docker build -f docs/examples/Dockerfile.toolbox \
-  --build-arg CODEWHALE_IMAGE=ghcr.io/hmbown/codewhale:vX.Y.Z \
+  --build-arg CODEWHALE_IMAGE=ghcr.io/hmbown/codewhale:v0.10.0 \
   --build-arg TOOLBOX_PACKAGES="git openssh-client curl build-essential pkg-config python3 python3-pip nodejs npm" \
   -t codewhale-toolbox:my-project .
 ```
@@ -103,7 +106,7 @@ the toolbox image from [`docs/examples/Dockerfile.toolbox`](examples/Dockerfile.
 and keeps the project state volume explicit:
 
 ```bash
-CODEWHALE_IMAGE=ghcr.io/hmbown/codewhale:vX.Y.Z \
+CODEWHALE_IMAGE=ghcr.io/hmbown/codewhale:v0.10.0 \
 CODEWHALE_TOOLBOX_IMAGE=codewhale-toolbox:my-project \
 CODEWHALE_HOME_VOLUME=codewhale-my-project-home \
 CODEWHALE_WORKSPACE="$PWD" \

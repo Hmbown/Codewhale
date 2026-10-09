@@ -186,7 +186,7 @@ pub(super) fn reasoning_timeline_text(
         };
         if let Some(duration_secs) = duration_secs {
             status.push_str(" · ");
-            status.push_str(&crate::elapsed::format_elapsed_ms(
+            status.push_str(&codewhale_command_contract::elapsed::format_elapsed_ms(
                 (duration_secs * 1000.0) as u64,
             ));
         }
@@ -1160,8 +1160,9 @@ fn turn_timeline_lines(app: &App, start: usize, end: usize) -> Vec<String> {
             } => {
                 let summary = one_line_summary(content, 88);
                 let status = streaming.then_some("running").unwrap_or("done");
-                let duration = duration_secs
-                    .map(|secs| crate::elapsed::format_elapsed_ms((secs * 1000.0) as u64));
+                let duration = duration_secs.map(|secs| {
+                    codewhale_command_contract::elapsed::format_elapsed_ms((secs * 1000.0) as u64)
+                });
                 let actions = timeline_cell_actions(app, idx, cell);
                 rows.push(timeline_row(
                     "reasoning",
@@ -1173,8 +1174,8 @@ fn turn_timeline_lines(app: &App, start: usize, end: usize) -> Vec<String> {
             }
             HistoryCell::Tool(tool) => {
                 let (kind, summary) = timeline_tool_summary(app, idx, tool);
-                let duration =
-                    tool_duration_for_activity(tool).map(crate::elapsed::format_elapsed_ms);
+                let duration = tool_duration_for_activity(tool)
+                    .map(codewhale_command_contract::elapsed::format_elapsed_ms);
                 let status = tool.status().map(activity_status_label);
                 let actions = timeline_cell_actions(app, idx, cell);
                 rows.push(timeline_row(
@@ -1561,10 +1562,10 @@ fn turn_route_lines(app: &App) -> Vec<String> {
         .as_ref()
         .and_then(|turn| turn.route.as_ref())
     {
-        let provider = if route.provider == crate::config::ApiProvider::Custom {
+        let provider = if route.provider == crate::config::ProviderKind::Custom {
             route.provider_identity.clone()
         } else {
-            route.provider.display_name().to_string()
+            route.provider.provider().display_name().to_string()
         };
         (provider, route.model.clone())
     } else {
@@ -1816,7 +1817,7 @@ mod tests {
     fn turn_route_lines_show_decision_evidence_and_a_failing_router() {
         let mut app = test_app();
         app.auto_model = true;
-        app.last_effective_provider = Some(crate::config::ApiProvider::Deepseek);
+        app.last_effective_provider = Some(crate::config::ProviderKind::Deepseek);
         app.last_effective_model = Some("deepseek-v4-pro".to_string());
         let decision = crate::model_routing::AutoRouteDecisionEvidence {
             choice: "strong".to_string(),
@@ -1876,7 +1877,7 @@ mod tests {
     fn turn_route_lines_include_truthful_auto_receipt() {
         let mut app = test_app();
         app.auto_model = true;
-        app.last_effective_provider = Some(crate::config::ApiProvider::Zai);
+        app.last_effective_provider = Some(crate::config::ProviderKind::Zai);
         app.last_effective_model = Some(crate::config::ZAI_GLM_5_TURBO_MODEL.to_string());
         app.last_auto_route_receipt = Some(crate::model_routing::AutoRouteReceipt {
             tier: crate::model_routing::AutoRouteTier::Fast,
@@ -1886,7 +1887,8 @@ mod tests {
             },
             scope: crate::model_routing::AutoRouteScope::RunnableProviders,
             data_path: crate::model_routing::AutoRouteDataPath::Classifier {
-                provider: crate::config::ApiProvider::Deepseek,
+                provider: "deepseek".into(),
+                provider_kind: crate::config::ProviderKind::Deepseek,
                 model: "deepseek-v4-flash".to_string(),
             },
             reason: crate::model_routing::AutoRouteReason::ClassifierRecommendation,

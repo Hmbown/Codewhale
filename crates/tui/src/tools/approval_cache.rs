@@ -148,6 +148,8 @@ pub fn build_approval_grouping_key(tool_name: &str, input: &serde_json::Value) -
 /// keyed `<scope>:<tool_name>:<hash of input>` for both, so its grants are
 /// bound to the reviewed plugin build and never widened to a family; every
 /// other tool keeps [`build_approval_key`] / [`build_approval_grouping_key`].
+/// The registry's captured owning agent prefixes both keys with `agent:<id>:`,
+/// so its grants and denials never cover a parent or sibling's call.
 ///
 /// [`approval_scope`]: crate::tools::spec::ToolSpec::approval_scope
 #[must_use]
@@ -159,7 +161,7 @@ pub fn approval_keys_for_call(
     let scope = registry
         .and_then(|registry| registry.get(tool_name))
         .and_then(|tool| tool.approval_scope());
-    match scope {
+    let keys = match scope {
         Some(scope) => {
             let key = ApprovalKey(format!("{scope}:{tool_name}:{}", hash_json_value(input)));
             (key.clone(), key)
@@ -168,7 +170,33 @@ pub fn approval_keys_for_call(
             build_approval_key(tool_name, input),
             build_approval_grouping_key(tool_name, input),
         ),
+    };
+    if let Some(owner) = registry.and_then(|registry| registry.context().owner_agent_id.as_deref())
+    {
+        let scoped = |key: ApprovalKey| ApprovalKey(format!("agent:{owner}:{}", key.0));
+        (scoped(keys.0), scoped(keys.1))
+    } else {
+        keys
     }
+}
+
+/// [`approval_keys_for_call`] for a call an extension made through `core/call`
+/// (`scope` is the extension plugin build's [`approval_scope`]): both keys are
+/// prefixed `extcall:<scope>:`, so a session grant or a denial recorded for the
+/// model's call of a tool never matches the extension's call of it, and the
+/// reverse, and neither crosses to another plugin build.
+///
+/// [`approval_scope`]: crate::tools::spec::ToolSpec::approval_scope
+#[must_use]
+pub fn extension_origin_approval_keys(
+    scope: &str,
+    registry: Option<&crate::tools::ToolRegistry>,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> (ApprovalKey, ApprovalKey) {
+    let (exact, grouping) = approval_keys_for_call(registry, tool_name, input);
+    let scoped = |key: ApprovalKey| ApprovalKey(format!("extcall:{scope}:{}", key.0));
+    (scoped(exact), scoped(grouping))
 }
 
 /// The sorted `web.run` action kinds present in `input`, e.g. `open+search_query`.

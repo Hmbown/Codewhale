@@ -38,17 +38,17 @@ Run these before changing stale policy or doing a manual cleanup pass:
 STALE_CUTOFF=$(python3 -c 'from datetime import date, timedelta; print(date.today() - timedelta(days=45))')
 NEEDS_INFO_CUTOFF=$(python3 -c 'from datetime import date, timedelta; print(date.today() - timedelta(days=30))')
 
-gh issue list --repo Hmbown/CodeWhale --state open \
+gh issue list --repo codewhale-hq/CodeWhale --state open \
   --search "updated:<${STALE_CUTOFF}" \
   --limit 100 \
   --json number,title,updatedAt,labels,url
 
-gh issue list --repo Hmbown/CodeWhale --state open \
+gh issue list --repo codewhale-hq/CodeWhale --state open \
   --search "label:needs-info updated:<${NEEDS_INFO_CUTOFF}" \
   --limit 100 \
   --json number,title,updatedAt,labels,url
 
-gh issue list --repo Hmbown/CodeWhale --state open \
+gh issue list --repo codewhale-hq/CodeWhale --state open \
   --search "created:<${STALE_CUTOFF} comments:0 -label:keep-open -label:release-blocker -label:security" \
   --limit 100 \
   --json number,title,createdAt,updatedAt,labels,url

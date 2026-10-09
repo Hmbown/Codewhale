@@ -380,18 +380,28 @@ foreach ($t in $targets) {
     $entry = $stack.Pop(); $cur = $entry[0]; $path = $entry[1];
     if ($els.Count -ge $max) { $truncated = $true; break }
     $rect = $cur.Current.BoundingRectangle;
+    # UIA returns Rect.Empty for controls without a visible rectangle. Keep
+    # their semantic identity, but never turn absent/nonfinite bounds into a click.
+    $position = $null; $size = $null;
+    if (-not $rect.IsEmpty -and $rect.X -ge [int]::MinValue -and $rect.X -le [int]::MaxValue -and
+        $rect.Y -ge [int]::MinValue -and $rect.Y -le [int]::MaxValue -and
+        $rect.Width -gt 0 -and $rect.Width -le [int]::MaxValue -and
+        $rect.Height -gt 0 -and $rect.Height -le [int]::MaxValue) {
+      $position = [pscustomobject]@{ x = [int]$rect.X; y = [int]$rect.Y };
+      $size = [pscustomobject]@{ w = [int]$rect.Width; h = [int]$rect.Height };
+    }
     $acts = @();
     try { $acts = @($cur.GetSupportedPatterns() | ForEach-Object { $_.ProgrammaticName -replace 'PatternIdentifiers\\.Pattern$','' -replace 'Pattern$','' }) } catch {}
     $value = ''; $vp = $null;
     if (-not $cur.Current.IsPassword -and $cur.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) { $value = [string]$vp.Current.Value }
     [void]$els.Add([pscustomobject]@{ index = $els.Count; path = @($path); runtime_id = @($cur.GetRuntimeId()); window_runtime_id = $windowId; role = [string]$cur.Current.ControlType.ProgrammaticName; label = [string]$cur.Current.Name; value = $value.Substring(0, [Math]::Min(120, $value.Length)); enabled = $cur.Current.IsEnabled;
-      x = [int]$rect.X; y = [int]$rect.Y; w = [int]$rect.Width; h = [int]$rect.Height; actions = $acts });
+      position = $position; size = $size; actions = $acts });
     $kids = $cur.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition);
     for ($i = $kids.Count - 1; $i -ge 0; $i--) { $stack.Push(@($kids[$i], ($path + $i))) }
   }
   break;
 }
-$result = [pscustomobject]@{ found = $found; name = $appName; truncated = $truncated; elements = @($els | ForEach-Object { [pscustomobject]@{ index = $_.index; path = @($_.path); runtime_id = $_.runtime_id; window_runtime_id = $_.window_runtime_id; role = ($_.role -replace 'ControlType.',''); label = $_.label; value = $_.value; enabled = $_.enabled; position = [pscustomobject]@{ x = $_.x; y = $_.y }; size = [pscustomobject]@{ w = $_.w; h = $_.h }; actions = $_.actions } }) };
+$result = [pscustomobject]@{ found = $found; name = $appName; truncated = $truncated; elements = @($els | ForEach-Object { [pscustomobject]@{ index = $_.index; path = @($_.path); runtime_id = $_.runtime_id; window_runtime_id = $_.window_runtime_id; role = ($_.role -replace 'ControlType.',''); label = $_.label; value = $_.value; enabled = $_.enabled; position = $_.position; size = $_.size; actions = $_.actions } }) };
 Write-Output ($result | ConvertTo-Json -Depth 6 -Compress);`, { timeoutMs: 60_000 });
       if (!j.found) throw new ExecError("application window not found in UIA tree — pass app_ref.name as the exact window title from list_windows or list_apps.title");
       return j;
@@ -440,7 +450,12 @@ $bmp.Dispose(); $img.Dispose();
 Write-Output '{"ok": true}';`;
       const r = await psOk(script, { timeoutMs: 20_000 });
       if (r.code !== 0 || !fs.existsSync(out)) throw new ExecError(`zoom failed: ${(r.stderr || "").slice(0, 250)}`, r);
-      return { file: out, bytes: fs.statSync(out).size, region, source: src };
+      const parent = lastRaster;
+      const [x, y, w, h] = region.map(Math.round);
+      lastRaster = { file: out, bytes: fs.statSync(out).size, region, source: src,
+        points: { x: (parent.points?.x ?? 0) + x / parent.scale, y: (parent.points?.y ?? 0) + y / parent.scale, w: w / parent.scale, h: h / parent.scale },
+        pixels: { w, h }, scale: parent.scale, capturedAt: new Date().toISOString() };
+      return { ...lastRaster };
     },
     left_click: ({ target, strategy }) => { assertEventStrategy(strategy); return clickAt(0, target.x, target.y, 1); },
     double_click: ({ target }) => clickAt(0, target.x, target.y, 2),

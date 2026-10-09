@@ -1,103 +1,171 @@
-<!-- source: README.md sha256:925619135f77 -->
-# Codewhale
+<!-- source: README.md sha256:c28f2ad5a8ed -->
+<div align="center">
 
-Codewhale は、選んだホスト型またはローカルのモデルを使ってプロジェクトを読み、ファイルを編集し、コマンドを実行して、自分の作業結果を確認するオープンソースのエージェントです。まずはターミナルで一つのタスクから始めましょう。大きな仕事では、異なるモデルや役割を持つエージェントに作業の一部を分担させられます。
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="brand/wordmark-inverted.svg">
+  <img src="brand/wordmark.svg" alt="Codewhale" width="320">
+</picture>
 
-![ターミナルで動作する Codewhale](web/public/codewhale-tui-5765d80.png)
+**どのモデルでも使える、オープンソースのコーディングエージェント。**
 
-*v0.10.0 の開発ビルドによるターミナルのプレビュー。*
+Codewhale はプロジェクトを読み、ファイルを編集し、コマンドを実行して、自分の作業を確認します。
+ターミナル上で、あなたが選んだホスト型またはローカルのモデルを使います。
+
+[![CI](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/codewhale-hq/CodeWhale/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
+[![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
+
+[ウェブサイト](https://codewhale.net) · [ドキュメント](docs/README.md) · [変更履歴](CHANGELOG.md) · [コントリビュート](CONTRIBUTING.md)
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
-[![CI](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml/badge.svg)](https://github.com/Hmbown/CodeWhale/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/codewhale-cli?label=crates.io)](https://crates.io/crates/codewhale-cli)
-[![npm](https://img.shields.io/npm/v/codewhale?label=npm)](https://www.npmjs.com/package/codewhale)
-[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
+<img src="web/public/codewhale-tui-0102-demo.png" alt="Codewhale のターミナルセッション" width="760">
+
+<sub>設定済みのローカルデモセッションから取得した、実際の Codewhale ターミナル画面です。</sub>
+
+</div>
 
 ## インストール
 
-macOS または Linux に新規インストールする場合は、公式 GitHub Release を使います。
+macOS と Linux:
 
 ```bash
 curl -fsSL https://codewhale.net/install.sh | sh
-"$HOME/.local/bin/codewhale"
 ```
 
-`codewhale` だけで実行して "command not found" と表示される場合は、`~/.local/bin` がまだ PATH に含まれていません。インストーラーがお使いのシェル向けに表示する 1 行のコマンドを実行するか、[PATH に追加する](docs/INSTALL.md#put-it-on-your-path)を参照してください。
+インストーラーはチェックサム検証済みのバイナリを `~/.local/bin` にダウンロードします。
+その後 `codewhale` が "command not found" と表示される場合は、インストーラーが出力する PATH 用の 1 行を実行するか、
+[PATH に追加する](docs/INSTALL.md#put-it-on-your-path)を参照してください。
+アップグレードはいつでも `codewhale update` で行えます。
 
-インストーラーは、公開済みの最新リリースを選択します。[変更履歴](CHANGELOG.md)には次のリリースの未公開候補版についても記載されていますが、その変更が公開ダウンロードに含まれるのは、リリースが公開されてからです。
+<details>
+<summary><b>Windows、npm、Cargo、その他のインストール方法</b></summary>
 
-Windows では [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest) から対応するインストーラーまたはアーカイブを入手してください。既存の直接インストールは `codewhale update` で更新できます。確認だけなら `codewhale update --check` を使います。更新対象の実行ファイルのパスが表示され、より新しいビルドは保持されます。npm と Cargo は補助的なパッケージ導入方法です。パッケージ管理からの移行や PATH の設定は[インストールガイド](docs/INSTALL.md)を参照してください。
+```bash
+winget install HunterBown.CodeWhale  # Windows x64 (or Scoop, or the installer from GitHub Releases)
+npm install -g codewhale            # wraps the same release binaries
+cargo install codewhale-cli --locked  # build from crates.io
+```
 
-初回起動ではそのまま入力欄（コンポーザー）が開き、セットアップの案内はありません。モデルからの応答には、ホスト型またはローカルのモデルへの接続が必要です。接続されるまで、起動画面には "no model connected" と表示されます。`/provider` を実行する（または F3 を押す）と、ホスト型サービスのキーを追加したり、ローカルランタイムを選んだりできます。Ollama がチャットモデルとともにすでに動作している場合、Codewhale は自動的にそれに切り替わります。Codewhale は補助的なパッケージ配布方法として npm と Cargo に対応し、Docker、Nix、Scoop、Android/Termux、必要に応じて利用できる CNB ミラーにも対応しています。パッケージマネージャーでインストール済みの場合は、移行手順が案内されます。[インストールと PATH のヘルプ](docs/INSTALL.md)を参照してください。
+Docker、Nix、Linux 上の Homebrew、Android/Termux、チェックサム検証付きの手動ダウンロード、
+任意の CNB ミラーについては[インストールガイド](docs/INSTALL.md)で説明しています。
+方法は 1 つだけ選んでください。1 台のマシンに複数の方法でインストールすると、`PATH` の中で競合します。
 
-各シェルの Tab 補完はコマンド一つで設定できます — `codewhale completion bash|zsh|fish|powershell|elvish`。詳しくは[シェル補完](docs/INSTALL.md#8-shell-completions)をご覧ください。
+</details>
 
-## 使い方
+## クイックスタート
 
-プロジェクトのフォルダーでターミナルを開き、`codewhale` を実行します（[PATH に追加](docs/INSTALL.md#put-it-on-your-path)済みであることが前提です）。`/provider` でプロバイダーを、`/model` でモデルを選び、具体的なタスクを伝えます：
+**プロバイダーの API キーを一か所で管理。** [Codewhale アカウントを作成](https://app.codewhale.net/register)するか、
+`codewhale login` を実行してログインしてください。API キーをアカウントに保存・更新すると、
+ログイン済みのデバイスから Codewhale のモデルルート経由で利用できます。
+[アカウントのキーを設定する](docs/CONFIGURATION.md#account-provider-keys)。
+ログインしても既存のローカルキーはアップロードされません。アカウントなしでもローカルで利用できます。
+
+1. **プロジェクトを開く。** 作業したいフォルダーで `codewhale` を実行します。
+2. **モデルを接続する。** `/provider`（または `F3`）を実行して、ホスト型のキーを追加するか、ローカルランタイムを選びます。
+   チャットモデルを載せた Ollama がすでに起動していれば、Codewhale は自動的にそれへ切り替わります。モデルの変更は `/model` で行います。
+3. **具体的なタスクを渡す。**
 
 ```text
 Fix the failing tests and explain what changed.
 ```
 
-TUI を開かずにタスクを実行することもできます：
+同じタスクを、スクリプトや CI ジョブからヘッドレスで実行することもできます。
 
 ```bash
 codewhale exec "fix the failing tests and explain what changed"
 ```
 
-Codewhale はリポジトリを読み、ファイルを編集し、コマンドを実行して結果を確認しながら、目標に向かって作業を続けます。ファイルの変更やシェルコマンドの実行をせずに調べるには `/mode plan` を使い、変更を加えてほしいときは `/mode work` を使います。`Shift+Tab` を押すと Ask、Auto-Review、Full Access を選択できます。それぞれで許可される操作は[モードと権限のガイド](docs/MODES.md)を参照してください。
+コマンドとキーボードショートカットは `/help` で確認できます。
 
-## ターミナル、アプリ、Computer Use
+## 実行方法
 
-ターミナルとグラフィカルなクライアントは Codewhale Runtime に接続します。Runtime がエージェントとそのツールを実行します：
+どのクライアントも同じローカルの Codewhale Runtime を操作するため、セッション、ツール、権限はどこでも同じように動作します。
 
-- **ターミナル：** `codewhale` は対話型インターフェースを開き、`codewhale exec` はスクリプトや CI ジョブからタスクを実行します。
-- **ローカルブラウザー：** `codewhale web` は、同じ Runtime を使う同梱の[ローカル Web クライアント](docs/WEB.md)を開きます。
-- **Codewhale デスクトップアプリ（GPUI）：** 別リポジトリで開発しているネイティブデスクトップアプリが、サインイン後に使う製品クライアントの方向性です。app.codewhale.net のホステッド Web アプリはこれに合わせて作り直します。マーケティングサイト・サインイン・課金・法務・ダウンロードの各ページは Web に残ります。提供状況は[製品ページ](https://codewhale.net/en/product)をご覧ください。
+| コマンド | 内容 |
+| --- | --- |
+| `codewhale` | 対話型のターミナルインターフェース |
+| `codewhale exec "…"` | スクリプトや CI からヘッドレスで 1 ターン実行し、JSON をストリーミング出力 |
+| `codewhale web` | `127.0.0.1` で動作する、同梱の[ローカルブラウザークライアント](docs/WEB.md) |
+| `codewhale review --pr N` | 参考情報としての[プルリクエストレビュー](docs/GITHUB_ACTION.md)。投稿は任意で有効化 |
+| Runtime API | スレッド、イベント、承認のための[ローカル HTTP API](docs/RUNTIME_API.md) |
 
-**Computer Use は、ほかのアプリケーションの状態を確認し、操作するためのツールを追加します。** このプラグインは現在のソースコードに含まれています。使用前に要求されるアクセス権を確認し、有効にしてください。OS の権限やプラットフォームの要件も満たす必要があります。同梱の [Computer Use ガイド](crates/tui/plugins/computer-use/README.md)と[プラグインの設定](docs/PLUGINS.md)を参照してください。
+ネイティブのデスクトップアプリ（GPUI）は、サインインして使う製品クライアントとして開発中です。提供状況は
+[製品ページ](https://codewhale.net/en/product)をご覧ください。コミュニティが保守している
+[VS Code 拡張機能](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode)は、
+サイドバーから同じ Runtime に接続します（[ソース](https://github.com/HengQuWorld/CodeWhale-VSCode)）。
 
-VS Code では、コミュニティが保守する CodeWhale 拡張機能がサイドバーからローカルの Runtime に接続します。[VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode) からインストールしてください。ソースコードは [GitHub](https://github.com/HengQuWorld/CodeWhale-VSCode) にあります。
+## 主な機能
 
-## Codewhale を選ぶ理由
+- **どのモデルでも、ロックインなし。** Anthropic、DeepSeek、Google、Mistral、Moonshot、OpenAI、OpenRouter、xAI など、
+  40 以上のプロバイダー経路を内蔵。OpenAI 互換のエンドポイントや、Ollama、vLLM、SGLang 経由のローカルモデルも使えます。
+  [プロバイダー](docs/PROVIDERS.md)
+- **主導権はあなたに。** Plan モードは何も変更せずに調査だけを行い、Work と Operate は変更を加えます。
+  承認ポスチャーがツール呼び出しにあなたの許可を求めるタイミングを決め、`/undo` と `/restore` でワークスペースの変更を元に戻せます。
+  `/receipts` はセッション内のすべてのファイル、コマンド、承認を一覧表示します。[モード](docs/MODES.md) ·
+  [レシート](docs/RECEIPTS.md)
+- **長い作業のために。** 持続する `/goal` を設定し、範囲を区切った作業を
+  [サブエージェント](docs/SUBAGENTS.md)に任せ、支出の事前チェック付きで監督される
+  [エージェントチーム](docs/FLEET.md)を動かし、あるいはリポジトリに含められる
+  [ワークフロー](docs/WORKFLOW_AUTHORING.md)としてスクリプト化できます。
+- **普段使っているものを拡張。** [MCP サーバー](docs/MCP.md)を接続し、
+  [スキル](docs/SKILLS.md)と[プラグイン](docs/PLUGINS.md)をインストールし、
+  セッションやツールのイベントで[フック](docs/HOOKS.md)を実行し、既存の
+  [Claude Code プラグイン](docs/CLAUDE_PLUGIN_COMPAT.md)も読み込めます。
+- **Computer Use。** 同梱のプラグインが、他のアプリケーションを観察・操作するツールを追加します。
+  使用前にアクセス範囲を確認し、有効化してください。
+  [ガイド](crates/tui/plugins/computer-use/README.md)
 
-- **モデルを選べます。** ホスト型プロバイダーに接続するほか、Ollama、vLLM、SGLang 経由でローカルモデルも利用できます。`/provider` でプロバイダーを切り替え、`/model` でモデルを選択します。
-- **主導権を保てます。** 提案された操作と、その結果生じたファイルの変更を確認できます。承認設定によってレビューが必要なタイミングが決まり、Full Access でもポリシーの厳格な制約は守られます。`/undo` と `/restore` はワークスペースの変更を復元する際に役立ちます。
-- **長い作業も整理できます。** セッションを保存し、永続的な `/goal` を設定し、ワークフローを実行前に確認できます。さらに、エージェントの内部指示を会話履歴に混ぜることなく、複数のエージェントを連携させられます。
-- **今あるエージェントを拡張できます。** MCP サーバーやスキルを接続し、フックを設定し、エージェントの役割をプロジェクトまたは個人設定内の読みやすいファイルとして管理できます。
+## モードと権限
 
-コマンドとキーボードショートカットは、TUI で `/help` を実行して確認できます。
+| | 切り替え方法 | 選択肢 |
+| --- | --- | --- |
+| **モード（Mode）**: エージェントが何をしているか | `Tab` または `/mode` | Plan（調査のみ、変更なし）· Work（編集と実行）· Operate（計画され検証されたステップで目標を進める） |
+| **ポスチャー（Posture）**: いつ先に確認するか | `Shift+Tab` | Ask · Auto-Review · Full Access |
+
+Full Access でも、ハードなポリシー境界は守られます。
+各選択肢については[モードと権限のガイド](docs/MODES.md)で説明しています。
 
 ## 安全性
 
-Codewhale は、あなたが許可した範囲のアクセス権で、あなたのマシン上で動作します。承認モードとリポジトリのルールがエージェントの操作を制限し、対応環境では任意の OS サンドボックスがさらに強固な実行境界を加えます。不明なモデル料金は、無料と表示せず不明のまま扱います。
+Codewhale はあなたのマシン上で、あなたが与えたアクセス権の範囲で動作します。承認ポスチャーとリポジトリのルールがエージェントにできることを制限し、
+対応環境ではコマンドは OS のサンドボックス内で実行されます（macOS は Seatbelt、Linux の bubblewrap は任意で有効化）。
+`/preview-request` は、何かを送信する前に、機密情報を伏せたリクエストそのものを表示します。
+価格が不明なモデルは「不明」のまま扱われ、無料として報告されることはありません。
 
-正確なポリシーの適用順序は[認可の順序](docs/AUTHORIZATION_ORDER.md)、ローカル設定は[設定ガイド](docs/CONFIGURATION.md)をご覧ください。
+[認可の順序](docs/AUTHORIZATION_ORDER.md)、
+[サンドボックス](docs/SANDBOX.md)、[テレメトリ](docs/TELEMETRY.md)を参照してください。
+利用回数の集計は既定で有効で、`codewhale config set telemetry false` で無効にできます。
 
 ## ドキュメント
 
-- [GitHub PR レビューの設定](docs/GITHUB_ACTION.md)
-- [プロバイダーとローカルモデル](docs/PROVIDERS.md)
-- [エージェントチーム](docs/FLEET.md)
-- [MCP](docs/MCP.md)、[フック](docs/HOOKS.md)、[設定](docs/CONFIGURATION.md)
-- [ローカル Web クライアント](docs/WEB.md)
-- [すべてのドキュメント](docs/README.md)
-- [リポジトリ構成とコントリビューションガイド](CONTRIBUTING.md#project-structure)
+| まずはここから | さらに詳しく |
+| --- | --- |
+| [インストール](docs/INSTALL.md) | [設定](docs/CONFIGURATION.md) |
+| [プロバイダーとローカルモデル](docs/PROVIDERS.md) | [アーキテクチャ](docs/ARCHITECTURE.md) |
+| [モードと権限](docs/MODES.md) | [Runtime API](docs/RUNTIME_API.md) |
+| [キーバインド](docs/KEYBINDINGS.md) | [プラグイン作成](docs/PLUGIN_AUTHORING.md) |
+| [GitHub PR レビュー](docs/GITHUB_ACTION.md) | [すべてのドキュメント](docs/README.md) |
 
-## コミュニティに参加
+## コミュニティ
 
-**不具合の報告、機能の提案、pull request を歓迎します。** Codewhale を何か月も使っている方も、初めて試す方もお気軽にご参加ください。必要なプロバイダーがない、ワークフローが使いづらい、ターミナル UI が作業を妨げるといった場合は、[issue を作成](https://github.com/Hmbown/CodeWhale/issues/new/choose)するか、[pull request を送信](CONTRIBUTING.md)して、一緒に改善しましょう。初めてのコントリビューションも歓迎し、採用された成果にはコントリビューターのクレジットを残します。
+バグ報告、機能のアイデア、プルリクエストを歓迎します。Codewhale を何か月も使っている方も、初めて試す方も同じです。
+プロバイダーが足りない、あるいはワークフローが使いにくいと感じたら、
+[issue を作成](https://github.com/codewhale-hq/CodeWhale/issues/new/choose)するか、
+[プルリクエストを送って](CONTRIBUTING.md)ください。初めてのコントリビュートも歓迎で、
+取り込まれた作業の貢献者としてのクレジットは保たれます。
+[リポジトリの構成](CONTRIBUTING.md#project-structure)が最初の手がかりになります。
 
-[Discord](https://discord.gg/37gfS3ksug) に参加するか、WeChat で Hunter（`hunterbown`）を追加して Whale Brothers グループへの参加を依頼してください。
+[Discord](https://discord.gg/37gfS3ksug) に参加するか、WeChat で Hunter
+（`hunterbown`）を追加して、Whale Brothers グループへの参加を依頼してください。
 
-## プロジェクトの沿革
+## 歴史とライセンス
 
-Codewhale は `deepseek-tui` として始まり、その設定とセッションとの互換性を現在も維持しています。今ではプロバイダーに依存せず、独立して保守されており、いかなるモデルプロバイダーとも提携していません。
+Codewhale は `deepseek-tui` として始まり、今もそのプロジェクトの設定とセッションを読み込みます。
+現在は特定のプロバイダーに依存せず、独立して保守されており、どのモデルプロバイダーとも提携していません。
+[すべてのコントリビューター](docs/CONTRIBUTORS.md)と、成長を支えてくれたオープンソースコミュニティに感謝します。
 
-すべてのコントリビューターと、プロジェクトの成長を支えたオープンソースコミュニティに感謝します。[コントリビューターの記録](docs/CONTRIBUTORS.md)もご覧ください。
-
-## ライセンス
-
-[MIT](LICENSE)。他のオープンソースプロジェクトを基にした部分は[サードパーティー通知](docs/THIRD_PARTY_NOTICES.md)に記載しています。
+[MIT](LICENSE)。他のオープンソースプロジェクトから改変して取り入れた部分は、
+[サードパーティ通知](docs/THIRD_PARTY_NOTICES.md)に記載しています。

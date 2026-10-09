@@ -363,6 +363,132 @@ impl SessionJournal {
             );
         }
     }
+
+    /// Ids a bounded save may move out of this journal, in journal order.
+    ///
+    /// Empty until more than `dead_threshold` entries sit off the active
+    /// branch — superseded versions left behind by compaction, undo and
+    /// edits (#6842). Past it, the plan keeps the root→leaf path, then whole
+    /// off-branch chains (an entry with every ancestor) newest first, with
+    /// `Compaction`/`BranchSummary` chains ahead of plain leaves, while the
+    /// kept off-branch total stays within `dead_budget`. A kept entry never
+    /// loses its parent, so the remainder always passes [`Self::validate`].
+    ///
+    /// Pure: callers archive the planned entries durably before removing
+    /// them with [`Self::remove_entries`]. Known limit: the active branch
+    /// itself is never pruned, so a session that never compacts stays as
+    /// long as its conversation.
+    pub fn prune_plan(&self, dead_threshold: usize, dead_budget: usize) -> Vec<EntryId> {
+        let active = self.root_to_leaf();
+        if self.entries.len().saturating_sub(active.len()) <= dead_threshold {
+            return Vec::new();
+        }
+        let index: HashMap<&str, usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.id.as_str(), i))
+            .collect();
+        let mut keep = vec![false; self.entries.len()];
+        for entry in &active {
+            if let Some(&i) = index.get(entry.id.as_str()) {
+                keep[i] = true;
+            }
+        }
+        let parents: HashSet<&str> = self
+            .entries
+            .iter()
+            .filter_map(|e| e.parent_id.as_deref())
+            .collect();
+        let summary = |e: &SessionEntry| {
+            matches!(
+                e.kind,
+                SessionEntryKind::Compaction { .. } | SessionEntryKind::BranchSummary { .. }
+            )
+        };
+        // Newest first: journal order is append order.
+        let candidates = self
+            .entries
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, e)| summary(e))
+            .chain(
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .filter(|(_, e)| !parents.contains(e.id.as_str())),
+            );
+        let mut used = 0usize;
+        for (start, _) in candidates {
+            if keep[start] {
+                continue;
+            }
+            let mut chain = Vec::new();
+            let mut seen = HashSet::new();
+            let mut cursor = Some(start);
+            let mut closed = true;
+            while let Some(i) = cursor {
+                if keep[i] {
+                    break;
+                }
+                if !seen.insert(i) || used + chain.len() >= dead_budget {
+                    closed = false;
+                    break;
+                }
+                chain.push(i);
+                cursor = match self.entries[i].parent_id.as_deref() {
+                    None => None,
+                    Some(parent) => match index.get(parent) {
+                        Some(&p) => Some(p),
+                        None => {
+                            closed = false;
+                            None
+                        }
+                    },
+                };
+            }
+            if closed {
+                used += chain.len();
+                for i in chain {
+                    keep[i] = true;
+                }
+            }
+        }
+        self.entries
+            .iter()
+            .zip(keep)
+            .filter(|(_, kept)| !kept)
+            .map(|(e, _)| e.id.clone())
+            .collect()
+    }
+
+    /// Remove `ids` atomically: either every listed entry leaves and the
+    /// remainder still validates, or the journal is left exactly as it was
+    /// and the validation error is returned. Returns how many were removed.
+    pub fn remove_entries(&mut self, ids: &HashSet<EntryId>) -> Result<usize, String> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let original = std::mem::take(&mut self.entries);
+        let mut removed = Vec::new();
+        for (position, entry) in original.into_iter().enumerate() {
+            if ids.contains(&entry.id) {
+                removed.push((position, entry));
+            } else {
+                self.entries.push(entry);
+            }
+        }
+        if let Err(error) = self.validate() {
+            // Ascending positions put every entry back where it was.
+            for (position, entry) in removed {
+                self.entries.insert(position, entry);
+            }
+            return Err(error);
+        }
+        Ok(removed.len())
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionImportContainer {
@@ -930,5 +1056,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A compaction-heavy session: each round rebranches the whole tail, so
+    /// superseded copies pile up off the active branch (#6842).
+    fn compacted_journal(rounds: usize, tail: usize) -> SessionJournal {
+        let mut j = SessionJournal::new();
+        for round in 0..rounds {
+            let messages: Vec<Message> = (0..tail)
+                .map(|i| msg("user", &format!("round {round} message {i}")))
+                .collect();
+            j.rebranch_active_messages(&messages);
+        }
+        j
+    }
+
+    #[test]
+    fn prune_plan_is_empty_under_the_threshold() {
+        let j = compacted_journal(4, 10);
+        assert_eq!(j.len(), 40);
+        assert!(j.prune_plan(30, 5).is_empty());
+    }
+
+    #[test]
+    fn prune_plan_keeps_active_branch_and_whole_recent_chains() {
+        let mut j = compacted_journal(50, 10);
+        let active_before = j.active_messages(true);
+        let leaf = j.leaf_id.clone();
+        let plan = j.prune_plan(100, 25);
+        // 490 dead entries; 2 whole 10-entry chains fit a 25 budget.
+        assert_eq!(plan.len(), 490 - 20);
+        let ids: HashSet<EntryId> = plan.into_iter().collect();
+        assert_eq!(j.remove_entries(&ids).unwrap(), 470);
+        assert_eq!(j.len(), 30);
+        j.validate().unwrap();
+        assert_eq!(j.leaf_id, leaf);
+        assert_eq!(j.active_messages(true), active_before);
+        // The newest superseded round survives, not an arbitrary one.
+        let kept: Vec<String> = j
+            .entries
+            .iter()
+            .filter_map(|e| e.kind.as_message())
+            .map(|m| match &m.content[0] {
+                ContentBlock::Text { text, .. } => text.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert!(kept.iter().any(|t| t.starts_with("round 48 ")), "{kept:?}");
+        assert!(!kept.iter().any(|t| t.starts_with("round 0 ")), "{kept:?}");
+    }
+
+    #[test]
+    fn prune_plan_prefers_summary_chains() {
+        let mut j = compacted_journal(30, 4);
+        let leaf = j.leaf_id.clone().unwrap();
+        // An old compaction hanging off the very first entry.
+        let first = j.entries[0].id.clone();
+        j.branch_to(&first).unwrap();
+        let summary = j.append_compaction("old summary".into(), None, None, None);
+        j.branch_to(&leaf).unwrap();
+        let plan = j.prune_plan(10, 2);
+        assert!(!plan.contains(&summary));
+        assert!(!plan.contains(&first));
+    }
+
+    #[test]
+    fn remove_entries_refuses_to_orphan_and_leaves_journal_untouched() {
+        let mut j = compacted_journal(3, 3);
+        let before = j.clone();
+        let active: HashSet<EntryId> = j
+            .root_to_leaf()
+            .iter()
+            .map(|e| e.id.clone())
+            .take(1)
+            .collect();
+        assert!(j.remove_entries(&active).is_err());
+        assert_eq!(j, before);
     }
 }

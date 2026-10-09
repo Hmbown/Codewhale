@@ -49,7 +49,7 @@ from typing import Any
 
 DEFAULT_MODELS_DEV_URL = "https://models.dev/catalog.json"
 DEFAULT_OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
-USER_AGENT = "CodeWhale-catalog-automation/0.9.0 (+https://github.com/Hmbown/CodeWhale)"
+USER_AGENT = "CodeWhale-catalog-automation/0.9.0 (+https://github.com/codewhale-hq/CodeWhale)"
 FETCH_TIMEOUT_SECS = 60
 
 
@@ -177,6 +177,8 @@ def public_models_dev_document(data: dict[str, Any]) -> dict[str, Any]:
         out["_meta"] = strip_sensitive_fields(data["_meta"])
     if isinstance(data.get("models"), dict):
         out["models"] = strip_sensitive_fields(data["models"])
+    if isinstance(data.get("_reviewed"), dict):
+        out["_reviewed"] = strip_sensitive_fields(data["_reviewed"])
     if isinstance(data.get("providers"), dict):
         out["providers"] = strip_sensitive_fields(data["providers"])
     return out
@@ -375,8 +377,14 @@ SEED_RENDER_COMMAND = "python3 scripts/catalog_models_dev.py seed render"
 PROVIDER_MODEL_FIELDS = (
     "id",
     "base_model",
+    "canonical_model_id",
     "name",
+    "description",
+    "type",
     "family",
+    "knowledge",
+    "release_date",
+    "last_updated",
     "default",
     "attachment",
     "reasoning",
@@ -389,11 +397,19 @@ PROVIDER_MODEL_FIELDS = (
     "modalities",
     "limit",
     "cost",
+    "provider",
+    "status",
+    "experimental",
 )
 CANONICAL_MODEL_FIELDS = (
     "id",
     "name",
+    "description",
+    "type",
     "family",
+    "knowledge",
+    "release_date",
+    "last_updated",
     "attachment",
     "reasoning",
     "tool_call",
@@ -402,15 +418,20 @@ CANONICAL_MODEL_FIELDS = (
     "open_weights",
     "modalities",
     "limit",
+    "license",
+    "links",
+    "weights",
+    "benchmarks",
 )
 NESTED_FIELDS = {
     "limit": ("context", "input", "output"),
     "modalities": ("input", "output"),
-    "cost": ("input", "output", "cache_read", "cache_write"),
+    "cost": ("input", "output", "cache_read", "cache_write", "reasoning", "input_audio", "output_audio", "tiers", "context_over_200k"),
+    "provider": ("npm", "api", "shape", "body", "headers"),
 }
 # Mapping-only keys a spec model entry may carry. None of them restates an
-# upstream fact: `base_model` is Codewhale's canonical join, which upstream
-# provider rows do not carry.
+# upstream fact: `base_model` is the seed's compatibility join; generated
+# upstream provider rows may carry `canonical_model_id`.
 SPEC_MODEL_KEYS = {"id", "upstream_id", "from", "base_model", "curated"}
 SPEC_PROVIDER_KEYS = {"id", "upstream", "name", "api", "npm", "env", "doc", "default", "models"}
 SAFE_PUBLIC_TEXT = re.compile(r"^[A-Za-z0-9 ._:/()+\-]{0,64}$")
@@ -694,7 +715,46 @@ def stale_corrections(
     return stale
 
 
-def render_seed(spec: dict[str, Any], lock: dict[str, Any]) -> str:
+def validate_reviewed(data: Any) -> dict[str, Any]:
+    """Refuse malformed authored supplements before the deterministic render."""
+    def identifier(value: Any) -> bool:
+        return isinstance(value, str) and bool(value) and len(value.encode("utf-8")) <= 512 and value == value.strip() and not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value)
+
+    def positive(value: Any) -> bool:
+        return value is None or isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 0xffffffff
+
+    if not isinstance(data, dict) or not identifier(data.get("revision")):
+        die("reviewed model catalog missing or malformed")
+    intrinsic = data.get("intrinsic", {})
+    if not isinstance(intrinsic, dict):
+        die("reviewed intrinsic facts must be an object")
+    for key, row in intrinsic.items():
+        if not identifier(key) or not isinstance(row, dict) or not identifier(row.get("source")) or any(not positive(row.get(field)) for field in ("context_window", "max_output", "generation_default")) or not (row.get("reasoning") is None or isinstance(row.get("reasoning"), bool)):
+            die("malformed reviewed intrinsic fact")
+    public = data.get("public_models", [])
+    if not isinstance(public, list):
+        die("reviewed public models must be an array")
+    seen: set[str] = set()
+    for row in public:
+        if not isinstance(row, dict) or not identifier(row.get("id")) or row["id"] in seen or row["id"].lower() not in intrinsic:
+            die("missing or duplicate reviewed public model")
+        seen.add(row["id"])
+    for key in ("compatibility_aliases", "completion_rosters", "constants", "groups"):
+        if not isinstance(data.get(key, {}), dict):
+            die(f"reviewed {key} must be an object")
+    for aliases in data.get("compatibility_aliases", {}).values():
+        if not isinstance(aliases, dict) or any(not identifier(key) or not identifier(value) for key, value in aliases.items()):
+            die("malformed reviewed alias")
+    for entries in data.get("completion_rosters", {}).values():
+        if not isinstance(entries, list) or any(not identifier(value) for value in entries):
+            die("malformed reviewed completion roster")
+    for reference in data.get("numeric_refs", {}).values():
+        if not isinstance(reference, dict) or reference.get("field") not in ("context_window", "max_output", "generation_default") or reference.get("model") not in intrinsic or not positive(intrinsic[reference["model"]].get(reference["field"])) or intrinsic[reference["model"]].get(reference["field"]) is None:
+            die("missing or malformed numeric model contract")
+    return data
+
+
+def render_seed(spec: dict[str, Any], lock: dict[str, Any], reviewed_source: dict[str, Any]) -> str:
     """Render the offline seed from spec + lock. Pure and deterministic."""
     errors: list[str] = []
     providers_out: dict[str, Any] = {}
@@ -719,6 +779,10 @@ def render_seed(spec: dict[str, Any], lock: dict[str, Any]) -> str:
                 row = dict(locked[1])
             row["id"] = model["id"]
             if model.get("base_model"):
+                canonical = row.get("canonical_model_id")
+                if canonical is not None and canonical != model["base_model"]:
+                    errors.append(f"{key[0]}/{key[1]}: seed base_model conflicts with upstream canonical_model_id")
+                    continue
                 row["base_model"] = model["base_model"]
             row.pop("default", None)
             if model["id"] == provider["default"]:
@@ -750,7 +814,8 @@ def render_seed(spec: dict[str, Any], lock: dict[str, Any]) -> str:
         f"{len(providers_out)} providers, {row_count} provider model rows, "
         f"{len(models_out)} canonical model entries."
     )
-    document = {"_meta": meta, "models": models_out, "providers": providers_out}
+    reviewed_source = validate_reviewed(reviewed_source)
+    document = {"_meta": meta, "models": models_out, "providers": providers_out, "_reviewed": reviewed_source}
     ensure_models_dev_shape(document, "rendered seed")
     return json.dumps(document, indent=2, ensure_ascii=False) + "\n"
 
@@ -793,7 +858,8 @@ def cmd_seed_lock(args: argparse.Namespace) -> None:
 def cmd_seed_render(args: argparse.Namespace) -> None:
     spec = load_seed_spec(Path(args.spec))
     lock = read_json_file(Path(args.lock))
-    rendered = render_seed(spec, lock)
+    reviewed = read_json_file(Path(args.corrections)).get("reviewed")
+    rendered = render_seed(spec, lock, reviewed)
     target = Path(args.out)
     if args.check:
         current = target.read_text(encoding="utf-8") if target.is_file() else ""
@@ -907,7 +973,7 @@ def build_parser() -> argparse.ArgumentParser:
     for command in (lock, render):
         command.add_argument("--spec", default=str(SEED_SPEC))
         command.add_argument("--lock", default=str(SEED_LOCK))
-    lock.add_argument("--corrections", default=str(CORRECTIONS_ASSET))
+        command.add_argument("--corrections", default=str(CORRECTIONS_ASSET))
     lock.set_defaults(func=cmd_seed_lock)
     render.set_defaults(func=cmd_seed_render)
     return p

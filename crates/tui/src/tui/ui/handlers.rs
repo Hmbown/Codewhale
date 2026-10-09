@@ -17,7 +17,7 @@ pub(crate) fn sync_fleet_roster(app: &mut App, config: &Config, engine_handle: &
     let roster = crate::fleet::identity::load_effective_roster(
         &config.fleet_config(),
         &app.workspace,
-        Some(app.plugin_registry.as_ref()),
+        Some(app.extension_plugin_view().as_ref()),
     );
     if let Some(error) = roster.load_error() {
         app.set_sticky_status(error.to_string(), StatusToastLevel::Error, None);
@@ -1163,6 +1163,7 @@ pub(crate) async fn handle_mcp_ui_action(
             network_policy,
             app.mcp_reload_required,
             std::sync::Arc::clone(&app.plugin_registry),
+            mcp::McpBackend::from_config(config),
         )
         .await
         .map(|snapshot| (snapshot, None))
@@ -1480,6 +1481,245 @@ async fn handle_theme_selection_updated(
     Ok(false)
 }
 
+/// Whether a settled question is the host's own Plan hand-off rather than an
+/// engine `request_user_input` call. The engine's request is recorded in
+/// `pending_user_input_prompt` before its view opens, so a provider-chosen
+/// tool-call id equal to the hand-off id still reaches the engine.
+pub(crate) fn is_plan_handoff_request(app: &App, tool_id: &str) -> bool {
+    (tool_id == crate::tui::plan_handoff::REQUEST_ID
+        || tool_id.starts_with(&format!("{}:", crate::tui::plan_handoff::REQUEST_ID)))
+        && app
+            .pending_user_input_prompt
+            .as_ref()
+            .is_none_or(|(id, _)| id != tool_id)
+}
+
+fn plan_handoff_seed_title(plan: &crate::tui::plan_handoff::PendingPlanHandoff) -> String {
+    // Match the graph's trimmed title without changing the approved message.
+    plan.text
+        .trim()
+        .chars()
+        .take(1024)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Stage one graph-owned item for a prose plan without replacing existing work.
+async fn seed_plan_handoff_todos(
+    app: &App,
+    plan: &mut crate::tui::plan_handoff::PendingPlanHandoff,
+) -> Result<(), String> {
+    if plan.has_current_checklist {
+        return Ok(());
+    }
+    let work = app
+        .runtime_services
+        .work
+        .as_ref()
+        .ok_or_else(|| "Work state is unavailable".to_string())?;
+    let mut todos = work.current_todos().await?;
+    let content = plan_handoff_seed_title(plan);
+    if let Some(id) = plan.seeded_todo_id {
+        return if todos.items.iter().any(|item| {
+            item.id == id
+                && item.content == content
+                && item.status == crate::tools::todo::TodoStatus::Pending
+        }) {
+            Ok(())
+        } else {
+            Err("The approved plan's To-do changed; review the plan again".to_string())
+        };
+    }
+    let id = todos
+        .items
+        .iter()
+        .map(|item| item.id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| "To-do item IDs are exhausted".to_string())?;
+    todos.items.push(crate::tools::todo::TodoItem {
+        id,
+        content,
+        status: crate::tools::todo::TodoStatus::Pending,
+    });
+    work.apply_todo_update(&plan.session_id, "todo_write", &todos)
+        .await?;
+    plan.seeded_todo_id = Some(id);
+    Ok(())
+}
+
+/// Remove only this unchanged seed from the latest projection. Unprojected
+/// graph history remains; operation_parent cannot adopt an unprojected step.
+async fn rollback_plan_handoff_seed(
+    app: &App,
+    plan: &mut crate::tui::plan_handoff::PendingPlanHandoff,
+) -> Result<(), String> {
+    let Some(id) = plan.seeded_todo_id else {
+        return Ok(());
+    };
+    if app.current_session_id.as_deref() != Some(plan.session_id.as_str()) {
+        return Err("The plan belongs to another session".to_string());
+    }
+    let work = app
+        .runtime_services
+        .work
+        .as_ref()
+        .ok_or_else(|| "Work state is unavailable".to_string())?;
+    let mut todos = work.current_todos().await?;
+    if let Some(item) = todos.items.iter().find(|item| item.id == id) {
+        if item.content != plan_handoff_seed_title(plan)
+            || item.status != crate::tools::todo::TodoStatus::Pending
+        {
+            return Err(
+                "The approved plan's To-do changed; review it before continuing".to_string(),
+            );
+        }
+        todos.items.retain(|item| item.id != id);
+        work.apply_todo_update(&plan.session_id, "todo_write", &todos)
+            .await?;
+    }
+    plan.seeded_todo_id = None;
+    Ok(())
+}
+
+fn reopen_plan_handoff(
+    app: &mut App,
+    plan: &crate::tui::plan_handoff::PendingPlanHandoff,
+    reason: &str,
+) {
+    app.view_stack.push(UserInputView::new(
+        plan.request_id.clone(),
+        crate::tui::plan_handoff::request(app.ui_locale),
+    ));
+    let notice = app
+        .tr(MessageId::SessionSaveFailed)
+        .replace("{id}", &plan.session_id)
+        .replace("{error}", reason);
+    app.push_status_toast(notice, StatusToastLevel::Warning, Some(8_000));
+}
+
+/// Carry out only the answer bound to this exact completed Plan response.
+pub(crate) async fn apply_plan_handoff(
+    app: &mut App,
+    config: &Config,
+    engine_handle: &EngineHandle,
+    request_id: &str,
+    choice: crate::tui::plan_handoff::PlanHandoffChoice,
+) -> Result<()> {
+    apply_plan_handoff_with_checkpoint(app, config, engine_handle, request_id, choice, |app| {
+        Box::pin(persist_pending_work_checkpoint(app))
+    })
+    .await
+}
+
+type PlanHandoffCheckpoint =
+    for<'a> fn(&'a mut App) -> Pin<Box<dyn Future<Output = Result<bool, String>> + 'a>>;
+
+/// The checkpoint callback keeps the existing admission boundary explicit;
+/// tests can refuse admission without mutating the global persistence actor.
+pub(crate) async fn apply_plan_handoff_with_checkpoint(
+    app: &mut App,
+    config: &Config,
+    engine_handle: &EngineHandle,
+    request_id: &str,
+    choice: crate::tui::plan_handoff::PlanHandoffChoice,
+    checkpoint: PlanHandoffCheckpoint,
+) -> Result<()> {
+    use crate::tui::plan_handoff::PlanHandoffChoice;
+
+    let Some(mut plan) = app
+        .pending_plan_handoff
+        .clone()
+        .filter(|plan| app.plan_handoff_is_current(plan, request_id))
+    else {
+        return Ok(());
+    };
+    if !matches!(&choice, PlanHandoffChoice::Work(_))
+        && let Err(reason) = rollback_plan_handoff_seed(app, &mut plan).await
+    {
+        app.pending_plan_handoff = Some(plan.clone());
+        reopen_plan_handoff(app, &plan, &reason);
+        return Ok(());
+    }
+    let message = match choice {
+        PlanHandoffChoice::KeepPlanning => {
+            app.pending_plan_handoff = None;
+            return Ok(());
+        }
+        PlanHandoffChoice::Revise(feedback) => QueuedMessage::new(feedback, None),
+        PlanHandoffChoice::Work(posture) => {
+            if !enter_work_for_plan(app, config, engine_handle, posture).await {
+                return Ok(());
+            }
+            let staged = seed_plan_handoff_todos(app, &mut plan).await;
+            app.pending_plan_handoff = Some(plan.clone());
+            let checkpoint = match staged {
+                Ok(()) => checkpoint(app).await.map(|_| ()),
+                Err(reason) => Err(reason),
+            };
+            if let Err(reason) = checkpoint {
+                // Undo our unpublished projection before the event loop can
+                // retry an ordinary checkpoint. Never roll back other work.
+                // An already queued write cannot be recalled by this repair.
+                let reason = match rollback_plan_handoff_seed(app, &mut plan).await {
+                    Ok(()) => reason,
+                    Err(cleanup) => format!("{reason}; {cleanup}"),
+                };
+                app.pending_plan_handoff = Some(plan.clone());
+                apply_mode_update(app, engine_handle, config, AppMode::Plan).await;
+                reopen_plan_handoff(app, &plan, &reason);
+                return Ok(());
+            }
+            QueuedMessage::new(
+                format!("{}\n\n{}", app.tr(MessageId::PlanHandoffProceed), plan.text),
+                None,
+            )
+        }
+    };
+    // Consume before ordinary composer admission. Its existing recovery owns
+    // the exact user message on an offline/failed send; a repeated answer
+    // cannot enqueue another execution.
+    app.pending_plan_handoff = None;
+    let action = ComposerSubmitAction::Submit(app.decide_submit_disposition());
+    dispatch_composer_message(
+        app,
+        config,
+        engine_handle,
+        message,
+        DispatchRecovery::Immediate,
+        action,
+    )
+    .await
+}
+
+/// Leave Plan for Work with the chosen permission. Returns `false`, with the
+/// reason on screen, when the permission or the mode could not be applied;
+/// the session then stays where it was and nothing is sent.
+pub(crate) async fn enter_work_for_plan(
+    app: &mut App,
+    config: &Config,
+    engine_handle: &EngineHandle,
+    posture: ApprovalMode,
+) -> bool {
+    if engine_handle.tx_op.is_closed() {
+        return false;
+    }
+    if app.agent_approval_baseline() != posture
+        && let Err(reason) = app.apply_agent_posture(posture)
+    {
+        app.push_status_toast(reason, StatusToastLevel::Warning, Some(8_000));
+        return false;
+    }
+    apply_mode_update(app, engine_handle, config, AppMode::Agent).await;
+    if engine_handle.tx_op.is_closed() {
+        app.set_mode(AppMode::Plan);
+        return false;
+    }
+    app.mode == AppMode::Agent
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_view_events(
     terminal: &mut AppTerminal,
@@ -1534,7 +1774,7 @@ pub(crate) async fn handle_view_events(
                 // rows divert their text output into a pager stacked on the
                 // panel instead of a transcript dump; mutations keep their
                 // transcript receipt either way.
-                let mut result = crate::commands::execute(&command, app);
+                let mut result = crate::commands::execute_with_config(&command, app, config);
                 if let Some(title) = pager_title
                     && let Some(text) = result.message.take()
                 {
@@ -1654,8 +1894,26 @@ pub(crate) async fn handle_view_events(
                     }
                 };
                 if result.is_ok() {
+                    note_human_decision_delivered(app, &tool_id);
                     app.retire_action_notices(Some(&tool_id));
                 }
+            }
+            ViewEvent::UserInputSubmitted { tool_id, response }
+                if is_plan_handoff_request(app, &tool_id) =>
+            {
+                let choice = crate::tui::plan_handoff::choice(app.ui_locale, &response);
+                apply_plan_handoff(app, config, engine_handle, &tool_id, choice).await?;
+            }
+            // Esc follows the same owned-seed cleanup as Keep planning.
+            ViewEvent::UserInputCancelled { tool_id } if is_plan_handoff_request(app, &tool_id) => {
+                apply_plan_handoff(
+                    app,
+                    config,
+                    engine_handle,
+                    &tool_id,
+                    crate::tui::plan_handoff::PlanHandoffChoice::KeepPlanning,
+                )
+                .await?;
             }
             ViewEvent::UserInputSubmitted { tool_id, response } => {
                 let result = engine_handle
@@ -2185,25 +2443,39 @@ pub(crate) async fn handle_view_events(
                 // config has the target provider active so credential discovery
                 // succeeds, but the parent session provider/model are never
                 // mutated.
-                let Some(provider) = ApiProvider::parse(&provider_id) else {
-                    app.set_sticky_status(
-                        format!("Team route activation failed: unknown provider `{provider_id}`"),
-                        crate::tui::app::StatusToastLevel::Error,
-                        None,
-                    );
-                    app.needs_redraw = true;
-                    continue;
+                let identity = match config.resolve_provider_selection_identity(&provider_id) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        app.set_sticky_status(
+                            format!("Team route activation failed: {error}"),
+                            crate::tui::app::StatusToastLevel::Error,
+                            None,
+                        );
+                        app.needs_redraw = true;
+                        continue;
+                    }
                 };
-                let provider_label = provider.display_name();
+                let provider_label = identity
+                    .compatibility()
+                    .map_or(identity.key.as_str(), |row| row.label);
                 let mut scoped = config.clone();
-                scoped.provider = Some(provider_id.clone());
-                let validation =
-                    crate::route_runtime::resolve_runtime_route(&scoped, provider, Some(&model))
-                        .and_then(|route| route.validate().map_err(|err| err.to_string()));
+                let validation = scoped
+                    .scope_to_provider_identity(&identity)
+                    .and_then(|()| {
+                        crate::route_runtime::resolve_runtime_route_for_identity(
+                            &scoped,
+                            &identity,
+                            Some(&model),
+                        )
+                    })
+                    .and_then(|route| route.validate().map_err(|err| err.to_string()));
                 match validation {
                     Ok(validated) => {
-                        app.provider_health
-                            .record_success(&scoped, provider, &validated.model);
+                        app.provider_health.record_success(
+                            &scoped,
+                            &validated.client.turn_route_receipt(),
+                            &validated.model,
+                        );
                         app.push_status_toast(
                             format!(
                                 "{provider_label} route activated for team: {}",
@@ -2221,8 +2493,18 @@ pub(crate) async fn handle_view_events(
                             "route_validation_failed",
                             &error,
                         );
-                        app.provider_health
-                            .record_failure(&scoped, provider, &model, &envelope);
+                        if let Some(generation) =
+                            scoped.readonly_health_credential_generation(&identity)
+                        {
+                            app.provider_health.record_models_probe_failure(
+                                &scoped,
+                                &identity,
+                                &model,
+                                generation,
+                                envelope.category,
+                                &envelope.message,
+                            );
+                        }
                         app.push_status_toast(
                             format!("{provider_label} route activation failed: {error}"),
                             crate::tui::app::StatusToastLevel::Error,
@@ -2321,20 +2603,33 @@ pub(crate) async fn handle_view_events(
                 // after the pick) could still name an unconfigured one — which
                 // would fail loudly at launch. Catch it at save time with a
                 // clear message, reusing the SAME predicate the picker uses.
-                if let Some(provider_id) = draft.provider.as_deref()
-                    && let Some(provider) = crate::config::ApiProvider::parse(provider_id)
-                    && !crate::config::provider_is_configured_for_active(
-                        config,
-                        provider,
-                        app.api_provider,
-                    )
-                {
-                    let message = tr(app.ui_locale, MessageId::FleetProfileProviderUnconfigured)
-                        .replace("{provider}", provider_id)
-                        .replace("{env}", &provider.env_vars_label());
-                    app.set_sticky_status(message, StatusToastLevel::Error, None);
-                    app.needs_redraw = true;
-                    continue;
+                if let Some(provider_id) = draft.provider.as_deref() {
+                    let checked =
+                        config
+                            .resolve_provider_pin_identity(provider_id)
+                            .and_then(|identity| {
+                                let active = app.admitted_provider_identity()?;
+                                if crate::config::provider_is_configured_for_active(
+                                    config, &identity, active,
+                                ) {
+                                    Ok(())
+                                } else {
+                                    Err(tr(
+                                        app.ui_locale,
+                                        MessageId::FleetProfileProviderUnconfigured,
+                                    )
+                                    .replace("{provider}", provider_id)
+                                    .replace(
+                                        "{env}",
+                                        &identity.provider.provider().env_vars().join(" / "),
+                                    ))
+                                }
+                            });
+                    if let Err(message) = checked {
+                        app.set_sticky_status(message, StatusToastLevel::Error, None);
+                        app.needs_redraw = true;
+                        continue;
+                    }
                 }
                 let mut txn = codewhale_config::persistence::SetupTransaction::new();
                 txn.stage(target.clone(), draft.render_toml().into_bytes());
@@ -2344,7 +2639,7 @@ pub(crate) async fn handle_view_events(
                             std::sync::Arc::new(crate::fleet::identity::load_effective_roster(
                                 &config.fleet_config(),
                                 &app.workspace,
-                                Some(app.plugin_registry.as_ref()),
+                                Some(app.extension_plugin_view().as_ref()),
                             ));
                         let roster_refresh_failed = engine_handle
                             .try_send(Op::SetFleetRoster { roster })
@@ -2408,7 +2703,9 @@ pub(crate) async fn handle_view_events(
                     app.view_stack.push(
                         crate::tui::provider_picker::ProviderPickerView::new_for_setup(
                             app.api_provider,
-                            Some(app.api_provider),
+                            app.admitted_provider_identity()
+                                .ok()
+                                .map(|identity| identity.key.clone()),
                             config,
                             runtime_status,
                         )
@@ -2421,7 +2718,9 @@ pub(crate) async fn handle_view_events(
             }
             ViewEvent::SetupOpenModelRequested => {
                 if app.view_stack.top_kind() != Some(ModalKind::ModelPicker) {
-                    open_model_picker_for_provider(app, config, app.api_provider);
+                    if let Ok(identity) = app.admitted_provider_identity().cloned() {
+                        open_model_picker_for_provider(app, config, &identity);
+                    }
                     app.status_message =
                         Some("Model route picker opened from /setup readiness.".to_string());
                 }
@@ -2507,8 +2806,7 @@ pub(crate) async fn handle_view_events(
             }
             ViewEvent::ModelPickerApplied {
                 model,
-                provider,
-                provider_id,
+                identity,
                 effort,
                 previous_model,
                 previous_effort,
@@ -2519,8 +2817,7 @@ pub(crate) async fn handle_view_events(
                     engine_handle,
                     config,
                     model,
-                    provider,
-                    provider_id,
+                    identity,
                     effort,
                     previous_model,
                     previous_effort,
@@ -2613,7 +2910,7 @@ pub(crate) async fn handle_view_events(
                 app.needs_redraw = true;
             }
             ViewEvent::ModelPickerNeedsAuth {
-                provider,
+                identity,
                 model,
                 reason,
             } => {
@@ -2626,7 +2923,7 @@ pub(crate) async fn handle_view_events(
                 if let Some(picker) =
                     crate::tui::provider_picker::ProviderPickerView::new_for_missing_auth(
                         app.api_provider,
-                        provider,
+                        &identity,
                         config,
                         None,
                     )
@@ -2634,7 +2931,8 @@ pub(crate) async fn handle_view_events(
                     app.view_stack.push(picker);
                 } else {
                     app.status_message = Some(format!(
-                        "🔒 {model} needs {provider:?} credentials — open /provider to authenticate."
+                        "🔒 {model} needs {} credentials — open /provider to authenticate.",
+                        identity.key
                     ));
                 }
                 app.needs_redraw = true;
@@ -2671,28 +2969,23 @@ pub(crate) async fn handle_view_events(
                     back_from_provider_onboarding(app);
                 }
             }
-            ViewEvent::ProviderPickerApplied {
-                provider,
-                provider_id,
-            } => {
-                if let Some(provider_id) = provider_id {
-                    set_active_custom_provider_in_memory(config, &provider_id);
-                }
-                let model_override = provider_picker_model_override(app, config, provider);
+            ViewEvent::ProviderPickerApplied { identity } => {
+                let provider = identity.provider;
+                let model_override = provider_picker_model_override(app, config, &identity);
                 let switched =
-                    switch_provider(app, engine_handle, config, provider, model_override).await;
+                    switch_provider(app, engine_handle, config, identity, model_override).await;
                 if switched && app.onboarding == OnboardingState::Provider {
                     complete_provider_picker_onboarding(app, provider);
                 }
                 refresh_config_view_if_open(app, "provider");
             }
             ViewEvent::ProviderPickerApiKeySubmitted {
-                provider,
-                provider_id,
+                identity,
                 api_key,
                 base_url,
             } => {
-                let identity = picker_provider_identity(config, provider, provider_id.as_deref())
+                config
+                    .verify_provider_identity(&identity)
                     .map_err(anyhow::Error::msg)?;
                 apply_provider_picker_api_key(
                     app,
@@ -2706,15 +2999,16 @@ pub(crate) async fn handle_view_events(
                 refresh_config_view_if_open(app, "provider");
             }
             ViewEvent::ProviderPickerSetupConfirmed {
-                provider,
-                provider_id,
+                identity,
                 api_key,
                 model,
                 context_window,
                 base_url,
             } => {
-                let identity = picker_provider_identity(config, provider, provider_id.as_deref())
+                config
+                    .verify_provider_identity(&identity)
                     .map_err(anyhow::Error::msg)?;
+                let provider = identity.provider;
                 let completed = apply_provider_picker_setup_confirmed(
                     app,
                     engine_handle,
@@ -2747,20 +3041,43 @@ pub(crate) async fn handle_view_events(
                     api_key_env,
                 )
                 .await;
-                complete_provider_picker_onboarding_if_switched(app, ApiProvider::Custom, switched);
+                complete_provider_picker_onboarding_if_switched(
+                    app,
+                    ProviderKind::Custom,
+                    switched,
+                );
                 refresh_config_view_if_open(app, "provider");
+            }
+            ViewEvent::ProviderPickerClaudeOAuthRequested => {
+                let switched =
+                    run_claude_login_from_tui(terminal, app, engine_handle, config).await?;
+                complete_provider_picker_onboarding_if_switched(
+                    app,
+                    ProviderKind::Anthropic,
+                    switched,
+                );
             }
             ViewEvent::ProviderPickerXaiOAuthRequested => {
                 let switched =
                     run_xai_device_login_from_tui(terminal, app, engine_handle, config).await?;
-                complete_provider_picker_onboarding_if_switched(app, ApiProvider::Xai, switched);
+                complete_provider_picker_onboarding_if_switched(app, ProviderKind::Xai, switched);
             }
             ViewEvent::ProviderPickerChatgptOAuthRequested => {
                 let switched =
                     run_chatgpt_pkce_login_from_tui(terminal, app, engine_handle, config).await?;
                 complete_provider_picker_onboarding_if_switched(
                     app,
-                    ApiProvider::OpenaiCodex,
+                    ProviderKind::OpenaiCodex,
+                    switched,
+                );
+            }
+            ViewEvent::ProviderPickerOrcarouterOAuthRequested => {
+                let switched =
+                    run_orcarouter_pkce_login_from_tui(terminal, app, engine_handle, config)
+                        .await?;
+                complete_provider_picker_onboarding_if_switched(
+                    app,
+                    ProviderKind::Orcarouter,
                     switched,
                 );
             }
@@ -2769,45 +3086,54 @@ pub(crate) async fn handle_view_events(
                 consent_provider,
                 source,
                 path,
-            } => match persist_external_credential_consent_for_at(
-                app.config_path.as_deref(),
-                config,
-                provider,
-                consent_provider,
-                source,
-                &path,
-            ) {
-                Ok(_) => {
-                    let toast = app
-                        .tr(MessageId::ProviderExternalGrantedToast)
-                        .replace("{owner}", source.owner_label())
-                        .replace("{provider}", provider.as_str());
-                    app.push_status_toast(toast, StatusToastLevel::Success, Some(8_000));
-                    let model_override = provider_picker_model_override(app, config, provider);
-                    let switched =
-                        switch_provider(app, engine_handle, config, provider, model_override).await;
-                    // #4763: reusing an external CLI grant completes provider
-                    // onboarding exactly like a submitted key or an applied
-                    // route. Without this the picker closes on success and
-                    // the user is returned to the provider step they just
-                    // satisfied — the second half of the reported loop.
-                    if switched && app.onboarding == OnboardingState::Provider {
-                        complete_provider_picker_onboarding(app, provider);
+            } => {
+                let identity = config
+                    .builtin_provider_identity(provider)
+                    .map_err(anyhow::Error::msg)?;
+                match persist_external_credential_consent_for_at(
+                    app.config_path.as_deref(),
+                    config,
+                    &identity,
+                    consent_provider,
+                    source,
+                    &path,
+                ) {
+                    Ok(_) => {
+                        let toast = app
+                            .tr(MessageId::ProviderExternalGrantedToast)
+                            .replace("{owner}", source.owner_label())
+                            .replace("{provider}", provider.as_str());
+                        app.push_status_toast(toast, StatusToastLevel::Success, Some(8_000));
+                        let model_override = provider_picker_model_override(app, config, &identity);
+                        let switched =
+                            switch_provider(app, engine_handle, config, identity, model_override)
+                                .await;
+                        // #4763: reusing an external CLI grant completes provider
+                        // onboarding exactly like a submitted key or an applied
+                        // route. Without this the picker closes on success and
+                        // the user is returned to the provider step they just
+                        // satisfied — the second half of the reported loop.
+                        if switched && app.onboarding == OnboardingState::Provider {
+                            complete_provider_picker_onboarding(app, provider);
+                        }
+                        refresh_config_view_if_open(app, "provider");
                     }
-                    refresh_config_view_if_open(app, "provider");
+                    Err(error) => app.push_status_toast(
+                        app.tr(MessageId::ProviderExternalSaveFailedToast)
+                            .replace("{error}", &error.to_string()),
+                        StatusToastLevel::Error,
+                        None,
+                    ),
                 }
-                Err(error) => app.push_status_toast(
-                    app.tr(MessageId::ProviderExternalSaveFailedToast)
-                        .replace("{error}", &error.to_string()),
-                    StatusToastLevel::Error,
-                    None,
-                ),
-            },
+            }
             ViewEvent::ProviderPickerExternalConsentRevoked { provider } => {
+                let identity = config
+                    .builtin_provider_identity(provider)
+                    .map_err(anyhow::Error::msg)?;
                 match revoke_external_credential_consent_for_at(
                     app.config_path.as_deref(),
                     config,
-                    provider,
+                    &identity,
                 ) {
                     Ok(_) => app.push_status_toast(
                         app.tr(MessageId::ProviderExternalRevokedToast)
@@ -2824,22 +3150,15 @@ pub(crate) async fn handle_view_events(
                 }
                 refresh_config_view_if_open(app, "provider");
             }
-            ViewEvent::ProviderPickerOpenModels {
-                provider,
-                provider_id,
-            } => {
-                if let Some(provider_id) = provider_id {
-                    set_active_custom_provider_in_memory(config, &provider_id);
-                }
-                open_model_picker_for_provider(app, config, provider);
+            ViewEvent::ProviderPickerOpenModels { identity } => {
+                open_model_picker_for_provider(app, config, &identity);
             }
             ViewEvent::ProviderPickerTestConnection {
-                provider,
-                provider_id,
+                identity,
                 catalog_view,
             } => {
-                match picker_provider_identity(config, provider, provider_id.as_deref()) {
-                    Ok(identity) => {
+                match config.verify_provider_identity(&identity) {
+                    Ok(()) => {
                         apply_provider_picker_test_connection(
                             app,
                             engine_handle,
@@ -2847,10 +3166,10 @@ pub(crate) async fn handle_view_events(
                             identity,
                             catalog_view,
                         )
-                        .await;
+                        .await
                     }
                     Err(error) => {
-                        app.push_status_toast(error, StatusToastLevel::Error, Some(8_000));
+                        app.push_status_toast(error, StatusToastLevel::Error, Some(8_000))
                     }
                 }
                 refresh_config_view_if_open(app, "provider");

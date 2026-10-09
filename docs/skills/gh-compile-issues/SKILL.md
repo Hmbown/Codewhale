@@ -15,7 +15,7 @@ maintainer approval.
 ## Inputs
 
 - Repo root: the local Codewhale checkout (run `git rev-parse --show-toplevel`).
-- GitHub repo: `Hmbown/CodeWhale`
+- GitHub repo: `codewhale-hq/CodeWhale`
 - Required GitHub CLI: `gh`
 - An issue set: explicit numbers, or a milestone (e.g. the current `vX.Y.Z`).
 
@@ -25,7 +25,7 @@ maintainer approval.
    (a `vX.Y.Z: ...` title says nothing about whether code already covers it).
 
    ```bash
-   gh issue list --repo Hmbown/CodeWhale --state open \
+   gh issue list --repo codewhale-hq/CodeWhale --state open \
      --milestone "<milestone>" --limit 300 --json number,title,labels,milestone
    ```
 
@@ -34,7 +34,7 @@ maintainer approval.
    verdict.
 
    ```bash
-   gh issue view N --repo Hmbown/CodeWhale \
+   gh issue view N --repo codewhale-hq/CodeWhale \
      --json number,title,state,author,labels,milestone,body,comments
    ```
 

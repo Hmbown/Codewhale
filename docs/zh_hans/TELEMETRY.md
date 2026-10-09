@@ -103,7 +103,7 @@ Codewhale 没有恢复出厂设置命令，因此本文档也不会声称有。
 | `install_id` | uuid v4 | `crates/telemetry/src/envelope.rs` | 随机、绝不派生，每 90 天轮换。见上文"数据存放位置"。 |
 | `app_version` | string | `env!("CARGO_PKG_VERSION")`，即 `crates/telemetry/src/lib.rs:112` 处 | 必须匹配 `^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$`。 |
 | `git_sha` | string \| null | `option_env!("CODEWHALE_RELEASE_BUILD_SHA")`——一个**新的** rustc-env | 前 12 个十六进制字符。仅当 `codewhale_build_support::release_build_sha` 按此优先级在 `CODEWHALE_BUILD_SHA`、旧版 `DEEPSEEK_BUILD_SHA` 或 `GITHUB_SHA` 中看到有效的完整 SHA 时才发出。所有未打 SHA 标记的构建一律为 `null`，且不做任何形式的运行时查找。**绝不**是 `CODEWHALE_BUILD_COMMIT`——那会回退到 `git_commit`，是构建者的私有 HEAD。**绝不**是 `Thread.git_sha`（`crates/state/src/lib.rs:93`）——那是用户工作区的提交，是一条红线，只隔一个名字。 |
-| `surface` | enum | 由发出批次的客户端明确设置 | `tui \| exec \| cli \| app-server \| mcp-server \| serve \| website \| web-app \| desktop \| control-plane`。运行时指标沿用其现有的采集器。浏览器产品计数使用同一个封闭信封。声明某个 surface 不代表其客户端已经部署。 |
+| `surface` | enum | 由发出批次的客户端明确设置 | `tui \| exec \| cli \| app-server \| mcp-server \| serve \| website \| web-app \| desktop \| control-plane \| vscode-extension`。运行时指标沿用其现有的采集器。浏览器产品计数使用同一个封闭信封。声明某个 surface 不代表其客户端已经部署。 |
 | `os` | enum | `std::env::consts::OS`，即 `crates/cli/src/update.rs:41` 处 | allowlist：`linux \| macos \| windows \| freebsd \| android \| other`。 |
 | `arch` | enum | `std::env::consts::ARCH` | `x86_64 \| aarch64 \| other`。 |
 | `libc` | enum | `cfg!(target_env)`——**编译期** | `gnu \| musl \| none`。运行时检测会读取发行版厂商字符串；编译期免费且不泄露任何内容。 |
@@ -115,6 +115,22 @@ Codewhale 没有恢复出厂设置命令，因此本文档也不会声称有。
 ### 哪些界面发送
 
 所有运行界面使用同一个 `decide` 与发送前复查：要求可读的隐私状态、可用的主目录、有效端点，并且没有持久退出或运行级终止开关；新用户缺少偏好时默认开启。TUI 提供告知和设置入口，无头命令不会代替用户记录同意。现有运行事件和计数器不变，不增加第二套采集器。
+
+### 嵌入方声明它启动的服务
+
+启动 `codewhale serve` 的客户端可以声明自己，使其会话不会被记成谁也不是的匿名 `serve` 流量。它在启动服务前把 `CODEWHALE_TELEMETRY_SURFACE` 设为 `surface` 白名单中的一个值；编辑器扩展使用 `vscode-extension`。
+
+该读取有三条刻意的约束：
+
+- **仅对 `serve` 生效。** 该变量会被后代进程继承，而 agent 执行 shell 命令时正是在用这套环境运行 `codewhale` 后代。只有"本身就是嵌入方那个服务"的分支会读取它，因此嵌套的 `codewhale exec` 不会把自己报成嵌入方——那既是错的，又看不出来。
+- **拒绝 `tui`**，而 `serve --mcp` 仍然报 `mcp-server`：没有人会替用户启动交互式终端界面，服务也不会因为嵌入方声明就变成 MCP 服务。
+- **无法识别的名称被丢弃，而不是被修正。** 白名单之外的值回退为 `serve`，既不导致启动失败，也不会被猜成一个相近的值；该字段只是一个标签，默认值才是诚实的那个。
+
+这改变的是嵌入方会话的**标签**，而不改变是否可以收集：服务自行从同一份持久配置、同一份 setup 状态和同一个运行级终止开关 `CODEWHALE_TELEMETRY` 解析该决定。嵌入方无法在用户已关闭时开启收集；由于共用同一主目录和同一个安装身份，在任一客户端做出的**持久**退出即对本机所有客户端的退出。
+
+扩展客户端是现成的例子：它只有一个开关，在用户关闭上报时传入 `CODEWHALE_TELEMETRY=0`。它自身没有载荷构造器、没有缓冲、也没有传输层——因此它的会话共用主目录的 `install_id`，而不是另建一个；一次安装在由该 ID 派生的任何计数里都是一个安装。
+
+由于该开关是运行级而非持久退出，关闭它只会停掉这个扩展启动的引擎，不会动共享的缓冲与身份：那些属于本机上的每一个界面，而不是某一个窗口；清除它们会静默改变用户终端会话的行为。若要在全机停止并清空上报，执行一次 `codewhale config set telemetry false` 即可。
 
 网站和应用使用 `product_usage`：告知版本 `5`，浏览器本地随机 v4 ID 每 90 天轮换；`os = other`、`arch = other`、`libc = none`、`tty = false`、`git_sha = null`，不读取浏览器指纹。同源代理仅向第一方采集端转发封闭 JSON，不转发入站 cookie、请求头、URL 或身份。未配置端点时不发送。浏览器退出统计会清除待发送计数和本地 ID；关闭期间的操作不会补发。产品使用统计设置放在应用和运行时；营销网站的隐私说明及退出入口放在隐私页面。
 

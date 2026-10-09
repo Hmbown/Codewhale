@@ -1,0 +1,217 @@
+{
+  "server_received": [
+    {
+      "arguments": {
+        "text": "hi"
+      },
+      "method": "tools/call",
+      "name": "echo"
+    },
+    {
+      "arguments": {},
+      "method": "tools/call",
+      "name": "fails"
+    },
+    {
+      "arguments": {},
+      "method": "tools/call",
+      "name": "rpc-error"
+    },
+    {
+      "arguments": {},
+      "method": "tools/call",
+      "name": "dies"
+    },
+    {
+      "arguments": {
+        "text": "after the child died"
+      },
+      "method": "tools/call",
+      "name": "echo"
+    }
+  ],
+  "steps": [
+    {
+      "op": "boot",
+      "outcome": "ok"
+    },
+    {
+      "op": "catalog",
+      "tools": [
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Exits after reading the call, without answering.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_dies"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Echo the text argument.",
+          "input_schema": {
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "name": "mcp_conformance_echo"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Always reports a tool-level error.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_fails"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_rpc-error"
+        }
+      ]
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": {
+            "content": [
+              {
+                "text": "echo from stdio",
+                "type": "text"
+              }
+            ]
+          },
+          "content_blocks": [],
+          "metadata": null,
+          "success": true
+        }
+      },
+      "tool": "mcp_conformance_echo"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": "the stdio fixture tool failed on purpose",
+          "content_blocks": [],
+          "metadata": null,
+          "success": false
+        }
+      },
+      "tool": "mcp_conformance_fails"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "err": {
+          "detail": "Failed to execute tool: MCP tool failed: MCP error in 'tools/call': {\n  \"code\": -32602,\n  \"message\": \"invalid params: stdio\"\n}",
+          "kind": "execution_failed"
+        }
+      },
+      "tool": "mcp_conformance_rpc-error"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "err": {
+          "detail": "Failed to execute tool: MCP tool failed: MCP server 'conformance' connection closed during tool call 'dies'; outcome unknown, not retried",
+          "kind": "execution_failed"
+        }
+      },
+      "tool": "mcp_conformance_dies"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": {
+            "content": [
+              {
+                "text": "echo from stdio",
+                "type": "text"
+              }
+            ]
+          },
+          "content_blocks": [],
+          "metadata": null,
+          "success": true
+        }
+      },
+      "tool": "mcp_conformance_echo"
+    },
+    {
+      "op": "catalog",
+      "tools": [
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Exits after reading the call, without answering.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_dies"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Echo the text argument.",
+          "input_schema": {
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "name": "mcp_conformance_echo"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Always reports a tool-level error.",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_fails"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_rpc-error"
+        }
+      ]
+    }
+  ]
+}

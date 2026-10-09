@@ -122,7 +122,7 @@ impl Default for DeployInputs {
             provider_slug: "deepseek".to_string(),
             region: String::new(),
             instance_name: "codewhale-remote".to_string(),
-            image: "ghcr.io/hmbown/codewhale:latest".to_string(),
+            image: "ghcr.io/codewhale-hq/codewhale:latest".to_string(),
         }
     }
 }

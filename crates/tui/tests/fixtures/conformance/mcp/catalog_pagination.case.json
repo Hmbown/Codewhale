@@ -1,0 +1,77 @@
+{
+  "description": "A paginated tools/list. Pins Rust McpConnection::discover_tools under McpCatalogBudget: pages are followed by nextCursor, a malformed tool entry is skipped without dropping its page, and the merged catalog is sorted by name regardless of server order.",
+  "server_name": "conformance",
+  "server": {
+    "initialize": {
+      "result": {
+        "protocolVersion": "2025-06-18",
+        "serverInfo": {
+          "name": "catalog-fixture",
+          "version": "1.0.0"
+        },
+        "capabilities": {
+          "tools": {}
+        }
+      }
+    },
+    "tools/list": [
+      {
+        "match": {
+          "cursor": "page-3"
+        },
+        "result": {
+          "tools": [
+            {
+              "name": "alpha",
+              "inputSchema": {
+                "type": "object"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "match": {
+          "cursor": "page-2"
+        },
+        "result": {
+          "tools": [
+            {
+              "description": "no name: malformed, skipped",
+              "inputSchema": {
+                "type": "object"
+              }
+            },
+            {
+              "name": "mid",
+              "description": "Second page.",
+              "inputSchema": {
+                "type": "object"
+              }
+            }
+          ],
+          "nextCursor": "page-3"
+        }
+      },
+      {
+        "result": {
+          "tools": [
+            {
+              "name": "zulu",
+              "description": "First page, listed first.",
+              "inputSchema": {
+                "type": "object"
+              }
+            }
+          ],
+          "nextCursor": "page-2"
+        }
+      }
+    ]
+  },
+  "steps": [
+    {
+      "op": "catalog"
+    }
+  ]
+}

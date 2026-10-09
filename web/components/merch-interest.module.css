@@ -1,0 +1,37 @@
+.interest { margin-block-start: var(--section-gap); padding-block: 2.5rem; border-block: 1px solid var(--line-strong); scroll-margin-top: 6rem; }
+.intro { max-width: 65ch; margin-block-end: 2rem; }
+.intro h2 { font-size: var(--text-section); margin-block-end: 1rem; }
+.intro > p { margin-block: .8rem; }
+.note { color: var(--muted); font-size: var(--text-ui); line-height: 1.6; max-width: 65ch; }
+.formBody, .products { border: 0; padding: 0; margin: 0; min-width: 0; }
+.formBody { display: grid; gap: 1.5rem; }
+.currency { display: grid; grid-template-columns: max-content minmax(9rem, 13rem); gap: .6rem 1rem; align-items: center; }
+.currency label, .field label, .products > legend { font-weight: 600; }
+.currency p { grid-column: 1 / -1; }
+.products > legend { font-size: var(--text-title); margin-block-end: .5rem; }
+.group { margin-block-start: 1.8rem; }
+.group h3 { font-size: var(--text-title); margin-block-end: .4rem; }
+.group > p { margin-block-end: .7rem; }
+.item { display: grid; grid-template-columns: minmax(0, 1fr) minmax(12rem, 20rem); gap: 1rem 2rem; align-items: center; border-block-end: 1px solid var(--line); padding-block: .8rem; }
+.choice, .consent { display: flex; gap: .8rem; align-items: flex-start; cursor: pointer; min-height: 48px; padding-block: .35rem; }
+.choice input, .consent input { flex: 0 0 auto; width: 1.2rem; height: 1.2rem; margin-block-start: .2rem; accent-color: var(--accent); }
+.detail { display: block; color: var(--muted); font-size: var(--text-ui); margin-block-start: .3rem; line-height: 1.5; }
+.budget { display: grid; gap: .4rem; min-width: 0; }
+.budget label { font-size: var(--text-ui); }
+.range { color: var(--muted); font-variant-numeric: tabular-nums; }
+.contact { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1rem; max-width: 52rem; margin-block-start: .5rem; }
+.field { display: grid; gap: .45rem; min-width: 0; align-content: start; }
+.interest select, .field input { min-width: 0; width: 100%; min-height: 48px; border: 1px solid var(--line-strong); border-radius: var(--radius-control); color: var(--text); background: var(--surface); padding: .7rem .85rem; font: inherit; caret-color: var(--accent); }
+.interest :is(input, select, button, a):focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; }
+.interest a { text-underline-offset: .2em; }
+.interest :global(.btn) { min-height: 48px; justify-self: start; white-space: normal; }
+.interest button:disabled { opacity: .65; cursor: not-allowed; }
+.formBody:disabled { opacity: .7; }
+.error { color: var(--danger); line-height: 1.6; margin-block-start: 1rem; }
+.notice { color: var(--muted); line-height: 1.6; }
+.confirmation { max-width: 65ch; display: grid; gap: 1rem; }
+.confirmation h3 { font-size: var(--text-title); }
+.trap, .srOnly { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+.interest ::selection { color: var(--on-brand); background: var(--accent); }
+@media (max-width: 700px) { .interest { margin-block-start: 3.5rem; } .item, .contact { grid-template-columns: 1fr; } .item { gap: .4rem; } .budget { margin-inline-start: 2rem; } .currency { grid-template-columns: 1fr; max-width: 20rem; } }
+@media (prefers-reduced-motion: reduce) { .interest * { transition-duration: 0s !important; } }

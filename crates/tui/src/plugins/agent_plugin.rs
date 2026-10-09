@@ -560,6 +560,7 @@ pub fn parse_kimi_plugin_json(text: &str, root: &Path) -> Result<PluginManifest,
         hooks: None,
         lsp: None,
         native: None,
+        providers: BTreeMap::new(),
         mcp_servers: (!mcp_servers.is_empty()).then_some(mcp_servers),
         capabilities: PluginCapabilities {
             network_hosts,
@@ -647,6 +648,8 @@ pub struct CodewhalePluginExtension {
     pub lsp: Option<PluginPathSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<PluginPathSpec>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, super::providers::PluginProviderDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<PluginCapabilities>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -664,6 +667,7 @@ impl CodewhalePluginExtension {
             && self.hooks.is_none()
             && self.lsp.is_none()
             && self.native.is_none()
+            && self.providers.is_empty()
             && self.capabilities.is_none()
             && self.when.is_none()
     }
@@ -943,6 +947,7 @@ pub fn standard_to_manifest(
         hooks: extension.hooks,
         lsp: extension.lsp,
         native: extension.native,
+        providers: extension.providers,
         mcp_servers,
         capabilities: extension.capabilities.unwrap_or_default(),
         when: extension.when,
@@ -1031,6 +1036,7 @@ pub fn manifest_to_standard(
         hooks: manifest.hooks.clone(),
         lsp: manifest.lsp.clone(),
         native: manifest.native.clone(),
+        providers: manifest.providers.clone(),
         capabilities: (!capabilities_are_default(&manifest.capabilities))
             .then(|| manifest.capabilities.clone()),
         when: manifest.when.clone(),

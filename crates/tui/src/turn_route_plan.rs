@@ -18,11 +18,9 @@
 //! later routing.
 
 use crate::compaction::CompactionConfig;
-use crate::config::{ApiProvider, Config, ProviderIdentity};
+use crate::config::{Config, ProviderIdentity, ProviderKind};
 use crate::reasoning_preference::ReasoningEffort;
-use crate::route_runtime::{
-    ResolvedRuntimeRoute, resolve_runtime_route, resolve_runtime_route_for_identity,
-};
+use crate::route_runtime::{ResolvedRuntimeRoute, resolve_runtime_route_for_identity};
 use codewhale_config::AppMode;
 
 /// Everything the shared turn-route planner needs.
@@ -33,7 +31,7 @@ use codewhale_config::AppMode;
 pub(crate) struct TurnRoutePlanRequest<'a> {
     pub(crate) route_config: &'a Config,
     pub(crate) app_route_identity: &'a ProviderIdentity,
-    pub(crate) api_provider: ApiProvider,
+    pub(crate) api_provider: ProviderKind,
     pub(crate) app_model: &'a str,
     pub(crate) auto_model: bool,
     pub(crate) reasoning_effort: ReasoningEffort,
@@ -57,7 +55,7 @@ pub(crate) struct TurnRoutePlanRequest<'a> {
 pub(crate) struct PlannedTurnRoute {
     pub(crate) route: ResolvedRuntimeRoute,
     pub(crate) compaction: CompactionConfig,
-    pub(crate) effective_provider: ApiProvider,
+    pub(crate) effective_provider: ProviderKind,
     pub(crate) effective_model: String,
     pub(crate) effective_provider_identity: String,
     pub(crate) effective_provider_label: String,
@@ -102,7 +100,7 @@ impl TurnRoutingSource {
 
 fn reasoning_effort_for_route_selection(
     auto_model: bool,
-    provider: ApiProvider,
+    provider: ProviderKind,
     effort: ReasoningEffort,
 ) -> &'static str {
     if auto_model {
@@ -167,23 +165,6 @@ pub(crate) async fn plan_turn_route(
         None
     };
 
-    let effective_provider = auto_selection
-        .as_ref()
-        .map(|selection| selection.provider)
-        .unwrap_or(request.api_provider);
-
-    // Without an Auto selection there is no per-request signal, so the
-    // route is the configured model — the same declared default the local
-    // fallback uses. Request wording is never inspected (#6290 rework).
-    let effective_model = if request.auto_model {
-        auto_selection
-            .as_ref()
-            .map(|selection| selection.model.clone())
-            .unwrap_or_else(|| request.app_model.to_string())
-    } else {
-        request.app_model.to_string()
-    };
-
     // Move classifier accounting out immediately. Every later parent-route
     // failure must settle this already-incurred auxiliary call instead of
     // returning an error that silently drops its exact quote/usage.
@@ -197,19 +178,28 @@ pub(crate) async fn plan_turn_route(
         })
         .unwrap_or_default();
 
-    let turn_route = if effective_provider == request.app_route_identity.provider {
-        resolve_runtime_route_for_identity(
-            request.route_config,
-            request.app_route_identity,
-            Some(&effective_model),
-        )
+    let selected_identity = auto_selection
+        .as_ref()
+        .map_or(request.app_route_identity, |selection| &selection.provider);
+    let effective_provider = selected_identity.provider;
+
+    // Without an Auto selection there is no per-request signal, so the
+    // route is the configured model — the same declared default the local
+    // fallback uses. Request wording is never inspected (#6290 rework).
+    let effective_model = if request.auto_model {
+        auto_selection
+            .as_ref()
+            .map(|selection| selection.model.clone())
+            .unwrap_or_else(|| request.app_model.to_string())
     } else {
-        resolve_runtime_route(
-            request.route_config,
-            effective_provider,
-            Some(&effective_model),
-        )
+        request.app_model.to_string()
     };
+
+    let turn_route = resolve_runtime_route_for_identity(
+        request.route_config,
+        selected_identity,
+        Some(&effective_model),
+    );
 
     let turn_route = match turn_route {
         Ok(route) => route,
@@ -237,11 +227,15 @@ pub(crate) async fn plan_turn_route(
     };
 
     let turn_route_limits = crate::route_budget::known_route_limits(turn_route.candidate.limits());
-    let effective_provider_identity = turn_route.identity.key.clone();
-    let effective_provider_label = if effective_provider == ApiProvider::Custom {
+    let effective_provider_identity = turn_route.identity.key.to_string();
+    let effective_provider_label = if effective_provider == ProviderKind::Custom {
         effective_provider_identity.clone()
     } else {
-        effective_provider.display_name().to_string()
+        turn_route
+            .identity
+            .compatibility()
+            .map_or(effective_provider.as_str(), |row| row.label)
+            .to_string()
     };
 
     let turn_compaction = CompactionConfig {
@@ -329,12 +323,9 @@ mod tests {
     use crate::config::DEFAULT_TEXT_MODEL;
 
     fn deepseek_identity() -> ProviderIdentity {
-        ProviderIdentity {
-            provider: ApiProvider::Deepseek,
-            key: ApiProvider::Deepseek.as_str().to_string(),
-            exact_id: None,
-            migrated_legacy_ollama_cloud_route: false,
-        }
+        crate::config::Config::default()
+            .builtin_provider_identity(ProviderKind::Deepseek)
+            .unwrap()
     }
 
     #[test]
@@ -342,10 +333,10 @@ mod tests {
         let _cost_scope = crate::cost_status::test_scope();
         let route = crate::cost_status::EffectiveRouteEnvelope::capture(
             None,
-            ApiProvider::Deepseek,
+            ProviderKind::Deepseek,
             "deepseek",
             "classifier-model",
-            Some(ApiProvider::Deepseek.default_base_url()),
+            Some(ProviderKind::Deepseek.provider().default_base_url()),
             chrono::Utc::now(),
         );
         let batch = crate::cost_status::RuntimeUsageBatch {
@@ -362,6 +353,7 @@ mod tests {
                 },
             }],
             drop_records: vec![crate::cost_status::RuntimeUsageDropRecord {
+                reason: crate::cost_status::RuntimeUsageMissingReason::default(),
                 source_id: "auto-router:plan-drop".to_string(),
                 route,
             }],
@@ -413,7 +405,7 @@ mod tests {
         assert_eq!(
             reasoning_effort_for_route_selection(
                 true,
-                ApiProvider::OpenaiCodex,
+                ProviderKind::OpenaiCodex,
                 ReasoningEffort::Off,
             ),
             "off"
@@ -421,7 +413,7 @@ mod tests {
         assert_eq!(
             reasoning_effort_for_route_selection(
                 false,
-                ApiProvider::OpenaiCodex,
+                ProviderKind::OpenaiCodex,
                 ReasoningEffort::Off,
             ),
             "low"
@@ -436,7 +428,7 @@ mod tests {
         let planned = plan_turn_route(TurnRoutePlanRequest {
             route_config: &config,
             app_route_identity: &identity,
-            api_provider: ApiProvider::Deepseek,
+            api_provider: ProviderKind::Deepseek,
             app_model: DEFAULT_TEXT_MODEL,
             auto_model: true,
             reasoning_effort: ReasoningEffort::Low,

@@ -81,6 +81,11 @@ pub enum WorkGraphChange {
     RecordActivity {
         event: WorkActivityEvent,
     },
+    /// Evict the oldest ended, non-durable Operation nodes beyond `keep`
+    /// (#6842). See `reducer::prune_ended_operations` for eligibility.
+    PruneEndedOperations {
+        keep: usize,
+    },
 }
 
 impl WorkGraphChange {
@@ -103,6 +108,7 @@ impl WorkGraphChange {
             WorkGraphChange::ReplaceCompatProjection { .. } => "replace_compat_projection",
             WorkGraphChange::SetImportDigest { .. } => "set_import_digest",
             WorkGraphChange::RecordActivity { .. } => "record_activity",
+            WorkGraphChange::PruneEndedOperations { .. } => "prune_ended_operations",
         }
     }
 }

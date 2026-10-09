@@ -2,7 +2,7 @@
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
 #[cfg(test)]
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::tui::app::{App, AppAction};
 use codewhale_localization::MessageId;
 
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(
             result.action,
             Some(AppAction::OpenProviderSetup {
-                provider: Some(ApiProvider::Anthropic)
+                provider: Some(ProviderKind::Anthropic.as_str().into())
             })
         );
         assert!(result.message.is_none());

@@ -12,6 +12,37 @@ pub(crate) fn path_is_confined(path: &Path) -> bool {
         })
 }
 
+/// Refuse `path` when any existing component below `root` is a link. The
+/// walk stops at the first component that does not exist yet, so a path that
+/// is about to be created through a real directory chain passes. This is a
+/// lexical check made before the use; prefer [`WorkspaceFile`] where the
+/// caller can open through it, and use this for paths a library call (a
+/// directory listing, a removal) takes by name.
+pub(crate) fn reject_linked_path(root: &Path, path: &Path) -> io::Result<()> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} must stay within {}", path.display(), root.display()),
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if crate::plugins::metadata_is_link_or_reparse(&metadata) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Refusing symlinked path {}", current.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 fn invalid_path() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -35,14 +66,19 @@ impl WorkspaceFile {
     /// Private store entry: created files are 0600, created parents 0700, and
     /// every replacement is owner-only again.
     pub(crate) fn open(workspace: &Path, relative: &Path, create: bool) -> io::Result<Self> {
-        Self::open_confined(workspace, relative, create, false)
+        Self::open_confined(workspace, relative, create, false, true)
     }
 
     /// A user's workspace file, edited in place: created entries follow the
     /// umask and replacement preserves the file's permission bits (an
     /// executable script stays executable). Confinement is unchanged.
     pub(crate) fn open_shared(workspace: &Path, relative: &Path, create: bool) -> io::Result<Self> {
-        Self::open_confined(workspace, relative, create, true)
+        Self::open_confined(workspace, relative, create, true, true)
+    }
+
+    /// An already captured absolute root: reject later root/ancestor links.
+    pub(crate) fn open_delivery(workspace: &Path, relative: &Path) -> io::Result<Self> {
+        Self::open_confined(workspace, relative, false, false, false)
     }
 
     fn open_confined(
@@ -50,13 +86,21 @@ impl WorkspaceFile {
         relative: &Path,
         create: bool,
         shared: bool,
+        resolve_root: bool,
     ) -> io::Result<Self> {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
         if !path_is_confined(relative) {
             return Err(invalid_path());
         }
-        let workspace = workspace.canonicalize()?;
+        let workspace = if resolve_root {
+            workspace.canonicalize()?
+        } else {
+            if !workspace.is_absolute() {
+                return Err(invalid_path());
+            }
+            workspace.to_path_buf()
+        };
         // Use the established credential/artifact openat pattern, without
         // touching credentials or creating a second filesystem store.
         // SAFETY: static path and immediate ownership of a successful fd.
@@ -141,6 +185,12 @@ impl WorkspaceFile {
         self.open_with_flags(libc::O_RDONLY)
     }
 
+    /// Reads a file another process may hold open for writing. Unix opens do
+    /// not exclude writers, so this is [`Self::open_file`].
+    pub(crate) fn open_file_shared(&self) -> io::Result<File> {
+        self.open_file()
+    }
+
     pub(crate) fn open_write(&self, append: bool) -> io::Result<File> {
         self.open_with_flags(
             libc::O_WRONLY | libc::O_CREAT | if append { libc::O_APPEND } else { 0 },
@@ -150,18 +200,34 @@ impl WorkspaceFile {
     fn open_with_flags(&self, flags: libc::c_int) -> io::Result<File> {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::fs::MetadataExt;
-        // SAFETY: a pinned parent and validated basename; never follows links.
-        let fd = unsafe {
-            libc::openat(
-                self.directory.as_raw_fd(),
-                self.filename.as_ptr(),
-                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-                self.create_mode(),
-            )
+        // macOS can fail an `openat(O_CREAT)` with ENOENT while another thread
+        // is creating the same name through the same pinned directory, even
+        // though the parent exists. The loser of that race only has to ask
+        // again: the file is there by then. The retry is bounded and applies
+        // only when creating, so a vanished parent still fails.
+        let mut attempts = 0;
+        let fd = loop {
+            // SAFETY: a pinned parent and validated basename; never follows links.
+            let fd = unsafe {
+                libc::openat(
+                    self.directory.as_raw_fd(),
+                    self.filename.as_ptr(),
+                    flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                    self.create_mode(),
+                )
+            };
+            if fd >= 0 {
+                break fd;
+            }
+            let error = io::Error::last_os_error();
+            attempts += 1;
+            if flags & libc::O_CREAT != 0 && error.kind() == io::ErrorKind::NotFound && attempts < 4
+            {
+                std::thread::yield_now();
+                continue;
+            }
+            return Err(error);
         };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
         // SAFETY: fd is freshly owned.
         let file = unsafe { File::from_raw_fd(fd) };
         let metadata = file.metadata()?;
@@ -183,6 +249,19 @@ impl WorkspaceFile {
     }
 
     fn atomic_write(&self, bytes: &[u8], replace: bool) -> io::Result<()> {
+        self.atomic_write_retained(bytes, replace, None).map(drop)
+    }
+
+    pub(crate) fn publish_retained(&self, bytes: &[u8], executable: bool) -> io::Result<File> {
+        self.atomic_write_retained(bytes, false, Some(if executable { 0o755 } else { 0o644 }))
+    }
+
+    fn atomic_write_retained(
+        &self,
+        bytes: &[u8],
+        replace: bool,
+        mode: Option<u32>,
+    ) -> io::Result<File> {
         use std::os::fd::{AsRawFd, FromRawFd};
         let temporary =
             std::ffi::CString::new(format!(".fleet-write-{}.tmp", uuid::Uuid::new_v4()))
@@ -192,7 +271,7 @@ impl WorkspaceFile {
             libc::openat(
                 self.directory.as_raw_fd(),
                 temporary.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 self.create_mode(),
             )
         };
@@ -204,6 +283,10 @@ impl WorkspaceFile {
         let result = (|| {
             if self.shared && replace {
                 self.copy_permissions_to(&file)?;
+            }
+            if let Some(mode) = mode {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(mode))?;
             }
             file.write_all(bytes)?;
             file.sync_all()?;
@@ -245,6 +328,43 @@ impl WorkspaceFile {
             }
         }
         result?;
+        self.directory.sync_all()?;
+        Ok(file)
+    }
+
+    pub(crate) fn open_retained(&self) -> io::Result<File> {
+        self.open_file()
+    }
+
+    pub(crate) fn identity_probe(&self) -> io::Result<File> {
+        self.open_file()
+    }
+
+    pub(crate) fn move_opened_to_sibling(
+        &self,
+        _file: &File,
+        destination: &Self,
+    ) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        if !same_file(&self.directory, &destination.directory)? {
+            return Err(invalid_path());
+        }
+        // Retirement must be one no-clobber rename. The link/unlink fallback
+        // used by immutable publication is not a conditional move of an old entry.
+        if !rename_exclusive(
+            self.directory.as_raw_fd(),
+            &self.filename,
+            &destination.filename,
+        )? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "exclusive retirement is unavailable",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn sync_parent(&self) -> io::Result<()> {
         self.directory.sync_all()
     }
 }
@@ -350,12 +470,122 @@ fn exclusive_rename_outcome(renamed: bool) -> io::Result<bool> {
     Ok(false)
 }
 
+/// Windows path fence shared by Fleet publication and Native sandbox ACL
+/// admission. Every original absolute ancestor is opened without delete/write
+/// sharing and without following reparse points before path-based calls.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub(crate) struct WindowsDirectory {
+    ancestors: Vec<std::sync::Arc<File>>,
+    directory: std::path::PathBuf,
+}
+
+#[cfg(windows)]
+impl WindowsDirectory {
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        Self::open_inner(path, false, false)
+    }
+
+    fn open_inner(path: &Path, create: bool, acl_target: bool) -> io::Result<Self> {
+        if !path.is_absolute() {
+            return Err(invalid_path());
+        }
+        let mut directory = std::path::PathBuf::new();
+        let mut ancestors = Vec::new();
+        let count = path.components().count();
+        for (index, component) in path.components().enumerate() {
+            if matches!(component, Component::ParentDir | Component::CurDir) {
+                return Err(invalid_path());
+            }
+            directory.push(component.as_os_str());
+            if matches!(component, Component::Prefix(_)) {
+                continue;
+            }
+            let open = || Self::open_component(&directory, acl_target && index + 1 == count);
+            let file = match open() {
+                Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
+                    match std::fs::create_dir(&directory) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(error) => return Err(error),
+                    }
+                    open()?
+                }
+                result => result?,
+            };
+            ancestors.push(file);
+        }
+        Ok(Self {
+            ancestors,
+            directory,
+        })
+    }
+
+    fn open_component(path: &Path, acl_target: bool) -> io::Result<std::sync::Arc<File>> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).share_mode(1).custom_flags(0x0220_0000);
+        if acl_target {
+            // The Native ACL writer uses SetKernelObjectSecurity, which never
+            // propagates to descendants; each child is fenced and granted
+            // explicitly. So the target needs only READ_CONTROL|WRITE_DAC plus a
+            // read right that records share access: read-only sharing still
+            // blocks rename, delete and data writes while it is edited. Unlike
+            // MAXIMUM_ALLOWED, which includes DELETE, it does not collide with a
+            // live host whose current directory is this directory.
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC,
+            };
+            options
+                .access_mode(READ_CONTROL | WRITE_DAC | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES);
+        }
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_dir() || crate::plugins::metadata_is_link_or_reparse(&metadata) {
+            return Err(invalid_path());
+        }
+        Ok(std::sync::Arc::new(file))
+    }
+
+    pub(crate) fn child_path(&self, name: &std::ffi::OsStr) -> io::Result<std::path::PathBuf> {
+        let name = Path::new(name);
+        if !path_is_confined(name) || name.components().count() != 1 {
+            return Err(invalid_path());
+        }
+        Ok(self.directory.join(name))
+    }
+
+    /// Extend the actual held direct-parent chain instead of reopening pinned
+    /// ancestors by path.
+    pub(crate) fn open_acl_child(&self, name: &std::ffi::OsStr) -> io::Result<Self> {
+        let directory = self.child_path(name)?;
+        let file = Self::open_component(&directory, true)?;
+        let mut ancestors = self.ancestors.clone();
+        ancestors.push(file);
+        Ok(Self {
+            ancestors,
+            directory,
+        })
+    }
+
+    pub(crate) fn open_acl(path: &Path) -> io::Result<Self> {
+        Self::open_inner(path, false, true)
+    }
+
+    pub(crate) fn acl_handle(&self) -> io::Result<&File> {
+        self.ancestors
+            .last()
+            .map(std::sync::Arc::as_ref)
+            .ok_or_else(invalid_path)
+    }
+}
+
 #[cfg(windows)]
 #[derive(Debug)]
 pub(crate) struct WorkspaceFile {
     // Retaining every ancestor without delete/write sharing prevents a path
     // swap or junction replacement while path-based Windows calls are running.
-    _ancestors: Vec<File>,
+    _ancestors: Vec<std::sync::Arc<File>>,
     directory: std::path::PathBuf,
     filename: std::ffi::OsString,
 }
@@ -363,52 +593,31 @@ pub(crate) struct WorkspaceFile {
 #[cfg(windows)]
 impl WorkspaceFile {
     pub(crate) fn open(workspace: &Path, relative: &Path, create: bool) -> io::Result<Self> {
-        use std::os::windows::fs::OpenOptionsExt;
         if !path_is_confined(relative) {
             return Err(invalid_path());
         }
-        let workspace = workspace.canonicalize()?;
-        let mut ancestors = Vec::new();
-        let mut directory = std::path::PathBuf::new();
-        for (path, may_create) in [
-            (workspace.as_path(), false),
-            (relative.parent().ok_or_else(invalid_path)?, create),
-        ] {
-            for component in path.components() {
-                directory.push(component.as_os_str());
-                if matches!(component, Component::Prefix(_)) {
-                    continue;
-                }
-                let open = || {
-                    std::fs::OpenOptions::new()
-                        .read(true)
-                        .share_mode(0x0000_0001)
-                        .custom_flags(0x0220_0000)
-                        .open(&directory)
-                }; // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
-                let file = match open() {
-                    Err(error) if may_create && error.kind() == io::ErrorKind::NotFound => {
-                        match std::fs::create_dir(&directory) {
-                            Ok(()) => {}
-                            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                            Err(error) => return Err(error),
-                        }
-                        open()?
-                    }
-                    result => result?,
-                };
-                let metadata = file.metadata()?;
-                if !metadata.is_dir() || crate::plugins::metadata_is_link_or_reparse(&metadata) {
-                    return Err(invalid_path());
-                }
-                ancestors.push(file);
-            }
-        }
+        // Preserve the original spelling until links/reparse points have been
+        // refused. Canonicalization must not turn a linked root into authority.
+        let workspace = if workspace.is_absolute() {
+            workspace.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(workspace)
+        };
+        let root = WindowsDirectory::open(&workspace)?;
+        let target = workspace.join(relative.parent().ok_or_else(invalid_path)?);
+        let mut pinned = WindowsDirectory::open_inner(&target, create, false)?;
+        pinned.ancestors.extend(root.ancestors);
+        let ancestors = pinned.ancestors;
+        let directory = pinned.directory;
         Ok(Self {
             _ancestors: ancestors,
             directory,
             filename: relative.file_name().ok_or_else(invalid_path)?.to_owned(),
         })
+    }
+
+    pub(crate) fn open_delivery(workspace: &Path, relative: &Path) -> io::Result<Self> {
+        Self::open(workspace, relative, false)
     }
 
     /// Windows has no Unix permission bits to preserve; see the Unix opener.
@@ -421,29 +630,40 @@ impl WorkspaceFile {
             return Err(invalid_path());
         }
         Ok(Self {
-            _ancestors: self
-                ._ancestors
-                .iter()
-                .map(File::try_clone)
-                .collect::<io::Result<_>>()?,
+            _ancestors: self._ancestors.clone(),
             directory: self.directory.clone(),
             filename: name.into(),
         })
     }
 
     pub(crate) fn open_update(&self, create: bool, append: bool) -> io::Result<File> {
-        self.open_with_access(create, append, true)
+        self.open_with_access(create, append, true, true)
     }
 
     pub(crate) fn open_write(&self, append: bool) -> io::Result<File> {
-        self.open_with_access(true, append, false)
+        self.open_with_access(true, append, false, true)
     }
 
-    fn open_with_access(&self, create: bool, append: bool, read: bool) -> io::Result<File> {
+    /// Reads a file another process may hold open for writing (a running
+    /// worker's log). [`Self::open_file`] denies concurrent writers, so it
+    /// fails with a sharing violation while the writer is alive; this opens
+    /// read-only with full sharing and applies the same regular, unlinked
+    /// checks to the handle.
+    pub(crate) fn open_file_shared(&self) -> io::Result<File> {
+        self.open_with_access(false, false, true, false)
+    }
+
+    fn open_with_access(
+        &self,
+        create: bool,
+        append: bool,
+        read: bool,
+        write: bool,
+    ) -> io::Result<File> {
         use std::os::windows::fs::OpenOptionsExt;
         let file = std::fs::OpenOptions::new()
             .read(read)
-            .write(true)
+            .write(write)
             .append(append)
             .create(create)
             .truncate(false)
@@ -478,18 +698,42 @@ impl WorkspaceFile {
     }
 
     fn atomic_write(&self, bytes: &[u8], replace: bool) -> io::Result<()> {
-        use std::mem::{offset_of, size_of};
-        use std::os::windows::ffi::OsStrExt;
+        self.atomic_write_retained(bytes, replace).map(drop)
+    }
+
+    pub(crate) fn publish_retained(&self, bytes: &[u8], _executable: bool) -> io::Result<File> {
+        self.atomic_write_retained(bytes, false)
+    }
+
+    pub(crate) fn open_retained(&self) -> io::Result<File> {
+        crate::plugins::manifest::open_bundle_file_for_retirement(
+            &self.directory.join(&self.filename),
+        )
+    }
+
+    pub(crate) fn identity_probe(&self) -> io::Result<File> {
+        crate::plugins::manifest::open_bundle_identity_probe(
+            &self.directory.join(&self.filename),
+            false,
+        )
+    }
+
+    pub(crate) fn move_opened_to_sibling(&self, file: &File, destination: &Self) -> io::Result<()> {
+        if self.directory != destination.directory {
+            return Err(invalid_path());
+        }
+        rename_windows_opened(file, &destination.filename, false)
+    }
+
+    pub(crate) fn sync_parent(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn atomic_write_retained(&self, bytes: &[u8], replace: bool) -> io::Result<File> {
         use std::os::windows::fs::OpenOptionsExt;
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Wdk::Storage::FileSystem::{
-            FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
-        };
-        use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
         use windows_sys::Win32::Storage::FileSystem::{
             DELETE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
         };
-        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
         let mut temporary =
             tempfile::Builder::new()
@@ -506,63 +750,14 @@ impl WorkspaceFile {
             temporary.write_all(bytes)?;
             temporary.as_file().sync_all()?;
 
-            // MoveFileExW (including tempfile::persist) reopens the destination
-            // directory with FILE_ADD_FILE, conflicting with our ancestor pins.
-            // A native rename with no root handle and a single basename uses
-            // the source file's existing parent instead. Keep all ancestor and
-            // source handles pinned; never relax their write/delete guards.
-            // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
-            let name = self.filename.encode_wide().collect::<Vec<_>>();
-            let name_bytes = name.len() * size_of::<u16>();
-            let buffer_size = (offset_of!(FILE_RENAME_INFORMATION, FileName) + name_bytes)
-                .max(size_of::<FILE_RENAME_INFORMATION>());
-            let mut buffer = vec![0_usize; buffer_size.div_ceil(size_of::<usize>())];
-            let rename = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
-            // SAFETY: the zeroed buffer is aligned and covers the struct plus
-            // the complete UTF-16 basename; no root means the source's parent.
-            unsafe {
-                (*rename).Anonymous.ReplaceIfExists = replace;
-                (*rename).FileNameLength = name_bytes as u32;
-                std::ptr::copy_nonoverlapping(
-                    name.as_ptr(),
-                    (*rename).FileName.as_mut_ptr(),
-                    name.len(),
-                );
-            }
-            let mut attempt = 0;
-            loop {
-                let mut status = IO_STATUS_BLOCK::default();
-                // SAFETY: this synchronously opened file has DELETE access;
-                // every handle and buffer remains live throughout the call.
-                let result = unsafe {
-                    NtSetInformationFile(
-                        temporary.as_file().as_raw_handle(),
-                        &mut status,
-                        rename.cast(),
-                        buffer_size as u32,
-                        FileRenameInformation,
-                    )
-                };
-                if result >= 0 {
-                    return Ok(());
-                }
-                // SAFETY: converts the returned NTSTATUS without dereferencing.
-                let error =
-                    io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(result) as i32 });
-                let Some(backoff) = crate::utils::windows_publish_retry_delay(&error, attempt)
-                else {
-                    return Err(error);
-                };
-                std::thread::sleep(backoff);
-                attempt += 1;
-            }
+            rename_windows_opened(temporary.as_file(), &self.filename, replace)
         })();
         match result {
             Ok(()) => {
                 // The old name is vacant after the rename; do not unlink an
                 // entry another process might create there afterwards.
                 temporary.disable_cleanup(true);
-                Ok(())
+                Ok(temporary.into_file())
             }
             Err(error) => {
                 // Close the source's delete-denying handle before cleanup.
@@ -573,10 +768,97 @@ impl WorkspaceFile {
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn rename_windows_opened(
+    file: &File,
+    filename: &std::ffi::OsStr,
+    replace: bool,
+) -> io::Result<()> {
+    use std::mem::{offset_of, size_of};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
+    };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    // MoveFileExW (including tempfile::persist) reopens the destination
+    // directory with FILE_ADD_FILE, conflicting with our ancestor pins.
+    // A native rename with no root handle and a single basename uses
+    // the source file's existing parent instead. Keep all ancestor and
+    // source handles pinned; never relax their write/delete guards.
+    // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
+    let name = filename.encode_wide().collect::<Vec<_>>();
+    let name_bytes = name.len() * size_of::<u16>();
+    let buffer_size = (offset_of!(FILE_RENAME_INFORMATION, FileName) + name_bytes)
+        .max(size_of::<FILE_RENAME_INFORMATION>());
+    let mut buffer = vec![0_usize; buffer_size.div_ceil(size_of::<usize>())];
+    let rename = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // SAFETY: the zeroed buffer is aligned and covers the struct plus
+    // the complete UTF-16 basename; no root means the source's parent.
+    unsafe {
+        (*rename).Anonymous.ReplaceIfExists = replace;
+        (*rename).FileNameLength = name_bytes as u32;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), (*rename).FileName.as_mut_ptr(), name.len());
+    }
+    let mut attempt = 0;
+    loop {
+        let mut status = IO_STATUS_BLOCK::default();
+        // SAFETY: this synchronously opened file has DELETE access;
+        // every handle and buffer remains live throughout the call.
+        let result = unsafe {
+            NtSetInformationFile(
+                file.as_raw_handle(),
+                &mut status,
+                rename.cast(),
+                buffer_size as u32,
+                FileRenameInformation,
+            )
+        };
+        if result >= 0 {
+            return Ok(());
+        }
+        // SAFETY: converts the returned NTSTATUS without dereferencing.
+        let error = io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(result) as i32 });
+        let Some(backoff) = crate::utils::windows_publish_retry_delay(&error, attempt) else {
+            return Err(error);
+        };
+        std::thread::sleep(backoff);
+        attempt += 1;
+    }
+}
+
 #[cfg(all(test, unix))]
 mod unix_publication_tests {
     use super::*;
     use std::io::Read;
+
+    /// Several threads creating one new name through their own pinned handles
+    /// must all succeed. macOS can fail the losers of that race with ENOENT
+    /// unless the open asks again.
+    #[test]
+    fn racing_creates_of_one_name_all_succeed() {
+        let workspace = tempfile::tempdir().unwrap();
+        for round in 0..40 {
+            let relative = std::path::PathBuf::from(format!("locks-{round}/manager.lock"));
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..4)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            WorkspaceFile::open(workspace.path(), &relative, true)
+                                .and_then(|file| file.open_update(true, false))
+                        })
+                    })
+                    .collect();
+                for worker in workers {
+                    worker
+                        .join()
+                        .unwrap()
+                        .expect("every racing create succeeds");
+                }
+            });
+        }
+    }
 
     #[test]
     fn a_racing_reader_never_sees_a_publication_half_done() {
@@ -814,8 +1096,29 @@ impl WorkspaceFile {
     pub(crate) fn open_file(&self) -> io::Result<File> {
         unreachable!()
     }
+    pub(crate) fn open_file_shared(&self) -> io::Result<File> {
+        unreachable!()
+    }
     pub(crate) fn publish(&self, _: &[u8]) -> io::Result<()> {
         unreachable!()
+    }
+    pub(crate) fn open_delivery(workspace: &Path, relative: &Path) -> io::Result<Self> {
+        Self::open(workspace, relative, false)
+    }
+    pub(crate) fn open_retained(&self) -> io::Result<File> {
+        self.open_file()
+    }
+    pub(crate) fn identity_probe(&self) -> io::Result<File> {
+        self.open_file()
+    }
+    pub(crate) fn publish_retained(&self, _: &[u8], _: bool) -> io::Result<File> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    pub(crate) fn move_opened_to_sibling(&self, _: &File, _: &Self) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    pub(crate) fn sync_parent(&self) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
     }
 }
 

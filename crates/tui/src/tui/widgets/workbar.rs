@@ -1,83 +1,37 @@
-//! The workbar: live workflow progress under the composer.
+//! Engine facts and localization for the shared terminal kit's workflow rows.
 //!
-//! The transcript carries one line per run — `started` while it runs, replaced
-//! by its finish line when it settles (`history.rs`, `App::announce_settled_workflows`);
-//! everything in between lives here, one row per run between the posture bar
-//! and the metrics line. The workbar draws no rules of its own: it is footer
-//! chrome like the rows around it, and a rule above and below it stacked with
-//! the work surface's divider into a ladder of separators.
-//!
-//! ```text
-//!  • Compare Cline with Codewhale  ████████××░░░░░░░░░░  4/10 done · 1 failed  2m 14s  ↓1.2M
-//!  ✕ Release-readiness audit       ××××××××××××××××××××  0/2 done · 2 failed  355ms  Authorization failed: …
-//! ```
-//!
-//! Row grammar: state mark · short title · 20-cell bar · outcome counts ·
-//! elapsed · ↓tokens · tail. The bar paints succeeded agents `█` and failed
-//! agents `×` in their own inks, so a run whose agents all failed never reads
-//! as a finished bar. The counts say what succeeded, never what merely
-//! settled. The tail is only ever true: `Large workflow` past
-//! [`LARGE_WORKFLOW_AGENTS`], `· N queued` when the runtime reports follow-ups
-//! waiting on a busy agent of this run, and for a run that fell short, the one
-//! reason worth reading — the first sentence, cut only at a word boundary.
-//!
-//! Every state reads without colour (a distinct mark, a distinct bar glyph,
-//! and a word for anything that needs you). Nothing animates, so reduced
-//! motion needs no second path; ASCII-safe terminals get the backend's
-//! per-cell fallbacks (`#`, `X`, `:`).
+//! The kit replaces the former RowCells, column fitter, bar partition and
+//! clipping renderer. WorkflowPanel remains the Engine's lifecycle authority;
+//! this adapter passes its reported facts into WorkflowProgress. The existing
+//! backend still owns terminal capabilities and custom palette adaptation.
 
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
+use std::time::Duration;
 
-use crate::tui::ui_text::{semantic_truncate, truncate_line_to_width};
-use crate::tui::widgets::workflow_panel::{WorkflowPanel, WorkflowPanelLifecycle};
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette::UiTheme;
+use codewhale_ratatui::{
+    Caps, Role, Theme, TuiInk, TuiPalette, WorkflowProgress, WorkflowProgressWords, WorkflowRun,
+    WorkflowRunState, color::ColorDepth, detect::Appearance,
+};
+use ratatui::text::Line;
 
-/// Cells in one progress bar.
-pub(crate) const BAR_CELLS: usize = 20;
-/// Agents a run must have admitted before the workbar calls it large. At this
-/// size a run is no longer something to watch row by row, and its token use
-/// is the thing worth a glance.
-pub(crate) const LARGE_WORKFLOW_AGENTS: usize = 25;
-/// Most run rows painted at once; the rest fold into one `+N more` row.
-pub(crate) const MAX_RUN_ROWS: usize = 6;
-/// The name column never shrinks below this before other columns go.
-const MIN_NAME_COLS: usize = 12;
-/// Nor grows past this: a long goal must not push the facts off the row.
-const MAX_NAME_COLS: usize = 40;
-/// Columns kept for the tail before the name takes the rest of the row.
-const TAIL_RESERVE_COLS: usize = 24;
-/// A reason squeezed below this many columns says nothing; it is left out.
-const MIN_REASON_COLS: usize = 12;
-/// Below this width the bar gives its columns to the name.
-const BAR_MIN_WIDTH: usize = 72;
-const GAP: &str = "  ";
-const DONE_CELL: &str = "█";
-const FAILED_CELL: &str = "×";
-const OPEN_CELL: &str = "░";
+use crate::tui::widgets::workflow_panel::{WorkflowPanel, WorkflowPanelLifecycle};
 
-/// One run as the workbar paints it: the run's own state plus the runtime's
-/// count of follow-ups waiting on its busy agents.
+#[cfg(test)]
+const LARGE_WORKFLOW_AGENTS: usize = 25;
+#[cfg(test)]
+const MAX_RUN_ROWS: usize = WorkflowProgress::desired_rows_for(usize::MAX) as usize - 1;
+
 pub(crate) struct WorkbarRun<'a> {
     pub panel: &'a WorkflowPanel,
     pub queued: usize,
 }
 
-/// Rows the workbar wants for `runs` runs, before the frame's budget: one per
-/// run, folded past [`MAX_RUN_ROWS`]. No runs, no rows.
 #[must_use]
 pub(crate) fn desired_rows(runs: usize) -> u16 {
-    let rows = if runs > MAX_RUN_ROWS {
-        MAX_RUN_ROWS + 1
-    } else {
-        runs
-    };
-    u16::try_from(rows).unwrap_or(u16::MAX)
+    WorkflowProgress::desired_rows_for(runs)
 }
 
-/// Paint the workbar into `area`: one row per run.
 pub(crate) fn render(
     area: ratatui::layout::Rect,
     buf: &mut ratatui::buffer::Buffer,
@@ -87,23 +41,18 @@ pub(crate) fn render(
     locale: Locale,
 ) {
     use ratatui::widgets::{Paragraph, Widget};
-    if area.width == 0 || area.height == 0 || runs.is_empty() {
-        return;
-    }
-    let rows = lines(
+    let area = area.intersection(buf.area);
+    Paragraph::new(lines(
         runs,
         area.width,
         usize::from(area.height),
         now_ms,
         theme,
         locale,
-    );
-    Paragraph::new(rows).render(area, buf);
+    ))
+    .render(area, buf);
 }
 
-/// Paint `runs` into at most `max_rows` lines of `width` columns. When the
-/// runs do not all fit, the last row says how many are hidden and names the
-/// key that lists them.
 #[must_use]
 pub(crate) fn lines(
     runs: &[WorkbarRun<'_>],
@@ -113,361 +62,87 @@ pub(crate) fn lines(
     theme: &UiTheme,
     locale: Locale,
 ) -> Vec<Line<'static>> {
-    let width = usize::from(width);
-    if runs.is_empty() || max_rows == 0 || width < 8 {
-        return Vec::new();
+    let word = |id| tr(locale, id).into_owned().into();
+    let progress = WorkflowProgress::new(
+        runs.iter().map(|run| facts(run, now_ms, locale)).collect(),
+    )
+    .words(WorkflowProgressWords {
+        done: word(MessageId::WorkflowSettledOfTotal),
+        failed: word(MessageId::WorkflowCountFailed),
+        cancelled: word(MessageId::WorkflowCountCancelled),
+        queued: word(MessageId::AgentRailQueuedCount),
+        no_tasks: word(MessageId::WorkflowNoTasksYet),
+        large: word(MessageId::WorkbarLargeWorkflow),
+        gaps: word(MessageId::WorkflowLineFinishedWithGaps),
+        stopped: word(MessageId::WorkflowLineStopped),
+        more: word(MessageId::WorkbarMoreRuns),
+        manage: word(MessageId::FooterHintToManage),
+    });
+    // The selected/custom UiTheme and existing backend retain palette authority.
+    // A fixed full-color kit palette supplies distinct semantic ink identities;
+    // map those identities before the backend's single capability pass.
+    let source_theme = Theme::new(Caps {
+        depth: ColorDepth::TrueColor,
+        ascii: false,
+        appearance: Appearance::Dark,
+    })
+    .tui_palette(TuiPalette::Whale);
+    let inks = [
+        (source_theme.color(Role::Foreground), theme.text_body),
+        (source_theme.color(Role::Muted), theme.text_muted),
+        (source_theme.color(Role::Hint), theme.text_hint),
+        (source_theme.color(Role::Danger), theme.error_fg),
+        (
+            source_theme.tui_ink(TuiInk::Working).fg,
+            theme.accent_action,
+        ),
+        (source_theme.tui_ink(TuiInk::Success).fg, theme.success),
+        (source_theme.tui_ink(TuiInk::Warning).fg, theme.warning),
+    ];
+    let mut rows = progress.lines(width, max_rows, &source_theme);
+    for row in &mut rows {
+        for span in &mut row.spans {
+            if let Some((_, color)) = inks
+                .iter()
+                .find(|(ink, _)| ink.is_some() && *ink == span.style.fg)
+            {
+                span.style.fg = Some(*color);
+            }
+        }
     }
-    let shown = if runs.len() > max_rows {
-        max_rows.saturating_sub(1)
-    } else {
-        runs.len()
+    rows
+}
+
+fn facts(run: &WorkbarRun<'_>, now_ms: u64, locale: Locale) -> WorkflowRun<'static> {
+    let panel = run.panel;
+    let (succeeded, _, _, total) = panel.row_outcomes();
+    let (failed, cancelled) = panel.failure_cancel_counts();
+    let state = match panel.lifecycle {
+        WorkflowPanelLifecycle::Pending => WorkflowRunState::Pending,
+        WorkflowPanelLifecycle::Running => WorkflowRunState::Running,
+        WorkflowPanelLifecycle::Succeeded => WorkflowRunState::Succeeded,
+        WorkflowPanelLifecycle::Degraded => WorkflowRunState::Degraded,
+        WorkflowPanelLifecycle::Failed => WorkflowRunState::Failed,
+        WorkflowPanelLifecycle::Cancelled => WorkflowRunState::Cancelled,
     };
-    let cells: Vec<RowCells> = runs[..shown]
-        .iter()
-        .map(|run| RowCells::new(run, now_ms, locale))
-        .collect();
-    let layout = Layout::fit(&cells, width.saturating_sub(1));
-    let mut out: Vec<Line<'static>> = cells
-        .iter()
-        .map(|cells| cells.line(&layout, width, theme))
-        .collect();
-    let hidden = runs.len() - shown;
-    if hidden > 0 {
-        let arrow = if crate::tui::color_compat::ascii_safe_enabled() {
-            "v"
-        } else {
-            "↓"
-        };
-        let text = format!(
-            " {} · {arrow} {}",
-            tr(locale, MessageId::WorkbarMoreRuns).replace("{count}", &hidden.to_string()),
-            tr(locale, MessageId::FooterHintToManage),
-        );
-        out.push(Line::from(Span::styled(
-            truncate_line_to_width(&text, width),
-            Style::default().fg(theme.text_hint),
-        )));
-    }
-    out
-}
-
-/// The text of one row, before layout.
-struct RowCells {
-    lifecycle: WorkflowPanelLifecycle,
-    mark: &'static str,
-    name: String,
-    /// Bar cells for succeeded and failed agents; the rest are open.
-    done_cells: usize,
-    failed_cells: usize,
-    /// `k/n done`, then ` · m failed · c cancelled` when not zero.
-    done: String,
-    problems: String,
-    elapsed: String,
-    tokens: Option<String>,
-    /// `(text, needs attention)` chips, then the reason, in that order.
-    chips: Vec<(String, bool)>,
-    reason: Option<String>,
-}
-
-impl RowCells {
-    fn new(run: &WorkbarRun<'_>, now_ms: u64, locale: Locale) -> Self {
-        let panel = run.panel;
-        let (succeeded, failed_rows, _, total) = panel.row_outcomes();
-        let lifecycle = panel.lifecycle;
-        let (done_cells, failed_cells) = bar_cells(succeeded, failed_rows, total);
-        let counts = panel.outcome_counts_text();
-        // The done count reads quiet; failures and cancels read in error ink.
-        let (done, problems) = match counts.split_once(" · ") {
-            Some((done, rest)) if total > 0 => (done.to_string(), format!(" · {rest}")),
-            _ if total == 0 && panel.failure_cancel_counts() != (0, 0) => (String::new(), counts),
-            _ => (counts, String::new()),
-        };
+    let mut facts = WorkflowRun::new(panel.short_title(), state)
+        .outcomes(succeeded, failed, cancelled, total)
+        .queued(run.queued);
+    if panel.started_at_ms != 0 {
         let end = panel.completed_at_ms.unwrap_or(now_ms);
-        let elapsed = if panel.started_at_ms == 0 {
-            String::new()
-        } else {
-            crate::elapsed::format_elapsed_ms(end.saturating_sub(panel.started_at_ms))
-        };
-        let tokens = panel.tokens_so_far().map(|tokens| {
-            format!(
-                "↓{}",
-                crate::tui::footer_ui::format_token_count_compact(tokens)
-            )
-        });
-
-        let mut chips = Vec::new();
-        if total >= LARGE_WORKFLOW_AGENTS {
-            chips.push((
-                format!("⚠ {}", tr(locale, MessageId::WorkbarLargeWorkflow)),
-                true,
-            ));
-        }
-        if run.queued > 0 {
-            chips.push((
-                format!(
-                    "· {}",
-                    tr(locale, MessageId::AgentRailQueuedCount)
-                        .replace("{count}", &run.queued.to_string())
-                ),
-                true,
-            ));
-        }
-        // A settled run that fell short says why. Failed leads with the reason
-        // (its mark and `N failed` already say it failed); gaps and stops keep
-        // their word, because their marks alone are not enough to tell them
-        // from the others on an ASCII terminal.
-        let reason = panel.outcome_reason();
-        let word = |id: MessageId| tr(locale, id).into_owned();
-        let reason = match lifecycle {
-            WorkflowPanelLifecycle::Failed => {
-                Some(reason.unwrap_or_else(|| word(MessageId::WorkflowLineFailed)))
-            }
-            WorkflowPanelLifecycle::Degraded => Some(match reason {
-                Some(reason) => format!(
-                    "{} · {reason}",
-                    word(MessageId::WorkflowLineFinishedWithGaps)
-                ),
-                None => word(MessageId::WorkflowLineFinishedWithGaps),
-            }),
-            WorkflowPanelLifecycle::Cancelled => Some(word(MessageId::WorkflowLineStopped)),
-            _ => None,
-        };
-        Self {
-            lifecycle,
-            mark: lifecycle_mark(lifecycle),
-            name: semantic_truncate(&panel.short_title(), MAX_NAME_COLS),
-            done_cells,
-            failed_cells,
-            done,
-            problems,
-            elapsed,
-            tokens,
-            chips,
-            reason,
-        }
-    }
-
-    fn progress_width(&self) -> usize {
-        self.done.width() + self.problems.width()
-    }
-
-    fn tail_width(&self) -> usize {
-        self.chips
-            .iter()
-            .map(|(chip, _)| chip.width() + 1)
-            .sum::<usize>()
-            + self
-                .reason
-                .as_deref()
-                .map_or(0, |reason| reason.width() + 1)
-    }
-
-    fn line(&self, layout: &Layout, width: usize, theme: &UiTheme) -> Line<'static> {
-        let state_ink = lifecycle_ink(self.lifecycle, theme);
-        let quiet = Style::default().fg(theme.text_muted);
-        let mut spans = vec![
-            Span::raw(" "),
-            Span::styled(format!("{} ", self.mark), Style::default().fg(state_ink)),
-            Span::styled(
-                pad(
-                    &semantic_truncate(&self.name, layout.name_room),
-                    layout.name_cols,
-                ),
-                Style::default()
-                    .fg(theme.text_body)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ];
-        if layout.bar {
-            let open = BAR_CELLS - self.done_cells - self.failed_cells;
-            spans.push(Span::raw(GAP));
-            spans.push(Span::styled(
-                DONE_CELL.repeat(self.done_cells),
-                Style::default().fg(theme.success),
-            ));
-            spans.push(Span::styled(
-                FAILED_CELL.repeat(self.failed_cells),
-                Style::default().fg(theme.error_fg),
-            ));
-            spans.push(Span::styled(
-                OPEN_CELL.repeat(open),
-                Style::default().fg(theme.text_hint),
-            ));
-        }
-        spans.push(Span::raw(GAP));
-        spans.push(Span::styled(self.done.clone(), quiet));
-        spans.push(Span::styled(
-            self.problems.clone(),
-            Style::default().fg(theme.error_fg),
+        facts = facts.elapsed(Duration::from_millis(
+            end.saturating_sub(panel.started_at_ms),
         ));
-        spans.push(Span::raw(" ".repeat(
-            layout.progress_cols.saturating_sub(self.progress_width()),
-        )));
-        if layout.elapsed_cols > 0 {
-            spans.push(Span::raw(GAP));
-            spans.push(Span::styled(pad(&self.elapsed, layout.elapsed_cols), quiet));
-        }
-        if layout.tokens_cols > 0 {
-            spans.push(Span::raw(GAP));
-            spans.push(Span::styled(
-                pad(self.tokens.as_deref().unwrap_or(""), layout.tokens_cols),
-                quiet,
-            ));
-        }
-        let mut used: usize = spans.iter().map(|span| span.content.width()).sum();
-        for (index, (chip, attention)) in self.chips.iter().enumerate() {
-            let gap = if index == 0 { GAP } else { " " };
-            spans.push(Span::raw(gap));
-            let ink = if *attention {
-                theme.warning
-            } else {
-                theme.text_muted
-            };
-            spans.push(Span::styled(chip.clone(), Style::default().fg(ink)));
-            used += gap.width() + chip.width();
-        }
-        if let Some(reason) = self.reason.as_deref() {
-            let gap = if self.chips.is_empty() { GAP } else { " " };
-            // The reason takes what the row has left, cut at a word boundary.
-            let room = width.saturating_sub(used + gap.width());
-            if room >= MIN_REASON_COLS.min(reason.width()) {
-                spans.push(Span::raw(gap));
-                spans.push(Span::styled(
-                    semantic_truncate(reason, room),
-                    Style::default().fg(state_ink),
-                ));
-            }
-        }
-        clip_line(spans, width)
     }
-}
-
-/// Split [`BAR_CELLS`] between succeeded and failed agents of `total`. A
-/// non-zero count always gets at least one cell, so one failure in a large run
-/// is still visible, and the two segments never overflow the bar.
-fn bar_cells(succeeded: usize, failed: usize, total: usize) -> (usize, usize) {
-    if total == 0 {
-        return (0, 0);
+    if let Some(tokens) = panel.tokens_so_far() {
+        facts = facts.tokens(tokens);
     }
-    let cells = |count: usize| {
-        let cells = (count * BAR_CELLS + total / 2) / total;
-        if count > 0 { cells.max(1) } else { 0 }.min(BAR_CELLS)
-    };
-    let failed = cells(failed);
-    let done = cells(succeeded).min(BAR_CELLS - failed);
-    (done, failed)
-}
-
-/// Column widths shared by every visible row, so the columns line up.
-struct Layout {
-    /// Room the name is truncated into, and the column it is padded to (the
-    /// widest name as shown, which a word-boundary cut can leave shorter).
-    name_room: usize,
-    name_cols: usize,
-    bar: bool,
-    progress_cols: usize,
-    elapsed_cols: usize,
-    tokens_cols: usize,
-}
-
-impl Layout {
-    /// Fit the shared columns into `width`. The name and the progress count
-    /// always stay; the bar goes first, then tokens, then the room kept for
-    /// the tail, then elapsed — so a narrow terminal keeps the facts and loses
-    /// the picture. The tail takes whatever the row has left after the name.
-    fn fit(rows: &[RowCells], width: usize) -> Self {
-        let widest = |f: &dyn Fn(&RowCells) -> usize| rows.iter().map(f).max().unwrap_or(0);
-        let name_want = widest(&|row| row.name.width());
-        let mut tail_want = widest(&RowCells::tail_width).min(TAIL_RESERVE_COLS);
-        let mut layout = Self {
-            name_room: 0,
-            name_cols: 0,
-            bar: width >= BAR_MIN_WIDTH,
-            progress_cols: widest(&RowCells::progress_width),
-            elapsed_cols: widest(&|row| row.elapsed.width()),
-            tokens_cols: widest(&|row| row.tokens.as_deref().map_or(0, UnicodeWidthStr::width)),
-        };
-        let name_cols = loop {
-            let fixed = 2 // mark + space
-                + if layout.bar { BAR_CELLS + GAP.len() } else { 0 }
-                + GAP.len() + layout.progress_cols
-                + if layout.elapsed_cols > 0 { GAP.len() + layout.elapsed_cols } else { 0 }
-                + if layout.tokens_cols > 0 { GAP.len() + layout.tokens_cols } else { 0 };
-            let room = width.saturating_sub(fixed + tail_want);
-            if room >= MIN_NAME_COLS.min(name_want) {
-                break name_want.min(room.max(MIN_NAME_COLS.min(name_want)));
-            }
-            if layout.bar {
-                layout.bar = false;
-            } else if layout.tokens_cols > 0 {
-                layout.tokens_cols = 0;
-            } else if tail_want > 0 {
-                tail_want = 0;
-            } else if layout.elapsed_cols > 0 {
-                layout.elapsed_cols = 0;
-            } else {
-                break width.saturating_sub(fixed).max(1).min(name_want.max(1));
-            }
-        };
-        // Word-boundary truncation can land short of the room; the column is
-        // as wide as the widest name it actually shows, not the room it had.
-        layout.name_room = name_cols;
-        layout.name_cols = widest(&|row| semantic_truncate(&row.name, name_cols).width());
-        layout
+    if let Some(reason) = panel.outcome_reason() {
+        facts = facts.reason(reason);
+    } else if state == WorkflowRunState::Failed {
+        facts = facts.reason(tr(locale, MessageId::WorkflowLineFailed).into_owned());
     }
-}
-
-/// The run's mark: distinct shapes, so the state reads without colour.
-fn lifecycle_mark(lifecycle: WorkflowPanelLifecycle) -> &'static str {
-    match lifecycle {
-        WorkflowPanelLifecycle::Pending => crate::tui::glyphs::AVAILABLE,
-        WorkflowPanelLifecycle::Running => "•",
-        WorkflowPanelLifecycle::Succeeded => crate::tui::glyphs::DONE,
-        WorkflowPanelLifecycle::Degraded => crate::tui::glyphs::ATTENTION,
-        WorkflowPanelLifecycle::Failed => crate::tui::glyphs::FAILED,
-        WorkflowPanelLifecycle::Cancelled => "⊘",
-    }
-}
-
-/// Running is working ink, not attention; only trouble spends warning/error.
-fn lifecycle_ink(lifecycle: WorkflowPanelLifecycle, theme: &UiTheme) -> ratatui::style::Color {
-    match lifecycle {
-        WorkflowPanelLifecycle::Pending | WorkflowPanelLifecycle::Cancelled => theme.text_muted,
-        WorkflowPanelLifecycle::Running => theme.accent_action,
-        WorkflowPanelLifecycle::Succeeded => theme.success,
-        WorkflowPanelLifecycle::Degraded => theme.warning,
-        WorkflowPanelLifecycle::Failed => theme.error_fg,
-    }
-}
-
-fn pad(text: &str, cols: usize) -> String {
-    let width = text.width();
-    if width >= cols {
-        text.to_string()
-    } else {
-        format!("{text}{}", " ".repeat(cols - width))
-    }
-}
-
-/// Clip a styled row at `width` columns without splitting a wide glyph.
-fn clip_line(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
-    let mut used = 0usize;
-    let mut out = Vec::with_capacity(spans.len());
-    for span in spans {
-        let span_width = span.content.width();
-        if used + span_width <= width {
-            used += span_width;
-            out.push(span);
-            continue;
-        }
-        let room = width.saturating_sub(used);
-        if room > 0 {
-            let text = truncate_line_to_width(&span.content, room);
-            out.push(Span::styled(text, span.style));
-        }
-        break;
-    }
-    Line::from(out)
+    facts
 }
 
 #[cfg(test)]
@@ -475,6 +150,7 @@ mod tests {
     use super::*;
     use crate::tui::widgets::workflow_panel::{WorkflowPanelEvent, WorkflowRowStatus};
     use ratatui::{Terminal, backend::TestBackend};
+    use unicode_width::UnicodeWidthStr;
 
     const NOW: u64 = 1_000_000;
 
@@ -687,11 +363,12 @@ mod tests {
         assert!(!row.contains('█'), "no agent succeeded: {row}");
         assert!(row.contains("0/2 done · 2 failed"), "{row}");
         assert!(row.contains("355ms") && !row.contains(" 0s"), "{row}");
-        // The failed cells carry error ink, not the success ink of done cells.
+        // The failed state mark carries error ink; the custom-theme regression
+        // separately covers failure bar cells.
         let theme = codewhale_palette::UI_THEME;
         let failed_cell = (0..140)
-            .find(|&x| band[(x, 0)].symbol() == FAILED_CELL)
-            .expect("failed cells");
+            .find(|&x| band[(x, 0)].symbol() == codewhale_ratatui::glyphs::FAILED)
+            .expect("failed state mark");
         assert_eq!(band[(failed_cell, 0)].fg, theme.error_fg);
         // The agents' own reason, not the run's aggregate, and not cut mid-word.
         assert!(row.contains("Authorization failed"), "{row}");
@@ -766,11 +443,11 @@ mod tests {
 
     #[test]
     fn one_failure_in_a_large_run_still_gets_a_bar_cell() {
-        assert_eq!(bar_cells(0, 1, 100), (0, 1));
-        assert_eq!(bar_cells(99, 1, 100), (19, 1));
-        assert_eq!(bar_cells(0, 2, 2), (0, BAR_CELLS));
-        assert_eq!(bar_cells(3, 1, 4), (15, 5));
-        assert_eq!(bar_cells(0, 0, 0), (0, 0));
+        let mut panel = run("large", NOW - 5_000, 100, 99);
+        complete(&mut panel, "large", 99, WorkflowRowStatus::Failed, None);
+        let shown = render(&one(&panel), 160, 1);
+        assert_eq!(shown.matches('×').count(), 1, "{shown}");
+        assert_eq!(shown.matches('█').count(), 19, "{shown}");
     }
 
     #[test]
@@ -895,6 +572,37 @@ mod tests {
                 "ASCII marks collide: {ascii_marks:?}"
             );
         }
+    }
+
+    #[test]
+    fn localized_folded_counts_and_custom_failure_ink_survive_kit_adoption() {
+        use ratatui::style::Color;
+        let panels: Vec<_> = (0..8)
+            .map(|n| settled(&format!("run-{n}"), WorkflowPanelLifecycle::Failed, 2, 0))
+            .collect();
+        let runs: Vec<_> = panels
+            .iter()
+            .map(|panel| WorkbarRun { panel, queued: 0 })
+            .collect();
+        let mut theme = codewhale_palette::UI_THEME;
+        theme.error_fg = Color::Rgb(231, 12, 56);
+        let folded = lines(&runs, 100, 1, NOW, &theme, Locale::Ja);
+        let text = folded[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("ほか 8 件"), "{text}");
+        assert!(!text.contains("{count}"), "{text}");
+        let row = lines(&runs[..1], 100, 1, NOW, &theme, Locale::En);
+        assert_eq!(row[0].spans[1].style.fg, Some(theme.error_fg));
+        assert!(
+            row[0]
+                .spans
+                .iter()
+                .filter(|span| span.content.contains('×'))
+                .all(|span| { span.style.fg == Some(theme.error_fg) })
+        );
     }
 
     #[test]

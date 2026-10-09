@@ -14,7 +14,7 @@ use super::model::{RailPanel, WorkRow, WorkRowId, WorkTone};
 pub(super) const fn view_always_has_content(panel: RailPanel) -> bool {
     matches!(
         panel,
-        RailPanel::Context | RailPanel::Git | RailPanel::Price
+        RailPanel::Context | RailPanel::Git | RailPanel::Price | RailPanel::Terminal
     )
 }
 
@@ -303,13 +303,13 @@ fn message_split(app: &App) -> (u64, u64, usize) {
 /// Before the first probe it says so; "not a git repository" only when the
 /// probe found none, and a git failure is named (#6565).
 pub(super) fn git_rows(app: &mut App) -> Vec<WorkRow> {
-    let out = git_rows_for(&crate::tui::git_status::cached_status(), &app.workspace);
+    let out = git_rows_for(&crate::git_status::cached_status(), &app.workspace);
     app.work_surface.latest_rows = out.clone();
     out
 }
 
 fn git_rows_for(
-    snap: &crate::tui::git_status::GitStatusSnapshot,
+    snap: &crate::git_status::GitStatusSnapshot,
     workspace: &std::path::Path,
 ) -> Vec<WorkRow> {
     let probed_here = snap.probed_workspace.as_deref() == Some(workspace);
@@ -335,7 +335,7 @@ fn note_row(id: &str, text: &str) -> WorkRow {
     }
 }
 
-fn git_state_rows(snap: &crate::tui::git_status::GitStatusSnapshot) -> Vec<WorkRow> {
+fn git_state_rows(snap: &crate::git_status::GitStatusSnapshot) -> Vec<WorkRow> {
     let mut out = Vec::new();
     let branch = match (snap.branch.as_deref(), snap.detached) {
         (Some(id), true) => format!("detached at {id}"),
@@ -547,7 +547,7 @@ pub(super) fn price_rows(app: &mut App) -> Vec<WorkRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::git_status::{
+    use crate::git_status::{
         ChangeCounts, ChangedPath, GitStatusSnapshot, RecentCommit, WorktreeEntry,
     };
     use std::path::{Path, PathBuf};
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn git_more_means_unlisted_paths() {
-        use crate::tui::git_status::{MAX_CHANGED_PATHS, parse_porcelain_v2};
+        use crate::git_status::{MAX_CHANGED_PATHS, parse_porcelain_v2};
         for count in [1, MAX_CHANGED_PATHS, MAX_CHANGED_PATHS + 1] {
             let mut raw = "# branch.head main\0".to_string();
             for index in 0..count {
@@ -779,7 +779,7 @@ mod tests {
 
     #[test]
     fn failed_git_status_reports_the_error_in_the_view_and_composer() {
-        use crate::tui::git_status::{context_line, probe_status};
+        use crate::git_status::{context_line, probe_status};
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path();
         let init = std::process::Command::new("git")

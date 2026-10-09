@@ -11,7 +11,7 @@ export const contribute: ContributeDict = {
     "File issues, improve translations and documentation, and send pull requests to the international Codewhale community.",
   kicker: "Contribute to an international open-source project",
   title: "Start with one concrete improvement.",
-  lede: "Codewhale welcomes contributors across countries, languages, platforms, and experience levels. Clear bug reports, reproduction results, documentation corrections, translations, and small complete patches all move the project forward.",
+  lede: "Contribute from any country, language, platform, or experience level. Clear bug reports, reproductions, docs fixes, translations, and small complete patches all count.",
   fileIssue: "File an issue",
   browsePulls: "Browse pull requests",
   fullGuide: "Open the full contributor guide",
@@ -19,8 +19,8 @@ export const contribute: ContributeDict = {
   workflowTitle: "From a problem to a reviewable patch.",
   reviewTitle: "Make the change easy to verify.",
   reviewScope:
-    "A reviewer needs the problem, the reason for the change, test evidence, and remaining risk. Clear scope usually leads to clearer feedback.",
+    "Give reviewers the problem, the reason for the change, test evidence, and remaining risk. A tight scope gets clearer feedback.",
   devTitle: "Build and run the relevant checks.",
   devScope:
-    "The repository uses stable Rust. Run the focused test for your change first, followed by formatting, Clippy, and the workspace suite.",
+    "The repository uses stable Rust. Run the focused test for your change first, then formatting, Clippy, and the workspace suite.",
 };

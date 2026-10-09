@@ -32,6 +32,6 @@ CSS consumers use `font-family: var(--font-family), var(--font-fallbacks), sans-
 to keep the shared family and CJK fallbacks together. The generator rejects
 selection and primary-hover opacity values outside the inclusive 0–1 range,
 and any palette that misses WCAG AA contrast in either mode: every text role
-at 4.5:1 and `border_strong` at 3:1 on `background`, `surface`, `sidebar`,
-`hover` and `selected`, and `primary_foreground` on `primary` at 4.5:1. A new
+at 4.5:1 (`muted_foreground` at 5.5:1) and `border_strong` at 3:1 on
+`background`, `surface`, `sidebar`, `hover` and `selected`, and `primary_foreground` on `primary` at 4.5:1. A new
 colour, such as a named blue, enters the tokens only once it passes.

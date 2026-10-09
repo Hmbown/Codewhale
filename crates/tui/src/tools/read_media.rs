@@ -325,7 +325,7 @@ pub(crate) async fn execute_read_media(
             // Read-back fallback for tool-owned stored originals: the store
             // only holds image bytes that already passed the guards above,
             // named by content hash, so admitting it widens nothing.
-            match context
+            let stored = context
                 .runtime
                 .media_originals_dir
                 .as_deref()
@@ -335,8 +335,20 @@ pub(crate) async fn execute_read_media(
                         &context.workspace,
                         dir,
                     )
-                }) {
+                });
+            match stored {
                 Some(path) => path,
+                // An image the user attached from outside the workspace
+                // (a dropped screenshot in a temp directory) stays viewable.
+                None if matches!(primary_err, ToolError::PathEscape { .. }) => {
+                    crate::tools::file::user_attached_image_read_path(
+                        context,
+                        path_str,
+                        "read_media",
+                    )
+                    .await?
+                    .ok_or(primary_err)?
+                }
                 None => return Err(primary_err),
             }
         }

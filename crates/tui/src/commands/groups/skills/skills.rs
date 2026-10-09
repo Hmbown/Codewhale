@@ -33,7 +33,7 @@ fn discover_visible_skills(app: &crate::tui::app::App) -> crate::skills::SkillRe
         &app.workspace,
         &app.skills_dir,
         app.skills_discovery_mode,
-        Some(app.plugin_registry.as_ref()),
+        Some(app.extension_plugin_view().as_ref()),
     )
     .into_enabled()
 }
@@ -87,21 +87,16 @@ fn activate_skill(app: &mut crate::tui::app::App, name: &str) -> CommandResult {
                 skill.name
             ));
         }
-        let plugin_provenance = match &skill.source {
-            crate::skills::SkillSource::Native => None,
-            crate::skills::SkillSource::Plugin { authority, .. } => {
-                if let Err(reason) = crate::plugins::registry::verify_plugin_component_authority(
-                    authority,
-                    crate::plugins::activation::PluginActivationCapability::Skills,
-                ) {
-                    return CommandResult::error(format!(
-                        "Plugin skill '{}' is no longer active: {reason}",
-                        skill.name
-                    ));
-                }
-                Some(authority.as_ref().clone())
-            }
-        };
+        let plugin_provenance = skill.source.provenance();
+        if let Some(provenance) = &plugin_provenance
+            && let Err(reason) =
+                provenance.verify_for(&app.workspace, Some(app.extension_plugin_view().as_ref()))
+        {
+            return CommandResult::error(format!(
+                "Plugin skill '{}' is no longer active: {reason}",
+                skill.name
+            ));
+        }
         let instruction = format!(
             "You are now using a skill. Follow these instructions:\n\n# Skill: {}\n\n{}\n\n---\n\nNow respond to the user's request following the above skill instructions.",
             skill.name, skill.body

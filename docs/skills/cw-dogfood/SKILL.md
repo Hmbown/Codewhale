@@ -32,7 +32,7 @@ Stage 4 of the loop: [cw-orient](../cw-orient/SKILL.md) →
    the thing on your PATH is the thing you just built:
    ```bash
    CODEWHALE_BUILD_SHA=$(git rev-parse HEAD) \
-     cargo build --release --locked -p codewhale-cli -p codewhale-tui
+     cargo build --release --locked -p codewhale-cli --bin codewhale
    ```
 
 3. **Install atomically.** Use the script; do not hand-copy:

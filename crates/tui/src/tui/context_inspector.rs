@@ -29,14 +29,15 @@ use codewhale_core::ContextReferenceSource;
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_models::{SystemPrompt, Tool};
 use codewhale_palette as palette;
+use codewhale_runtime::context_budget::{
+    CONTEXT_CRITICAL_THRESHOLD_PERCENT, CONTEXT_WARNING_THRESHOLD_PERCENT,
+};
 
 /// Marker used by per-turn working-set metadata. Replicated here so the
 /// context inspector can distinguish stable prompt blocks from volatile
 /// working-set context without importing engine internals.
 const WORKING_SET_MARKER: &str = "## Repo Working Set";
 
-pub(crate) const CONTEXT_WARNING_THRESHOLD_PERCENT: f64 = 85.0;
-pub(crate) const CONTEXT_CRITICAL_THRESHOLD_PERCENT: f64 = 95.0;
 const MAX_REFERENCE_ROWS: usize = 12;
 const MAX_TOOL_ROWS: usize = 8;
 const MAX_SCHEMA_COST_ROWS: usize = 24;
@@ -1041,7 +1042,7 @@ mod tests {
         // Pin the route identity: App::new consults the developer's real
         // saved settings, so on a machine with customized provider/model
         // the context-window assertions computed against a different route.
-        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.api_provider = crate::config::ProviderKind::Deepseek;
         app.auto_model = false;
         app.last_effective_model = None;
         app.active_route_limits = None;

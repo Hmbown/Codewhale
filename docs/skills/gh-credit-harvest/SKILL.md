@@ -27,8 +27,8 @@ this skill lands a credited commit and posts thanks; the workflow closes the PR.
    ```
 2. Review from evidence, not the title. Read the diff, tests, linked issue, comments, and CI:
    ```bash
-   gh pr view <N> --repo Hmbown/CodeWhale --json title,author,files,statusCheckRollup
-   gh pr diff <N> --repo Hmbown/CodeWhale
+   gh pr view <N> --repo codewhale-hq/CodeWhale --json title,author,files,statusCheckRollup
+   gh pr diff <N> --repo codewhale-hq/CodeWhale
    ```
 3. Test mergeability against the REAL landing branch (local-only branches lie via the main flag):
    ```bash
@@ -54,7 +54,7 @@ this skill lands a credited commit and posts thanks; the workflow closes the PR.
    ```
 7. Post a brief, warm, specific thank-you on the PR — name what the change fixed, no drama. Leave the PR open; the workflow closes it with credit when the commit lands on `main`:
    ```bash
-   gh pr comment <N> --repo Hmbown/CodeWhale \
+   gh pr comment <N> --repo codewhale-hq/CodeWhale \
      --body "Thank you @<handle> — clean fix for <the specific bug>. Harvested into the <release-branch> lane with your authorship preserved; it'll auto-close with credit once it reaches main."
    ```
 

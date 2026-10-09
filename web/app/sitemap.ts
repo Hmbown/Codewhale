@@ -1,13 +1,16 @@
 import type { MetadataRoute } from "next";
 import { contentLocalesForPath } from "@/lib/i18n/content-locales";
 import { SITE_URL } from "@/lib/page-meta";
+import { readCatalogue } from "@/lib/ratatui/catalogue";
 
 // Public, indexable routes (locale-prefixed). /admin and /api are
 // intentionally excluded; see app/robots.ts.
 const PATHS = ["", "/product", "/install", "/constitution", "/models", "/plugins", "/runtime", "/docs", "/docs/auth", "/docs/computers", "/docs/configuration", "/docs/guide", "/docs/hooks", "/docs/mcp", "/docs/modes", "/docs/review", "/docs/fleet", "/docs/runtime-api", "/docs/sandbox", "/docs/subagents", "/docs/tools", "/docs/troubleshooting", "/docs/trust", "/docs/vocabulary", "/docs/web", "/docs/work", "/faq", "/roadmap", "/feed", "/digest", "/changelog", "/contribute", "/community", "/signin", "/signup", "/legal/terms", "/legal/privacy"];
 
 export default function sitemap(): MetadataRoute.Sitemap {
-  return [...PATHS, "/computer-use"].flatMap((path) =>
+  const catalogue = readCatalogue();
+  const componentPaths = catalogue.entries.map((entry) => `/ratatui/${encodeURIComponent(entry.name)}`);
+  return [...PATHS, "/computer-use", "/ratatui", ...componentPaths].flatMap((path) =>
     contentLocalesForPath(path || "/").map((locale) => ({
       url: `${SITE_URL}/${locale}${path}`,
       alternates: {

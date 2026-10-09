@@ -26,7 +26,7 @@ use crate::commands::session_export_test_support::{
 };
 use crate::commands::traits::CommandDiscovery;
 use crate::commands::{CommandResult, execute};
-use crate::config::{ApiProvider, Config};
+use crate::config::{Config, ProviderKind};
 use crate::test_support::{EnvVarGuard, TestEnvLock};
 use crate::tui::app::{App, TuiOptions};
 use crate::tui::clipboard::ClipboardHandler;
@@ -245,7 +245,7 @@ fn export_is_discoverable_by_name_and_alias_in_palette_and_slash_completion() {
         &[],
         Locale::En,
         Some(workspace),
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
     );
     assert!(
         by_prefix.iter().any(|hint| hint.name == "/export"),
@@ -258,7 +258,7 @@ fn export_is_discoverable_by_name_and_alias_in_palette_and_slash_completion() {
         &[],
         Locale::En,
         Some(workspace),
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
     );
     let alias_row = by_alias
         .iter()

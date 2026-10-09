@@ -1,0 +1,30 @@
+{
+  "description": "A server whose tools/list never ends (65 pages of one tool; MAX_MCP_CATALOG_PAGES = 64). Pins Rust McpCatalogBudget::observe_page: the 65th page ends discovery and the server advertises nothing. The negative control serves exactly 64 pages and must see the server connect.",
+  "server_name": "conformance",
+  "expect_boot": "error",
+  "server": {
+    "initialize": {
+      "result": {
+        "protocolVersion": "2025-06-18",
+        "serverInfo": {
+          "name": "catalog-fixture",
+          "version": "1.0.0"
+        },
+        "capabilities": {
+          "tools": {}
+        }
+      }
+    },
+    "tools/list": {
+      "generate_pages": {
+        "count": 65,
+        "prefix": "paged"
+      }
+    }
+  },
+  "steps": [
+    {
+      "op": "catalog"
+    }
+  ]
+}

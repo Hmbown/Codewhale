@@ -122,6 +122,23 @@ fn default_decision() -> DecisionToml {
     DecisionToml::Prompt
 }
 
+/// The stricter of two fallback decisions, ordering `Deny` < `Prompt` < `Allow`.
+/// Used when a lower-precedence layer is folded onto a policy an authority set.
+fn stricter_decision(left: DecisionToml, right: DecisionToml) -> DecisionToml {
+    fn rank(decision: DecisionToml) -> u8 {
+        match decision {
+            DecisionToml::Deny => 0,
+            DecisionToml::Prompt => 1,
+            DecisionToml::Allow => 2,
+        }
+    }
+    if rank(left) <= rank(right) {
+        left
+    } else {
+        right
+    }
+}
+
 fn default_audit() -> bool {
     true
 }
@@ -171,6 +188,62 @@ impl From<Decision> for DecisionToml {
 }
 
 impl NetworkPolicy {
+    /// Fold a lower-precedence layer (the user's config document) onto this
+    /// policy without letting it widen what a higher authority set.
+    ///
+    /// The fold is deliberately asymmetric, because the two layers are not
+    /// peers:
+    ///
+    /// * `deny` is the **union**. Either layer saying no is a no.
+    /// * `default` keeps the **stricter** of the two.
+    /// * When the authority's fallback is `Deny`, the lower layer contributes
+    ///   **nothing that can allow**: `allow`, `proxy`, and the fake-IP CIDRs
+    ///   stay the authority's own. `decide` checks `allow` *before* falling back
+    ///   to `default`, so adopting a lower `allow` entry under a
+    ///   deny-by-default authority would let the document lift exactly the
+    ///   denial the authority set.
+    /// * Otherwise the authority is prompt-by-default, and the lower layer may
+    ///   do what `/network allow <host>` writes: name additional hosts. Those
+    ///   merge with the authority's own rather than replacing them, so a
+    ///   refresh cannot erase an administrator's allowances either.
+    /// * `audit` is the one field that widens by `true`: either layer asking for
+    ///   the audit log keeps it, and a document cannot silence it under an
+    ///   authority.
+    #[must_use]
+    pub fn folded_with_lower_layer(&self, lower: Self) -> Self {
+        fn union(mut base: Vec<String>, extra: Vec<String>) -> Vec<String> {
+            for entry in extra {
+                if !base.iter().any(|existing| existing == &entry) {
+                    base.push(entry);
+                }
+            }
+            base
+        }
+
+        let deny_by_default = self.default == DecisionToml::Deny;
+        let (allow, proxy, proxy_fake_ip_cidrs) = if deny_by_default {
+            (
+                self.allow.clone(),
+                self.proxy.clone(),
+                self.proxy_fake_ip_cidrs.clone(),
+            )
+        } else {
+            (
+                union(self.allow.clone(), lower.allow),
+                union(self.proxy.clone(), lower.proxy),
+                union(self.proxy_fake_ip_cidrs.clone(), lower.proxy_fake_ip_cidrs),
+            )
+        };
+        Self {
+            default: stricter_decision(self.default, lower.default),
+            allow,
+            deny: union(self.deny.clone(), lower.deny),
+            proxy,
+            proxy_fake_ip_cidrs,
+            audit: self.audit || lower.audit,
+        }
+    }
+
     /// Decide what to do for a single outbound call to `host`.
     ///
     /// **Deny-wins precedence**: if `host` matches any entry in `deny`, the
@@ -461,6 +534,12 @@ pub struct NetworkPolicyDecider {
     /// A resolved IP inside one of these ranges bypasses the restricted-IP SSRF
     /// block; real private/loopback/link-local/metadata IPs are unaffected.
     trusted_fakeip_cidrs: Vec<(Ipv4Addr, u8)>,
+    /// The policy was produced by an authority the user's config document may
+    /// not override — a managed layer, or a Fleet denial the user is not
+    /// allowed to widen. A mid-session re-read of that document then folds onto
+    /// this policy instead of replacing it. See
+    /// [`NetworkPolicy::folded_with_lower_layer`].
+    authoritative: bool,
 }
 
 impl NetworkPolicyDecider {
@@ -477,7 +556,22 @@ impl NetworkPolicyDecider {
             cache: NetworkSessionCache::new(),
             auditor,
             trusted_fakeip_cidrs,
+            authoritative: false,
         }
+    }
+
+    /// Mark this policy as set by an authority the user document may not
+    /// override. See the `authoritative` field.
+    #[must_use]
+    pub fn with_authoritative(mut self) -> Self {
+        self.authoritative = true;
+        self
+    }
+
+    /// Whether an authority set this policy rather than the user document.
+    #[must_use]
+    pub fn is_authoritative(&self) -> bool {
+        self.authoritative
     }
 
     /// Register IPv4 CIDR ranges to treat as benign fake-IP placeholders.
@@ -522,6 +616,43 @@ impl NetworkPolicyDecider {
             None
         };
         Self::new(policy, auditor)
+    }
+
+    /// Rebuild this decider against a policy re-read from disk, keeping the
+    /// session cache so an approval already granted in this session survives
+    /// the refresh.
+    ///
+    /// The engine snapshots its policy when it is spawned, and `/network allow
+    /// <host>` only edits the configuration document — it cannot reach that
+    /// snapshot. Callers hand the re-read table here instead of waiting for a
+    /// restart. The auditor keeps its log path and follows the new policy's
+    /// `audit` switch.
+    ///
+    /// Extra CIDRs registered through [`Self::with_trusted_fakeip_cidrs`] are
+    /// not carried over; the refresh re-derives them from `policy`. Configured
+    /// fake-IP ranges already ride in the policy, and no production caller
+    /// registers extras.
+    #[must_use]
+    pub fn with_policy_refreshed(&self, policy: NetworkPolicy) -> Self {
+        let auditor = match self.auditor.as_ref() {
+            Some(existing) => Some(NetworkAuditor::new(
+                existing.path().to_path_buf(),
+                policy.audit_enabled(),
+            )),
+            None if policy.audit_enabled() => NetworkAuditor::default_path(true),
+            None => None,
+        };
+        Self {
+            trusted_fakeip_cidrs: policy
+                .proxy_fake_ip_cidrs
+                .iter()
+                .filter_map(|cidr| parse_trusted_fakeip_cidr(cidr))
+                .collect(),
+            policy,
+            cache: self.cache.clone(),
+            auditor,
+            authoritative: self.authoritative,
+        }
     }
 
     /// Inspect the policy.
@@ -841,6 +972,190 @@ mod tests {
         assert_eq!(
             decider.evaluate("api.example.com", "fetch_url"),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn refreshed_policy_adopts_new_table_without_retracting_session_approvals() {
+        let decider = NetworkPolicyDecider::new(mk(Decision::Prompt, &[], &[]), None);
+        decider.approve_session("approved.example.com", "fetch_url");
+
+        // Mid-session `/network allow api.github.com` reaches the session as a
+        // re-read table rather than a restart.
+        let refreshed =
+            decider.with_policy_refreshed(mk(Decision::Prompt, &["api.github.com"], &[]));
+
+        assert_eq!(
+            refreshed.evaluate("api.github.com", "Bash"),
+            Decision::Allow,
+            "the re-read table is in force"
+        );
+        assert_eq!(
+            refreshed.evaluate("approved.example.com", "fetch_url"),
+            Decision::Allow,
+            "an approval already granted this session survives the refresh"
+        );
+        assert_eq!(
+            refreshed.evaluate("unlisted.example.com", "Bash"),
+            Decision::Prompt,
+            "hosts the table does not name keep the default"
+        );
+    }
+
+    #[test]
+    fn refreshed_policy_honours_a_new_deny_list() {
+        let decider = NetworkPolicyDecider::new(mk(Decision::Allow, &[], &[]), None);
+        assert_eq!(
+            decider.evaluate("evil.example.com", "fetch_url"),
+            Decision::Allow
+        );
+
+        let refreshed =
+            decider.with_policy_refreshed(mk(Decision::Allow, &[], &["evil.example.com"]));
+
+        assert_eq!(
+            refreshed.evaluate("evil.example.com", "fetch_url"),
+            Decision::Deny,
+            "a deny entry written after spawn is enforced without a restart"
+        );
+    }
+
+    #[test]
+    fn refreshed_policy_keeps_the_authority_marking() {
+        let decider =
+            NetworkPolicyDecider::new(mk(Decision::Deny, &[], &[]), None).with_authoritative();
+        assert!(decider.is_authoritative());
+        let refreshed = decider.with_policy_refreshed(mk(Decision::Allow, &[], &[]));
+        assert!(
+            refreshed.is_authoritative(),
+            "a refreshed authority is still an authority"
+        );
+    }
+
+    #[test]
+    fn folding_a_document_never_widens_an_authority() {
+        // Assert what the folded policy *decides*, not the shape of its fields:
+        // `decide` checks `allow` before falling back to `default`, so a field
+        // assertion can look safe while the verdict is `Allow`.
+
+        // What a Fleet denial or a managed overlay resolved to: deny by default.
+        let authority = NetworkPolicy {
+            default: DecisionToml::Deny,
+            deny: vec!["blocked.example.com".to_string()],
+            ..NetworkPolicy::default()
+        };
+        // What the user's document asks for on a mid-session re-read.
+        let document = NetworkPolicy {
+            default: DecisionToml::Allow,
+            allow: vec!["api.github.com".to_string()],
+            proxy: vec!["proxy.example.com".to_string()],
+            proxy_fake_ip_cidrs: vec!["198.18.0.0/15".to_string()],
+            audit: false,
+            ..NetworkPolicy::default()
+        };
+
+        let folded = authority.folded_with_lower_layer(document);
+
+        assert_eq!(
+            folded.decide("api.github.com"),
+            Decision::Deny,
+            "a document cannot lift a deny-by-default authority's denial"
+        );
+        assert_eq!(
+            folded.decide("blocked.example.com"),
+            Decision::Deny,
+            "a denial the authority set survives the fold"
+        );
+        assert_eq!(
+            folded.decide("unlisted.example.com"),
+            Decision::Deny,
+            "an unlisted host still falls back to the authority's denial"
+        );
+        assert!(
+            folded.proxy.is_empty() && folded.proxy_fake_ip_cidrs.is_empty(),
+            "a document cannot hand itself a fake-IP SSRF exception under a denial"
+        );
+        assert!(
+            folded.audit,
+            "a document cannot silence the audit log under an authority"
+        );
+
+        // A prompt-by-default authority is the case `/network allow` exists for:
+        // the document may name hosts, and it may not erase the authority's own.
+        let prompt_authority = NetworkPolicy {
+            default: DecisionToml::Prompt,
+            allow: vec!["internal.example.com".to_string()],
+            deny: vec!["blocked.example.com".to_string()],
+            ..NetworkPolicy::default()
+        };
+        let folded = prompt_authority.folded_with_lower_layer(NetworkPolicy {
+            default: DecisionToml::Allow,
+            allow: vec!["api.github.com".to_string()],
+            ..NetworkPolicy::default()
+        });
+        assert_eq!(
+            folded.decide("api.github.com"),
+            Decision::Allow,
+            "the document may still name hosts when the authority prompts"
+        );
+        assert_eq!(
+            folded.decide("internal.example.com"),
+            Decision::Allow,
+            "the authority's own allowance survives the fold"
+        );
+        assert_eq!(
+            folded.decide("unlisted.example.com"),
+            Decision::Prompt,
+            "the document cannot widen the authority's fallback to allow"
+        );
+        assert_eq!(
+            folded.decide("blocked.example.com"),
+            Decision::Deny,
+            "either layer's denial wins"
+        );
+
+        // The plain user path replaces the policy outright, so
+        // `/network default allow` still lands there.
+        let plain = NetworkPolicy {
+            default: DecisionToml::Prompt,
+            ..NetworkPolicy::default()
+        };
+        assert_eq!(
+            plain
+                .folded_with_lower_layer(NetworkPolicy {
+                    default: DecisionToml::Allow,
+                    ..NetworkPolicy::default()
+                })
+                .default,
+            DecisionToml::Prompt
+        );
+    }
+
+    /// A managed overlay may legitimately resolve `default = "allow"`. Its fold
+    /// takes the union branch, and the document's own fallback can only narrow
+    /// it — nothing there is more permissive than the authority's own policy,
+    /// because that policy already allowed everything.
+    #[test]
+    fn folding_an_allow_by_default_authority_only_narrows() {
+        let authority = NetworkPolicy {
+            default: DecisionToml::Allow,
+            ..NetworkPolicy::default()
+        };
+        let folded = authority.folded_with_lower_layer(NetworkPolicy {
+            default: DecisionToml::Deny,
+            allow: vec!["named.example.com".to_string()],
+            ..NetworkPolicy::default()
+        });
+
+        assert_eq!(
+            folded.decide("named.example.com"),
+            Decision::Allow,
+            "the authority allowed everything already; naming a host is not a widening"
+        );
+        assert_eq!(
+            folded.decide("other.example.com"),
+            Decision::Deny,
+            "the document narrowed the fallback, which is the direction it may move"
         );
     }
 

@@ -9,10 +9,11 @@
 //! # Platform Support
 //!
 //! - **macOS**: Uses Seatbelt (`sandbox-exec`) when the runtime probe succeeds
-//! - **Linux**: Uses bubblewrap only when the user opts in and `/usr/bin/bwrap`
-//!   is executable. The seccomp helper is not wired into child execution and
-//!   therefore is not advertised. The extension host is the exception to the
-//!   opt-in: it uses bubblewrap whenever a probe shows it works
+//! - **Linux**: Uses bubblewrap by default whenever `/usr/bin/bwrap` is
+//!   installed and a probe shows it can create its namespaces; `prefer_bwrap
+//!   = false` opts out. The seccomp helper is not wired into child execution
+//!   and therefore is not advertised. The extension host uses bubblewrap on
+//!   the same condition, probed per launch
 //!   (`extension_host::supervisor::plan_launch`).
 //! - **OpenHarmony**: No local Linux sandbox is advertised. Bubblewrap,
 //!   seccomp, and Linux `prctl` hardening are gated out under `target_env =
@@ -67,7 +68,7 @@ pub use policy::SandboxPolicy;
 // renaming it silently breaks that gate.
 pub const PUBLIC_SANDBOX_BACKENDS: &[&str] = &[
     "seatbelt (macOS, when available)",
-    "bubblewrap (Linux, opt-in when installed)",
+    "bubblewrap (Linux, default when installed and working)",
 ];
 
 /// Specification for a command to be executed, potentially within a sandbox.
@@ -344,8 +345,11 @@ pub fn get_platform_sandbox() -> Option<SandboxType> {
 
 /// Detect the sandbox wrapper the configured command path can actually use.
 ///
-/// Linux bubblewrap is deliberately opt-in. Source-only sandbox prototypes do
-/// not make commands sandboxed unless the child launch path applies them.
+/// Linux bubblewrap is on by default via `Config::prefers_bwrap` (an
+/// explicit `prefer_bwrap = false` opts out) and only selected when a real
+/// wrapped probe run proves it works on this host. Source-only sandbox
+/// prototypes do not make commands sandboxed unless the child launch path
+/// applies them.
 pub fn get_platform_sandbox_with_bwrap_preference(prefer_bwrap: bool) -> Option<SandboxType> {
     #[cfg(target_os = "macos")]
     {
@@ -1307,6 +1311,78 @@ mod tests {
             }
         }
         let _ = env;
+    }
+
+    /// Real Linux enforcement proof, not a marker check: the same
+    /// outside-workspace write succeeds unsandboxed and fails under
+    /// bubblewrap, and a normal workspace write succeeds inside the wrapper.
+    /// Skips on hosts where the functional probe says bwrap cannot run.
+    #[test]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn bwrap_workspace_write_blocks_outside_write_allows_inside() {
+        if !bwrap::is_available() {
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let outside = tempfile::Builder::new()
+            .prefix("cw_bwrap_outside")
+            .tempdir_in(&home)
+            .expect("outside-workspace tempdir under HOME");
+        let outside_target = outside.path().join("must_not_persist");
+        let inside_target = workspace.path().join("allowed_write");
+
+        let run = |manager: &SandboxManager, command: &str| -> (SandboxType, bool) {
+            let spec = CommandSpec::shell(
+                command,
+                workspace.path().to_path_buf(),
+                Duration::from_secs(15),
+            )
+            // CI's hermetic HOME lives under /tmp. Exclude temporary roots so
+            // the outside fixture is outside this test's writable policy too.
+            .with_policy(SandboxPolicy::WorkspaceWrite {
+                writable_roots: vec![],
+                network_access: false,
+                exclude_tmpdir: true,
+                exclude_slash_tmp: true,
+            });
+            let env = manager.prepare(&spec);
+            let (program, args) = env.command.split_first().unwrap();
+            let status = std::process::Command::new(program)
+                .args(args)
+                .current_dir(&env.cwd)
+                .envs(&env.env)
+                .status()
+                .expect("spawn prepared command");
+            (env.sandbox_type, status.success())
+        };
+
+        // Control: without the wrapper the outside write lands on the host —
+        // this proves the command itself is permitted and only the sandbox
+        // confines it.
+        let unwrapped = SandboxManager::default();
+        let (kind, ok) = run(
+            &unwrapped,
+            &format!("echo x > {}", outside_target.display()),
+        );
+        assert_eq!(kind, SandboxType::None);
+        assert!(ok);
+        assert!(outside_target.exists());
+        std::fs::remove_file(&outside_target).unwrap();
+
+        let wrapped = SandboxManager::with_bwrap_preference(true);
+        let (kind, ok) = run(&wrapped, &format!("echo x > {}", outside_target.display()));
+        assert_eq!(kind, SandboxType::LinuxBubblewrap);
+        assert!(!ok);
+        assert!(!outside_target.exists());
+
+        let (kind, ok) = run(&wrapped, &format!("echo ok > {}", inside_target.display()));
+        assert_eq!(kind, SandboxType::LinuxBubblewrap);
+        assert!(ok);
+        assert_eq!(
+            std::fs::read_to_string(&inside_target).unwrap().trim(),
+            "ok"
+        );
     }
 
     #[test]

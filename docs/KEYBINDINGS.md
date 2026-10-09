@@ -15,7 +15,7 @@ Global key chords are not yet user-configurable — tracked for a future release
 | `F3`                 | Open the provider/model picker (same as `/provider`)          |
 | `Ctrl-K`             | Open the command palette (slash-command finder)                |
 | `Ctrl-C`             | Cancel current turn / dismiss modal / arm-then-confirm quit    |
-| `Ctrl-B`             | Move a supported foreground shell wait into `/jobs` so the turn can continue; use `/jobs` or `Bash` with `action: "wait"` to inspect it |
+| `Ctrl-B`             | Release the current shell wait so the turn can continue; foreground commands move into `/jobs`, and background tasks keep running. Use `/jobs` or `Bash` with `action: "wait"` to inspect output |
 | `Ctrl-D`             | Quit (only when the composer is empty)                         |
 | `Tab`                | When the composer is empty, cycle TUI mode: Plan → Work → Operate → Plan |
 | `Shift+Tab`          | Cycle permission posture: Ask → Auto-Review → Full Access. Live regardless of composer contents or whether a turn is running (suppressed only while a modal other than Config is open) |
@@ -165,7 +165,7 @@ When `[memory] enabled = true`, typing `# foo` and pressing `Enter` appends `foo
 | `Alt-G` / `Alt-Shift-G` | Jump to top / bottom                            |
 | `Ctrl-Home` / `Ctrl-End` | Jump to top / bottom (also works from the composer)  |
 | `Alt-[` / `Alt-]`    | Jump between tool output blocks                     |
-| `Esc Esc`            | Backtrack to a previous user message (`←`/`→` steps, `Enter` rewinds) |
+| `Esc Esc`            | Backtrack to a previous user message (`←`/`→` steps, `Enter` rewinds). Rewinds the conversation only; files are not changed, and `/undo` puts them back |
 | `Esc`                | Return focus to composer                           |
 | `Ctrl-Y`             | With an empty composer, copy the focused transcript cell |
 | `Alt-V`              | Open raw detail for the focused tool or message    |
@@ -320,3 +320,13 @@ then `Enter` to submit or `Esc` to return to the options without sending.
 - **Bare Up/Down arrows scroll transcript when composer empty (v0.8.13).** Previously the `should_scroll_with_arrows` gate was hardcoded to false, meaning bare arrows always navigated composer history even when the composer was empty. Users in virtual terminals (Ghostty, Codex, Kitty-protocol) were especially affected because they couldn't use Cmd+Up / Alt+Up shortcuts.
 - **Configurable keymap (#436) and `tui.toml` (#437) remain deferred.** The `TuiPrefs` struct and loader exist in `settings.rs` but are not wired at startup. The named-binding registry that would let `~/.codewhale/tui.toml` override individual entries is still pending.
 - **No other broken bindings found.** Every other chord listed above resolves to a live handler in `crates/tui/src/tui/ui.rs` (key-event dispatch) or `crates/tui/src/tui/app.rs` (mode + state transitions).
+
+## Live Terminal dock
+
+In `/workbar terminal`, click the dock or press `Alt+W` to focus it. Typing,
+Enter, Tab and Ctrl+C reach the selected shell. Esc returns to the composer.
+`Alt+Down` / `Alt+Up` switch sessions; `Ctrl+N` starts a fresh shell.
+Mouse-wheel and PageUp/PageDown scroll output.
+
+See the [Terminal dock guide](GUIDE.md#live-terminal-dock) for permission
+boundaries, paste behavior and supported platforms.

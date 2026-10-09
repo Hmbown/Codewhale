@@ -9,6 +9,9 @@ use crate::tui::views::ModalKind;
 use super::model::{RailPanel, WorkRowId};
 
 pub(crate) fn select_dock_panel(app: &mut App, panel: RailPanel) {
+    if panel == RailPanel::Terminal {
+        app.launch.dismiss();
+    }
     app.work_surface.panel = panel;
     app.work_surface.explicit_view = true;
     app.work_surface.dismissed = false;

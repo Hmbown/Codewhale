@@ -88,6 +88,7 @@ pub struct AgentProfile {
     /// Runtime authority for a profile loaded from an immutable plugin
     /// snapshot. Rechecked at Agent spawn so another process can revoke it.
     pub plugin_authority: Option<crate::plugins::types::PluginAuthority>,
+    pub native_preset: Option<crate::extension_host::composition_scope::NativePresetRef>,
 }
 
 /// The minimum profile information needed to prevent a save from clobbering
@@ -154,7 +155,7 @@ struct AgentProfileToml {
     #[serde(default, alias = "model_hint", alias = "model_id")]
     model: Option<String>,
     /// Explicit provider id for `model` (#4093), e.g. `"deepseek"` or
-    /// `"openrouter"`. Validated against the known `ApiProvider` vocabulary at
+    /// `"openrouter"`. Validated against the known `ProviderKind` vocabulary at
     /// load time — never inferred by sniffing `model` for a provider-shaped
     /// substring (EPIC #2608). `deny_unknown_fields` no longer needs to guard
     /// this name: it is now a first-class, validated field instead of a
@@ -208,7 +209,28 @@ struct AgentProfilePermissionsToml {
 }
 
 pub fn load_workspace_agent_profiles(workspace: impl AsRef<Path>) -> Result<Vec<AgentProfile>> {
-    load_agent_profiles_from_dir(workspace.as_ref().join(WORKSPACE_AGENT_PROFILE_DIR))
+    let workspace = workspace.as_ref();
+    load_agent_profiles_from_dir_in(Some(workspace), workspace.join(WORKSPACE_AGENT_PROFILE_DIR))
+}
+
+/// Read one profile file. Under a workspace `root` a linked file or linked
+/// parent is refused (the shared confined-file refusal), so a repository
+/// cannot make a profile read land outside itself. `None` is for the user's
+/// own directories and installed plugins, which are not workspace content.
+fn read_profile_text(root: Option<&Path>, path: &Path) -> std::io::Result<String> {
+    match root {
+        Some(root) => crate::fs_confined::read_to_string(root, path),
+        None => std::fs::read_to_string(path),
+    }
+}
+
+/// Refuse a profile directory that reaches outside `root` through a link.
+fn check_profile_dir_confined(root: Option<&Path>, dir: &Path) -> Result<()> {
+    match root {
+        Some(root) => super::files::reject_linked_path(root, dir)
+            .with_context(|| format!("agent profile directory {}", dir.display())),
+        None => Ok(()),
+    }
 }
 
 /// Load every valid workspace profile while reporting invalid neighbors
@@ -217,16 +239,25 @@ pub fn load_workspace_agent_profiles(workspace: impl AsRef<Path>) -> Result<Vec<
 pub fn load_workspace_agent_profiles_tolerant(
     workspace: impl AsRef<Path>,
 ) -> Result<(Vec<AgentProfile>, Vec<AgentProfileLoadIssue>)> {
-    let dir = workspace.as_ref().join(WORKSPACE_AGENT_PROFILE_DIR);
-    load_agent_profiles_from_dir_tolerant(dir, ProfileOrigin::Workspace)
+    let workspace = workspace.as_ref();
+    let dir = workspace.join(WORKSPACE_AGENT_PROFILE_DIR);
+    load_agent_profiles_from_dir_tolerant_in(Some(workspace), dir, ProfileOrigin::Workspace)
 }
 
 pub fn load_agent_profiles_from_dir_tolerant(
     dir: impl AsRef<Path>,
     origin: ProfileOrigin,
 ) -> Result<(Vec<AgentProfile>, Vec<AgentProfileLoadIssue>)> {
+    load_agent_profiles_from_dir_tolerant_in(None, dir, origin)
+}
+
+fn load_agent_profiles_from_dir_tolerant_in(
+    root: Option<&Path>,
+    dir: impl AsRef<Path>,
+    origin: ProfileOrigin,
+) -> Result<(Vec<AgentProfile>, Vec<AgentProfileLoadIssue>)> {
     let dir = dir.as_ref();
-    let paths = agent_profile_paths(dir)?;
+    let paths = agent_profile_paths(root, dir)?;
     let mut profiles = Vec::new();
     let mut issues = Vec::new();
     let mut seen = BTreeSet::new();
@@ -236,7 +267,7 @@ pub fn load_agent_profiles_from_dir_tolerant(
     // Resolve identities first so duplicate ids fail closed as a group rather
     // than allowing whichever filename happens to sort first to win.
     for path in paths {
-        match load_agent_profile_identity_file(&path) {
+        match load_agent_profile_identity_file(root, &path) {
             Ok(identity) => {
                 let canonical_id = identity.id.to_ascii_lowercase();
                 if !seen.insert(canonical_id.clone()) {
@@ -267,7 +298,7 @@ pub fn load_agent_profiles_from_dir_tolerant(
             ));
             continue;
         }
-        match load_agent_profile_file(&path) {
+        match load_agent_profile_file(root, &path) {
             Ok(mut profile) => {
                 profile.origin = origin;
                 profiles.push(profile);
@@ -291,13 +322,13 @@ pub(crate) fn load_plugin_agent_profiles_from_component(
     let (mut profiles, issues) = if component.is_dir() {
         load_agent_profiles_from_dir_tolerant(component, ProfileOrigin::Plugin)?
     } else if component.is_file() {
-        match load_agent_profile_file(component) {
+        match load_agent_profile_file(None, component) {
             Ok(mut profile) => {
                 profile.origin = ProfileOrigin::Plugin;
                 (vec![profile], Vec::new())
             }
             Err(error) => {
-                let identity = load_agent_profile_identity_file(component).ok();
+                let identity = load_agent_profile_identity_file(None, component).ok();
                 (
                     Vec::new(),
                     vec![AgentProfileLoadIssue::new(
@@ -362,7 +393,17 @@ const CLAUDE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "notebookedi
 pub fn load_claude_agent_profiles_from_dir(
     dir: impl AsRef<Path>,
 ) -> Result<(Vec<AgentProfile>, Vec<AgentProfileLoadIssue>)> {
+    load_claude_agent_profiles_from_dir_in(None, dir)
+}
+
+/// [`load_claude_agent_profiles_from_dir`] for a directory that belongs to a
+/// workspace: with a `root`, links below it are refused.
+pub fn load_claude_agent_profiles_from_dir_in(
+    root: Option<&Path>,
+    dir: impl AsRef<Path>,
+) -> Result<(Vec<AgentProfile>, Vec<AgentProfileLoadIssue>)> {
     let dir = dir.as_ref();
+    check_profile_dir_confined(root, dir)?;
     if !dir.is_dir() {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -377,7 +418,7 @@ pub fn load_claude_agent_profiles_from_dir(
     let mut profiles: Vec<AgentProfile> = Vec::new();
     let mut issues = Vec::new();
     for path in paths {
-        match load_claude_agent_file(&path) {
+        match load_claude_agent_file(root, &path) {
             Ok(profile) => {
                 if profiles
                     .iter()
@@ -408,8 +449,8 @@ pub fn load_claude_agent_profiles_from_dir(
     Ok((profiles, issues))
 }
 
-fn load_claude_agent_file(path: &Path) -> Result<AgentProfile> {
-    let raw = std::fs::read_to_string(path)
+fn load_claude_agent_file(root: Option<&Path>, path: &Path) -> Result<AgentProfile> {
+    let raw = read_profile_text(root, path)
         .with_context(|| format!("reading Claude agent {}", path.display()))?;
     let (metadata, body) = crate::skills::parse_frontmatter(&raw)
         .map_err(|err| anyhow!("parsing Claude agent {}: {err}", path.display()))?
@@ -458,6 +499,7 @@ fn load_claude_agent_file(path: &Path) -> Result<AgentProfile> {
         non_empty_trimmed(metadata.get("description").map(String::as_str)).map(str::to_string);
     let instructions = trimmed_non_empty(body).map(str::to_string);
     Ok(AgentProfile {
+        native_preset: None,
         id,
         display_name: None,
         description: description.clone(),
@@ -519,26 +561,41 @@ fn claude_tools_role(tools: Option<&str>) -> &'static str {
 pub fn load_workspace_agent_profile_identities(
     workspace: impl AsRef<Path>,
 ) -> Result<Vec<AgentProfileIdentity>> {
-    let dir = workspace.as_ref().join(WORKSPACE_AGENT_PROFILE_DIR);
-    load_agent_profile_identities_from_dir(dir)
+    let workspace = workspace.as_ref();
+    let dir = workspace.join(WORKSPACE_AGENT_PROFILE_DIR);
+    load_agent_profile_identities_from_dir_in(Some(workspace), dir)
 }
 
 pub fn load_agent_profile_identities_from_dir(
     dir: impl AsRef<Path>,
 ) -> Result<Vec<AgentProfileIdentity>> {
+    load_agent_profile_identities_from_dir_in(None, dir)
+}
+
+fn load_agent_profile_identities_from_dir_in(
+    root: Option<&Path>,
+    dir: impl AsRef<Path>,
+) -> Result<Vec<AgentProfileIdentity>> {
     let dir = dir.as_ref();
-    agent_profile_paths(dir)?
+    agent_profile_paths(root, dir)?
         .into_iter()
-        .map(|path| load_agent_profile_identity_file(&path))
+        .map(|path| load_agent_profile_identity_file(root, &path))
         .collect()
 }
 
 pub fn load_agent_profiles_from_dir(dir: impl AsRef<Path>) -> Result<Vec<AgentProfile>> {
+    load_agent_profiles_from_dir_in(None, dir)
+}
+
+fn load_agent_profiles_from_dir_in(
+    root: Option<&Path>,
+    dir: impl AsRef<Path>,
+) -> Result<Vec<AgentProfile>> {
     let dir = dir.as_ref();
     let mut profiles = Vec::new();
     let mut seen = BTreeSet::new();
-    for path in agent_profile_paths(dir)? {
-        let profile = load_agent_profile_file(&path)?;
+    for path in agent_profile_paths(root, dir)? {
+        let profile = load_agent_profile_file(root, &path)?;
         if !seen.insert(profile.id.to_ascii_lowercase()) {
             bail!("duplicate agent profile id {}", profile.id);
         }
@@ -547,7 +604,8 @@ pub fn load_agent_profiles_from_dir(dir: impl AsRef<Path>) -> Result<Vec<AgentPr
     Ok(profiles)
 }
 
-fn agent_profile_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+fn agent_profile_paths(root: Option<&Path>, dir: &Path) -> Result<Vec<PathBuf>> {
+    check_profile_dir_confined(root, dir)?;
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -567,8 +625,11 @@ fn agent_profile_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn load_agent_profile_identity_file(path: &Path) -> Result<AgentProfileIdentity> {
-    let raw = std::fs::read_to_string(path)
+fn load_agent_profile_identity_file(
+    root: Option<&Path>,
+    path: &Path,
+) -> Result<AgentProfileIdentity> {
+    let raw = read_profile_text(root, path)
         .with_context(|| format!("reading agent profile identity {}", path.display()))?;
     let parsed: AgentProfileIdentityToml = toml::from_str(&raw)
         .map_err(|err| anyhow!("parsing agent profile identity {}: {err}", path.display()))?;
@@ -586,8 +647,8 @@ fn load_agent_profile_identity_file(path: &Path) -> Result<AgentProfileIdentity>
     })
 }
 
-fn load_agent_profile_file(path: &Path) -> Result<AgentProfile> {
-    let raw = std::fs::read_to_string(path)
+fn load_agent_profile_file(root: Option<&Path>, path: &Path) -> Result<AgentProfile> {
+    let raw = read_profile_text(root, path)
         .with_context(|| format!("reading agent profile {}", path.display()))?;
     let parsed: AgentProfileToml = toml::from_str(&raw)
         .map_err(|err| anyhow!("parsing agent profile {}: {err}", path.display()))?;
@@ -653,6 +714,7 @@ fn agent_profile_from_toml(path: &Path, parsed: AgentProfileToml) -> Result<Agen
     };
 
     Ok(AgentProfile {
+        native_preset: None,
         id,
         display_name: non_empty_trimmed(parsed.display_name.as_deref()).map(str::to_string),
         description,
@@ -1280,7 +1342,7 @@ text = "Scout deeply."
                 format!("id = \"{alias}\"\nrole_hint = \"{alias}\"\n"),
             )
             .unwrap();
-            let loaded = load_agent_profile_file(&path).expect("load compatibility profile");
+            let loaded = load_agent_profile_file(None, &path).expect("load compatibility profile");
             assert_eq!(loaded.id, alias, "saved identity remains addressable");
             assert_eq!(loaded.profile.role.name, "advisor");
             assert_eq!(loaded.profile.slot.as_str(), "advisor");
@@ -1566,6 +1628,94 @@ models = ["glm-5.2", "deepseek-v4-pro"]
         assert_eq!(issues.len(), 1);
         assert!(issues[0].detail.contains("reviewer.toml"), "{issues:?}");
         assert!(issues[0].detail.contains("model_class_hint"), "{issues:?}");
+    }
+
+    /// A workspace must not make a profile read land outside itself: a linked
+    /// profile file, or a linked profile directory, is refused and the content
+    /// behind the link never loads.
+    #[cfg(unix)]
+    #[test]
+    fn workspace_profiles_do_not_follow_links_out_of_the_workspace() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let hidden = "id = \"smuggled\"\nrole_hint = \"scout\"\n";
+        write_profile(outside.path(), "smuggled.toml", hidden);
+
+        let agents_dir = tmp.path().join(WORKSPACE_AGENT_PROFILE_DIR);
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_profile(
+            &agents_dir,
+            "scout.toml",
+            "id = \"scout\"\nrole_hint = \"scout\"\n",
+        );
+        symlink(
+            outside.path().join("smuggled.toml"),
+            agents_dir.join("linked.toml"),
+        )
+        .unwrap();
+
+        let (profiles, issues) = load_workspace_agent_profiles_tolerant(tmp.path())
+            .expect("directory discovery succeeds");
+        assert_eq!(
+            profiles.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            vec!["scout"]
+        );
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].detail.contains("linked.toml"), "{issues:?}");
+        assert!(
+            load_workspace_agent_profile_identities(tmp.path()).is_err(),
+            "the identity reader refuses the linked file too"
+        );
+        assert!(load_workspace_agent_profiles(tmp.path()).is_err());
+
+        // A linked profile directory is refused as a whole.
+        let other = TempDir::new().unwrap();
+        std::fs::create_dir_all(other.path().join(".codewhale")).unwrap();
+        symlink(
+            outside.path(),
+            other.path().join(WORKSPACE_AGENT_PROFILE_DIR),
+        )
+        .unwrap();
+        let error = load_workspace_agent_profiles_tolerant(other.path())
+            .expect_err("a linked profile directory is refused");
+        assert!(
+            format!("{error:#}").contains("Refusing symlinked"),
+            "{error:#}"
+        );
+
+        // The same directory is the user's own when no workspace root applies.
+        let (personal, _) = load_agent_profiles_from_dir_tolerant(
+            other.path().join(WORKSPACE_AGENT_PROFILE_DIR),
+            ProfileOrigin::Personal,
+        )
+        .expect("an operator-owned directory may be a link");
+        assert_eq!(personal.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_claude_agent_files_do_not_follow_links_out_of_the_workspace() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write_profile(
+            outside.path(),
+            "smuggled.md",
+            "---\nname: smuggled\ndescription: x\n---\nBody.\n",
+        );
+        let dir = tmp.path().join(CLAUDE_AGENT_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        symlink(outside.path().join("smuggled.md"), dir.join("linked.md")).unwrap();
+
+        let (profiles, issues) =
+            load_claude_agent_profiles_from_dir_in(Some(tmp.path()), &dir).unwrap();
+        assert!(profiles.is_empty(), "{profiles:?}");
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        // Without a workspace root the same file still loads: only workspace
+        // content is confined.
+        let (profiles, _) = load_claude_agent_profiles_from_dir(&dir).unwrap();
+        assert_eq!(profiles.len(), 1);
     }
 
     #[test]

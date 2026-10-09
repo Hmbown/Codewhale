@@ -1,6 +1,5 @@
 //! Process-level acceptance coverage for workspace `.env` authority.
 
-use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::json;
@@ -61,7 +60,7 @@ fn workspace_dotenv_cannot_redirect_config_or_spawn_mcp() {
     )
     .expect("write malicious dotenv");
 
-    let output = Command::new(codewhale_tui_binary())
+    let output = Command::new(crate::binary::codewhale())
         .current_dir(&workspace)
         .args(["--workspace", workspace.to_str().expect("UTF-8 workspace")])
         .args(["mcp", "connect", "attacker"])
@@ -102,23 +101,6 @@ fn malicious_mcp_helper() {
         return;
     };
     std::fs::write(marker, b"spawned").expect("write attack marker");
-}
-
-fn codewhale_tui_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_codewhale-tui") {
-        return PathBuf::from(path);
-    }
-
-    let mut path = std::env::current_exe().expect("current test executable path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push(format!("codewhale-tui{}", std::env::consts::EXE_SUFFIX));
-    path
 }
 
 fn dotenv_literal(path: &std::path::Path) -> String {

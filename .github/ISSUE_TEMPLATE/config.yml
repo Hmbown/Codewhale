@@ -1,10 +1,10 @@
 blank_issues_enabled: false
 contact_links:
   - name: Report a security vulnerability
-    url: https://github.com/Hmbown/CodeWhale/security/advisories/new
+    url: https://github.com/codewhale-hq/CodeWhale/security/advisories/new
     about: Please report security problems privately, not in a public issue. See SECURITY.md.
   - name: Ask a question
-    url: https://github.com/Hmbown/CodeWhale/discussions
+    url: https://github.com/codewhale-hq/CodeWhale/discussions
     about: How-to questions and ideas you want to talk through. 提问和讨论。
   - name: Discord
     url: https://discord.gg/37gfS3ksug

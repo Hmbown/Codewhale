@@ -12,9 +12,9 @@ export const docsShell: DocsShellDict = {
   metaDescription:
     "Install Codewhale, connect a provider, and get work done: modes and approvals, reviewing changes, workflows, sub-agents, MCP tools, hooks, the Runtime API, and troubleshooting.",
   portalMark: "Codewhale documentation",
-  heroTitle: "Get something done with Codewhale.",
+  heroTitle: "Install and use Codewhale",
   heroLead:
-    "Start from what you want to do. Each page says what you need, shows commands you can run today, and points to the next step.",
+    "Find installation steps, model setup, tool configuration and troubleshooting. The guides include commands and examples you can run.",
   installCta: "Install Codewhale",
 
   releaseLabel: "Release",
@@ -48,9 +48,9 @@ export const docsShell: DocsShellDict = {
   breadcrumbHome: "Home",
   breadcrumbDocs: "Docs",
 
-  helpTitle: "Need more than this page?",
+  helpTitle: "Get help",
   helpLead:
-    "Every guide is checked against a document in the repository. If something is wrong or missing, say so where the maintainer will see it.",
+    "Ask a question on Discord or report a documentation problem on GitHub.",
   helpSource: "Source: {name}",
   helpTroubleshooting: "Fix a problem",
   helpFaq: "FAQ",

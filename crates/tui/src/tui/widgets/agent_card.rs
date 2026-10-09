@@ -268,7 +268,7 @@ impl DelegateCard {
             let mut terminal = self.status.label().to_string();
             if let (Some(started), Some(finished)) = (self.started_at, self.finished_at) {
                 terminal.push_str(" · ");
-                terminal.push_str(&crate::elapsed::format_elapsed_ms(
+                terminal.push_str(&codewhale_command_contract::elapsed::format_elapsed_ms(
                     finished.duration_since(started).as_millis() as u64,
                 ));
             }

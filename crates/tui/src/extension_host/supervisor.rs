@@ -4,13 +4,33 @@
 //! The existing Rust manager owns heartbeat, crash budget, generation changes,
 //! and receipt-checked replay; this channel never replays a tool call.
 //!
+//! **Host-originated requests** run as tasks, not inline in the reader. Each
+//! request the host sends is admitted into [`InboundRequests`] (at most
+//! [`protocol::MAX_INFLIGHT`] at a time, no id twice, both violations end the
+//! host) and handed to [`HostEvents::host_request`] as its own task. It is
+//! cancelled by the host's `$/cancel` (whatever the handler later produces is
+//! dropped), by its owner's revocation (the host is answered `Cancelled`) and
+//! by the host's exit (nobody is answered); a handler that ignores its token is
+//! abandoned [`CANCEL_GRACE`] after the cancel. A method reserved for the other
+//! tier is neither accepted from the host nor sent to it
+//! (`protocol::MethodSpec::tiers`), and `host/hello` must report the tier the
+//! core launched and the built-in module digests it pins
+//! ([`check_hello_identity`]).
+//!
+//! **Tiers** ([`HostTier`]). The host is two processes, one per trust tier,
+//! started from the same bundle with `--tier=plugin|builtin` as the last
+//! argument. Each has its own data directory ([`tier_data_dir`]) and its own
+//! sandbox plan; the plugin tier's also denies reads of the builtin tier's
+//! data directory ([`host_denied_read_paths`]). Only the plugin tier starts
+//! in production today.
+//!
 //! **OS sandbox** ([`HostSandbox`]: the one value `/plugin`, doctor and the
 //! start diagnostic report). The host runs under Codewhale's command sandbox
-//! with a workspace-write policy rooted at
-//! `$CODEWHALE_HOME/extension-host/data`: no direct network, writes only
-//! there and in the temp dirs, and **no reads** of the Codewhale homes
-//! (everything but the bundle, its data dir and plugin code), the Codex and
-//! DSH credential homes, and the credential-store default deny-list
+//! with a workspace-write policy rooted at its tier's data directory (the
+//! plugin tier's is `$CODEWHALE_HOME/extension-host/data`): no direct network,
+//! writes only there and in the temp dirs, and **no reads** of the Codewhale
+//! homes (everything but the bundle, its data dir and plugin code), the Codex
+//! and DSH credential homes, and the credential-store default deny-list
 //! (`sandbox::read_guard`). Other user-readable files stay readable —
 //! including `.env` files, whose filename rule has no Seatbelt subpath or
 //! bubblewrap mount form — so this is defense-in-depth, not a containment
@@ -21,13 +41,17 @@
 //!   wrapper around `<runtime> --version` ([`probe_bwrap`]). When bwrap is
 //!   missing or cannot start — e.g. unprivileged user namespaces blocked by
 //!   Ubuntu 24.04's `kernel.apparmor_restrict_unprivileged_userns` — the host
-//!   starts unsandboxed and every surface says so with bwrap's own error;
-//!   never a silent downgrade. bwrap can mask only what exists, so each
+//!   refuses Native launch and reports the concrete error. The pinned Builtin
+//!   exception is diagnosed and ticket-bound. bwrap can mask only what exists, so each
 //!   Codewhale home is masked whole and its readable entries are bound again
 //!   (`sandbox::bwrap_exception_args`): an entry created after launch is
 //!   denied, as on macOS.
-//! * Windows: unsandboxed (the Job Object contains the process tree; that is
-//!   not isolation), and `/plugin` says so.
+//! * Windows: Native uses a freshly created LPAC AppContainer with no network
+//!   capabilities. Rust checks its actual token, attaches/caps the existing Job
+//!   before resuming, and requires a real data-read/write + outside-read/write
+//!   + loopback-network allow/deny probe. Only Core-selected runtime/bundle and
+//!     reviewed staged roots are granted reads. The Job is lifetime/memory only.
+//!     Builtin retains the separately diagnosed Rust-ticket-bound exception.
 //!
 //! Known limits under bubblewrap: a default-deny-list credential store
 //! created after launch stays readable (Seatbelt denies it by name); a
@@ -83,16 +107,20 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::dependencies::{HostRuntime, HostRuntimeKind};
+use crate::tools::codemode::PauseClock;
 
 use super::protocol::{
-    self, CoreRequest, HostLimits, HostMessage, HostNotification, HostRequest, InitializeParams,
-    RegisterResult, error_code,
+    self, CoreRequest, Direction, HelloParams, HostLimits, HostMessage, HostNotification,
+    HostRequest, InitializeParams, RegisterResult, RpcErrorWire, error_code,
 };
+use super::tier::{self, BuiltinModule, HostTier};
 
 /// Budget for spawn → `host/hello` → `host/initialize` → `host/ready`.
 ///
@@ -138,6 +166,8 @@ pub enum HostCallError {
 /// available), its working directory, and which sandbox applies.
 #[derive(Debug, Clone)]
 pub(crate) struct HostLaunch {
+    /// The trust tier this host process serves (`--tier=` in its argv).
+    pub tier: HostTier,
     pub program: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
@@ -153,6 +183,13 @@ pub(crate) struct HostLaunch {
     /// How the cap is meant to be enforced; a macOS Bun host confirms its
     /// jetsam limit in `host/hello` or initialization is refused.
     pub memory: MemoryEnforcement,
+    /// The built-in module digests `host/hello` must report: the table this
+    /// build pins ([`tier::BUILTIN_MODULES`]), which the host bundle embedded
+    /// from the same build must agree with ([`check_hello_identity`]).
+    pub builtin_modules: &'static [BuiltinModule],
+    /// Exact verified Native LPAC plan; Builtin retains its labelled exception.
+    #[cfg(windows)]
+    pub windows: Option<super::windows::NativeSandbox>,
 }
 
 /// Whether the host runs under an OS sandbox, and why not when it does not
@@ -181,6 +218,10 @@ impl HostSandbox {
 impl std::fmt::Display for HostSandbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Wrapped(name) if name == "windows-lpac" => write!(
+                f,
+                "windows-lpac sandbox (no direct network; reads only the selected runtime, canonical bundle and reviewed staged code; writes to Native data and platform-private scratch; Job limits lifetime/memory)"
+            ),
             Self::Wrapped(name) => write!(
                 f,
                 "{name} sandbox (no direct network; the Codewhale home except plugin code, the Codex and DSH credential homes and the default credential stores are unreadable; other files you can read, such as project .env files, are not protected)"
@@ -256,7 +297,11 @@ impl MemoryEnforcement {
 /// not in CI: under `RLIMIT_DATA` Node 24 aborts when it creates the host's
 /// watchdog Worker at 512 MiB, and Bun 1.4 aborts at startup at 256 MiB.
 /// Both started and ran at 1 GiB and failed an allocation past it. An idle
-/// host used 34–67 MB resident.
+/// host used 34–67 MB resident. On hosted x64 Linux (Node 24.21) each V8
+/// isolate's executable code range is charged to `RLIMIT_DATA` in full, and
+/// a default-sized second isolate aborted the host at this cap; the
+/// watchdog Worker therefore asks for a 16 MiB code range (`src/main.ts`).
+/// Plugins cannot start Workers (`denyNativeCode`), so it is the only one.
 pub const HOST_MEMORY_CAP: u64 = 1 << 30;
 
 /// Runtime flags, before the bundle path. Keep in sync with
@@ -264,7 +309,9 @@ pub const HOST_MEMORY_CAP: u64 = 1 << 30;
 ///
 /// - Node: a 256 MB old-space cap, `__proto__` throws, no native addons,
 ///   and the [`crate::dependencies::NODE_NATIVE_CODE_FLAGS`] this Node
-///   accepts (`node:sqlite`, and `node:ffi` where it exists).
+///   accepts (`node:sqlite`, and `node:ffi` where it exists). On Windows it
+///   also keeps symlinked paths as given, so module resolution never lstats
+///   the drive root the LPAC cannot read.
 /// - Bun ignores all of those except `--no-addons`. Instead it gets
 ///   `--no-install`, because Bun otherwise fetches a missing package from npm
 ///   while plugin code is running. It also gets `--no-env-file` and
@@ -274,6 +321,9 @@ pub const HOST_MEMORY_CAP: u64 = 1 << 30;
 ///   are locked in the host itself (`src/runtime.ts`).
 #[must_use]
 pub(crate) fn runtime_args(runtime: &HostRuntime) -> Vec<String> {
+    if runtime.compiled {
+        return Vec::new();
+    }
     base_runtime_args(runtime.kind)
         .iter()
         .chain(&runtime.native_code_flags)
@@ -299,16 +349,32 @@ pub(crate) fn runtime_env(kind: HostRuntimeKind) -> Vec<(String, String)> {
     let mut env = vec![("NODE_OPTIONS".to_string(), String::new())];
     if kind == HostRuntimeKind::Bun {
         env.push(("BUN_JSC_useShadowRealm".to_string(), "0".to_string()));
+        env.push(("BUN_OPTIONS".to_string(), String::new()));
+        // This variable otherwise makes a standalone image act as the Bun CLI.
+        env.push(("BUN_BE_BUN".to_string(), "0".to_string()));
     }
     env
 }
 
 fn base_runtime_args(kind: HostRuntimeKind) -> &'static [&'static str] {
     match kind {
+        #[cfg(not(windows))]
         HostRuntimeKind::Node => &[
             "--max-old-space-size=256",
             "--disable-proto=throw",
             "--no-addons",
+        ],
+        // Node resolves the entry bundle with realpathSync, which lstats every
+        // ancestor from `C:\`. A Windows LPAC cannot read the drive root, so
+        // the host died before its handshake (EPERM, lstat 'C:\'). Keep the
+        // granted path as given; the LPAC still decides every access.
+        #[cfg(windows)]
+        HostRuntimeKind::Node => &[
+            "--max-old-space-size=256",
+            "--disable-proto=throw",
+            "--no-addons",
+            "--preserve-symlinks",
+            "--preserve-symlinks-main",
         ],
         #[cfg(windows)]
         HostRuntimeKind::Bun => &[
@@ -371,7 +437,13 @@ const HOST_DENIED_HOME_ENTRIES: &[&str] = &[
 /// is denied whole and its readable entries come back as exceptions to bind
 /// again. Without it (Seatbelt, which matches paths that do not exist yet)
 /// every other entry is denied by name and there are no exceptions.
+///
+/// The plugin tier also denies the builtin tier's data directory, which lies
+/// inside the readable `extension-host/` entry: plugin code never reads
+/// tier-0 state. Planning materializes that sibling before the wrapper masks
+/// it, because bubblewrap cannot mask a directory that does not exist yet.
 pub(crate) fn host_denied_read_paths(
+    tier: HostTier,
     home: &Path,
     whole_homes: bool,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
@@ -390,12 +462,19 @@ pub(crate) fn host_denied_read_paths(
         roots.push(user.join(".deepseek"));
     }
     for root in roots {
+        // The builtin tier's data directory, inside the readable
+        // `extension-host/` entry of every Codewhale home: not for plugin code.
+        let tier_zero_data =
+            (tier == HostTier::Plugin).then(|| tier_data_dir(&root, HostTier::Builtin));
         if whole_homes {
             for entry in HOST_READABLE_HOME_ENTRIES {
                 let readable = root.join(entry);
                 if !exceptions.contains(&readable) {
                     exceptions.push(readable);
                 }
+            }
+            if let Some(dir) = tier_zero_data {
+                push(dir);
             }
             push(root);
             continue;
@@ -416,6 +495,12 @@ pub(crate) fn host_denied_read_paths(
         // exist yet cannot be canonicalized later, so deny it under both the
         // given and the resolved spelling of its (existing) root.
         let resolved = std::fs::canonicalize(&root).ok();
+        if let Some(dir) = tier_zero_data {
+            if let Some(resolved) = &resolved {
+                push(tier_data_dir(resolved, HostTier::Builtin));
+            }
+            push(dir);
+        }
         for name in names {
             let readable = name
                 .to_str()
@@ -443,36 +528,154 @@ pub(crate) fn host_denied_read_paths(
     (paths, exceptions)
 }
 
-/// Plan the host launch. Blocking (creates the data dir, canonicalizes the
-/// deny-list, and on Linux runs the bwrap probe); call from `spawn_blocking`.
+/// Plan the host launch for `tier`: the runtime's flags, the bundle, then the
+/// tier (`--tier=plugin|builtin`, which the host reads from its own argv).
+/// Blocking (creates the tier's data dir, canonicalizes the deny-list, and on
+/// Linux runs the bwrap probe); call from `spawn_blocking`.
 pub(crate) fn plan_launch(
+    tier: HostTier,
     runtime: &HostRuntime,
     bundle: &Path,
     home: &Path,
     memory_cap: u64,
 ) -> Result<HostLaunch, String> {
-    let data = host_data_dir(home)?;
+    let data = host_data_dir(home, tier)?;
+    // Bubblewrap cannot mask a root that does not exist yet. Materialize the
+    // sibling before a Native host gets its immutable read-deny projection.
+    if tier == HostTier::Plugin {
+        host_data_dir(home, HostTier::Builtin)?;
+    }
     let mut args = runtime_args(runtime);
-    args.push(bundle.to_string_lossy().into_owned());
-    let wrapped = wrap_host(&runtime.path, &args, &data, home);
-    host_launch(runtime, args, data, memory_cap, wrapped)
+    if !runtime.compiled {
+        args.push(bundle.to_string_lossy().into_owned());
+    }
+    args.push(tier.argv_flag());
+    #[cfg(windows)]
+    if tier == HostTier::Plugin {
+        let sandbox =
+            super::windows::NativeSandbox::prepare(runtime, bundle, home, &data, memory_cap)?;
+        return Ok(HostLaunch {
+            tier,
+            program: sandbox.program.clone(),
+            args,
+            cwd: data,
+            sandbox: HostSandbox::Wrapped("windows-lpac".into()),
+            sandbox_env: vec![("CODEWHALE_SANDBOX".into(), "windows-lpac".into())],
+            runtime: runtime.clone(),
+            runtime_env: runtime_env(runtime.kind),
+            memory_cap,
+            memory: MemoryEnforcement::JobObject,
+            builtin_modules: tier::BUILTIN_MODULES,
+            windows: Some(sandbox),
+        });
+    }
+    let wrapped = wrap_host(tier, &runtime.path, &args, &data, home);
+    host_launch(tier, runtime, args, data, memory_cap, wrapped)
 }
 
-/// The sandbox a host started now would get, planned (and on Linux probed)
-/// exactly as [`plan_launch`] does, for doctor. Blocking; creates the data
-/// dir, as a launch would.
-pub(crate) fn planned_sandbox(runtime: &HostRuntime, home: &Path) -> Result<HostSandbox, String> {
-    let data = host_data_dir(home)?;
+/// The sandbox a `tier` host started now would get, planned (and on Linux
+/// probed) exactly as [`plan_launch`] does, for doctor. Blocking; creates the
+/// data dir, as a launch would.
+pub(crate) fn planned_sandbox(
+    tier: HostTier,
+    runtime: &HostRuntime,
+    home: &Path,
+) -> Result<HostSandbox, String> {
+    let data = host_data_dir(home, tier)?;
+    if tier == HostTier::Plugin {
+        host_data_dir(home, HostTier::Builtin)?;
+    }
+    #[cfg(windows)]
+    if tier == HostTier::Plugin {
+        let bundle = super::materialize_bundle(home)?;
+        return Ok(
+            match super::windows::NativeSandbox::prepare(
+                runtime,
+                &bundle,
+                home,
+                &data,
+                HOST_MEMORY_CAP,
+            ) {
+                Ok(_) => HostSandbox::Wrapped("windows-lpac".into()),
+                Err(error) => HostSandbox::Unsandboxed(error),
+            },
+        );
+    }
     Ok(
-        match wrap_host(&runtime.path, &runtime_args(runtime), &data, home) {
+        match wrap_host(tier, &runtime.path, &runtime_args(runtime), &data, home) {
             Ok(wrapped) => HostSandbox::Wrapped(wrapped.name),
             Err(reason) => HostSandbox::Unsandboxed(reason),
         },
     )
 }
 
-fn host_data_dir(home: &Path) -> Result<PathBuf, String> {
-    let data = home.join("extension-host").join("data");
+/// A tier's data directory: its host's working directory and, under the OS
+/// sandbox, its only writable root. Pure.
+///
+/// The plugin tier keeps the directory it has always had,
+/// `extension-host/data`, because the per-plugin directories under it
+/// ([`plugin_data_dir`]) hold installed plugins' data and moving it would lose
+/// that. The builtin tier's is a sibling, `extension-host/data-builtin`, not a
+/// child: a child would lie inside the plugin tier's writable root, and the
+/// host sandbox has no per-subpath write deny, so plugin code could then write
+/// tier-0 state.
+pub(crate) fn tier_data_dir(home: &Path, tier: HostTier) -> PathBuf {
+    let base = home.join("extension-host");
+    match tier {
+        HostTier::Plugin => base.join("data"),
+        HostTier::Builtin => base.join("data-builtin"),
+    }
+}
+
+/// The directory an owner's code is given as its own: a plugin's
+/// ([`plugin_data_dir`], unchanged), or `modules/<module>` under the builtin
+/// tier's data directory for a built-in module (`plugin_name` is the module
+/// name, which [`HostTier::check_owner_id`] has restricted to a plain name).
+/// Pure.
+pub(crate) fn owner_data_dir(
+    home: &Path,
+    tier: HostTier,
+    plugin_id: &str,
+    plugin_name: &str,
+) -> PathBuf {
+    match tier {
+        HostTier::Plugin => plugin_data_dir(home, plugin_id, plugin_name),
+        HostTier::Builtin => tier_data_dir(home, tier).join("modules").join(plugin_name),
+    }
+}
+
+/// One plugin's own directory inside the host's data dir, which is the host
+/// sandbox's writable root: stable for one plugin id (so it survives updates
+/// and restarts), distinct per plugin, and a single path component under
+/// `plugins/`. The id contains slashes and the name alone can collide between
+/// scopes, so the name is joined to a digest of the id. Pure.
+pub(crate) fn plugin_data_dir(home: &Path, plugin_id: &str, plugin_name: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(plugin_id.as_bytes());
+    let short: String = digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let name: String = plugin_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    home.join("extension-host")
+        .join("data")
+        .join("plugins")
+        .join(format!("{name}-{short}"))
+}
+
+fn host_data_dir(home: &Path, tier: HostTier) -> Result<PathBuf, String> {
+    let data = tier_data_dir(home, tier);
     std::fs::create_dir_all(&data)
         .map_err(|error| format!("cannot create {}: {error}", data.display()))?;
     Ok(data)
@@ -494,7 +697,13 @@ const WINDOWS_UNSANDBOXED: &str = "Windows has no host sandbox yet; its Job Obje
 
 /// Wrap `program args` in the host's OS sandbox (module docs), or say why it
 /// has none here. Blocking.
-fn wrap_host(program: &Path, args: &[String], data: &Path, home: &Path) -> Result<Wrapped, String> {
+fn wrap_host(
+    tier: HostTier,
+    program: &Path,
+    args: &[String],
+    data: &Path,
+    home: &Path,
+) -> Result<Wrapped, String> {
     use crate::sandbox::{CommandSpec, SandboxManager, SandboxPolicy, SandboxType};
     if cfg!(windows) {
         return Err(WINDOWS_UNSANDBOXED.to_string());
@@ -515,7 +724,7 @@ fn wrap_host(program: &Path, args: &[String], data: &Path, home: &Path) -> Resul
     };
     let bwrap = cfg!(all(target_os = "linux", not(target_env = "ohos")));
     let mut manager = SandboxManager::with_bwrap_preference(bwrap);
-    let (denied, exceptions) = host_denied_read_paths(home, bwrap);
+    let (denied, exceptions) = host_denied_read_paths(tier, home, bwrap);
     manager.set_denied_read_subpaths(denied);
     manager.set_denied_read_exceptions(exceptions);
     let env = manager.prepare(&spec(args.to_vec()));
@@ -539,8 +748,10 @@ fn wrap_host(program: &Path, args: &[String], data: &Path, home: &Path) -> Resul
 }
 
 /// The launch for a [`wrap_host`] outcome: the wrapper's argv, or the
-/// runtime itself, unsandboxed, carrying the reason `/plugin` shows. Pure.
+/// pinned Builtin runtime itself, carrying the reason `/plugin` shows. Native
+/// code is refused without the verified wrapper. Pure.
 fn host_launch(
+    tier: HostTier,
     runtime: &HostRuntime,
     args: Vec<String>,
     data: PathBuf,
@@ -560,6 +771,13 @@ fn host_launch(
                 wrapped.env,
             )
         }
+        Err(reason) if tier == HostTier::Plugin => {
+            return Err(format!(
+                "Native extensions require a verified OS sandbox: {reason}"
+            ));
+        }
+        // Only the pinned Builtin tier may run without filesystem/network
+        // isolation. Every effect is still admitted by Rust operation tickets.
         Err(reason) => (
             runtime.path.clone(),
             args,
@@ -568,6 +786,7 @@ fn host_launch(
         ),
     };
     Ok(HostLaunch {
+        tier,
         program,
         args,
         cwd: data,
@@ -577,6 +796,9 @@ fn host_launch(
         runtime_env: runtime_env(runtime.kind),
         memory_cap,
         memory: MemoryEnforcement::planned(runtime.kind),
+        builtin_modules: tier::BUILTIN_MODULES,
+        #[cfg(windows)]
+        windows: None,
     })
 }
 
@@ -678,7 +900,7 @@ fn bwrap_probe_verdict(succeeded: bool, status: &str, stderr: &str) -> Result<()
 /// Known limit: in that case `/plugin` and doctor still name the configured
 /// cap, not the lower inherited one.
 #[cfg(target_os = "linux")]
-fn limit_child_memory(command: &mut tokio::process::Command, cap: u64) {
+pub(super) fn limit_child_memory(command: &mut tokio::process::Command, cap: u64) {
     // SAFETY: the closure runs in the forked child before exec and calls only
     // `getrlimit` and `setrlimit`, which are async-signal-safe; it allocates
     // nothing.
@@ -705,7 +927,7 @@ fn limit_child_memory(command: &mut tokio::process::Command, cap: u64) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn limit_child_memory(_command: &mut tokio::process::Command, _cap: u64) {}
+pub(super) fn limit_child_memory(_command: &mut tokio::process::Command, _cap: u64) {}
 
 /// Resident size of `pid` in bytes, for the macOS memory-cap check.
 #[cfg(target_os = "macos")]
@@ -756,13 +978,238 @@ fn exit_reason(
     reason
 }
 
+/// What one host-originated request is told about its own life: its id on the
+/// channel and the token that fires when the request is cancelled (the host's
+/// `$/cancel`, the owner's revocation, or the host's exit). A handler that
+/// waits for anything must wait on `cancel` too; one that ignores it is
+/// abandoned [`CANCEL_GRACE`] after it fires and its answer is dropped.
+pub(crate) struct HostRequestContext {
+    pub id: u64,
+    pub cancel: CancellationToken,
+    /// The channel's kill switch, for a handler that finds the host in
+    /// violation of the protocol (it ends the host, like a bad frame).
+    kill: mpsc::Sender<String>,
+}
+
+#[cfg(test)]
+impl HostRequestContext {
+    /// A context not attached to any channel, with the receiver its violations
+    /// arrive on and the token that cancels it.
+    pub(crate) fn for_test(id: u64) -> (Self, mpsc::Receiver<String>, CancellationToken) {
+        let (kill, violations) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        (
+            Self {
+                id,
+                cancel: cancel.clone(),
+                kill,
+            },
+            violations,
+            cancel,
+        )
+    }
+}
+
+impl HostRequestContext {
+    /// Report a protocol violation by the host: the host process is ended.
+    pub(crate) fn violation(&self, reason: String) {
+        let _ = self.kill.try_send(format!("protocol violation: {reason}"));
+    }
+}
+
 /// Callbacks from the channel into the manager.
+#[async_trait]
 pub(crate) trait HostEvents: Send + Sync + 'static {
     fn register(&self, params: &protocol::RegisterParams) -> RegisterResult;
     fn unregister(&self, params: &protocol::UnregisterParams);
     fn faulted(&self, params: &protocol::FaultedParams);
     fn log(&self, params: &protocol::LogParams);
     fn exited(&self, host_generation: u64, reason: String, stderr_tail: String);
+
+    /// A current, non-revoked call received a correlated reply. Late replies
+    /// and heartbeat answers do not pass here; the monitor validates pongs.
+    fn responded(&self) {}
+
+    /// Answer one host-originated request. Every such request runs as its own
+    /// task (`start_host_request`), so a handler may take as long as it needs
+    /// without holding up the reader. The registry requests are quick and
+    /// synchronous; a request that has to wait (a tool call the host asked the
+    /// core to make, later) overrides this and observes `cx.cancel`.
+    async fn host_request(
+        &self,
+        request: HostRequest,
+        cx: HostRequestContext,
+    ) -> Result<Value, RpcErrorWire> {
+        registry_host_request(self, request, &cx)
+    }
+}
+
+/// The answer to a registry request (`registry/register`,
+/// `registry/unregister`), which is quick and synchronous, and the refusal of a
+/// `core/call` an events implementation does not serve. The default
+/// [`HostEvents::host_request`], and what an overriding one falls back to.
+pub(crate) fn registry_host_request<E: HostEvents + ?Sized>(
+    events: &E,
+    request: HostRequest,
+    cx: &HostRequestContext,
+) -> Result<Value, RpcErrorWire> {
+    tracing::trace!(target: "extension_host", id = cx.id, "host request");
+    // A request cancelled before its handler began does nothing.
+    if cx.cancel.is_cancelled() {
+        return Err(RpcErrorWire {
+            code: error_code::CANCELLED,
+            message: "cancelled".to_string(),
+            data: None,
+        });
+    }
+    match request {
+        HostRequest::Register(params) => Ok(serde_json::to_value(events.register(&params))
+            .unwrap_or_else(|_| json!({"refused": "internal"}))),
+        HostRequest::Unregister(params) => {
+            events.unregister(&params);
+            Ok(json!({}))
+        }
+        HostRequest::ExecutionRedeem(_)
+        | HostRequest::CoreCall(_)
+        | HostRequest::ProcLaunch(_)
+        | HostRequest::ProcRead(_)
+        | HostRequest::ProcWrite(_)
+        | HostRequest::ProcClose(_)
+        | HostRequest::NetStart(_)
+        | HostRequest::NetFetch(_)
+        | HostRequest::NetRead(_)
+        | HostRequest::NetRelease(_)
+        | HostRequest::NetClose(_) => Err(RpcErrorWire {
+            code: error_code::REFUSED,
+            message: "core/call is not served here".to_string(),
+            data: None,
+        }),
+    }
+}
+
+/// Why an in-flight host request was cancelled; decides what the host is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelReason {
+    /// The host sent `$/cancel`: it has already stopped waiting, so whatever
+    /// the handler produces afterwards is dropped.
+    Host,
+    /// The request's owner was revoked: the host is answered `Cancelled`.
+    Revoked,
+    /// The host exited: there is nobody to answer.
+    Exit,
+}
+
+struct InboundRequest {
+    /// The plugin whose revocation cancels it.
+    owner: String,
+    cancel: CancellationToken,
+    cancelled: Option<CancelReason>,
+}
+
+/// The host-originated requests in flight, by the id the host gave them. At
+/// most [`protocol::MAX_INFLIGHT`] at a time (the same bound the host holds
+/// itself to), no id twice, and nothing admitted once the host has exited.
+#[derive(Default)]
+pub(crate) struct InboundRequests {
+    table: Mutex<InboundTable>,
+}
+
+#[derive(Default)]
+struct InboundTable {
+    requests: HashMap<u64, InboundRequest>,
+    closed: bool,
+}
+
+impl InboundRequests {
+    /// Start tracking request `id` of `owner`. `Err` is a protocol violation:
+    /// the host reused an id still in flight, or has more requests in flight
+    /// than its own limit allows.
+    fn admit(&self, id: u64, owner: &str) -> Result<CancellationToken, String> {
+        let mut table = self.table.lock().expect("inbound lock");
+        if table.closed {
+            return Err("host request after the host exited".to_string());
+        }
+        if table.requests.contains_key(&id) {
+            return Err(format!("host request id {id} is already in flight"));
+        }
+        if table.requests.len() >= protocol::MAX_INFLIGHT {
+            return Err(format!(
+                "more than {} host requests in flight",
+                protocol::MAX_INFLIGHT
+            ));
+        }
+        let cancel = CancellationToken::new();
+        table.requests.insert(
+            id,
+            InboundRequest {
+                owner: owner.to_string(),
+                cancel: cancel.clone(),
+                cancelled: None,
+            },
+        );
+        Ok(cancel)
+    }
+
+    /// The host's `$/cancel {id}`. An id that is not in flight (already
+    /// answered, or never sent) is ignored: the cancel raced the answer.
+    fn cancel_by_host(&self, id: u64) {
+        if let Some(request) = self
+            .table
+            .lock()
+            .expect("inbound lock")
+            .requests
+            .get_mut(&id)
+        {
+            request.fire(CancelReason::Host);
+        }
+    }
+
+    /// Cancel every in-flight request of `plugin_id`: its owner was revoked.
+    fn cancel_owner(&self, plugin_id: &str) {
+        for request in self
+            .table
+            .lock()
+            .expect("inbound lock")
+            .requests
+            .values_mut()
+            .filter(|request| request.owner == plugin_id)
+        {
+            request.fire(CancelReason::Revoked);
+        }
+    }
+
+    /// The host exited: cancel everything and admit nothing more.
+    fn cancel_all(&self) {
+        let mut table = self.table.lock().expect("inbound lock");
+        table.closed = true;
+        for request in table.requests.values_mut() {
+            request.fire(CancelReason::Exit);
+        }
+    }
+
+    /// The handler is done (or abandoned): forget the request and say why it
+    /// was cancelled, if it was.
+    fn finish(&self, id: u64) -> Option<CancelReason> {
+        self.table
+            .lock()
+            .expect("inbound lock")
+            .requests
+            .remove(&id)
+            .and_then(|request| request.cancelled)
+    }
+
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        self.table.lock().expect("inbound lock").requests.len()
+    }
+}
+
+impl InboundRequest {
+    /// Cancel for `reason`; the first reason stands.
+    fn fire(&mut self, reason: CancelReason) {
+        self.cancelled.get_or_insert(reason);
+        self.cancel.cancel();
+    }
 }
 
 /// Receives one request's outcome.
@@ -772,6 +1219,8 @@ struct PendingCall {
     tx: oneshot::Sender<Result<Value, HostCallError>>,
     /// Plugin whose revocation cancels this call.
     owner: Option<String>,
+    /// Exact never-reused registration handle, when this is a contribution call.
+    handle: Option<u64>,
     revoked: bool,
     heartbeat: bool,
 }
@@ -783,6 +1232,11 @@ struct Handshake {
 }
 
 pub(crate) struct HostProcess {
+    /// The tier this process was launched for.
+    pub tier: HostTier,
+    /// The generation of its tier's host this process is (what the manager
+    /// bumps per launch); a capability ticket is bound to it.
+    pub generation: u64,
     pub pid: Option<u32>,
     /// The runtime the Rust side launched; `host/hello` must agree.
     pub runtime: HostRuntime,
@@ -793,8 +1247,12 @@ pub(crate) struct HostProcess {
     memory: Arc<std::sync::OnceLock<MemoryEnforcement>>,
     pub sandbox: HostSandbox,
     tree: Arc<crate::process_tree::ProcessTree>,
+    #[cfg(windows)]
+    windows: Option<super::windows::NativeSandbox>,
     outbound: mpsc::Sender<Vec<u8>>,
     pending: Arc<Mutex<HashMap<u64, PendingCall>>>,
+    /// Requests the host sent, running as tasks ([`start_host_request`]).
+    inbound: Arc<InboundRequests>,
     /// Admission checks and sealing hold `pending`; the manager also reads
     /// this flag to avoid activation while the exit callback is still pending.
     admission_closed: AtomicBool,
@@ -821,7 +1279,144 @@ fn tail_string(tail: &Mutex<VecDeque<u8>>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// The watcher/protocol remains one implementation for both launch mechanisms.
+enum HostChild {
+    Tokio(tokio::process::Child),
+    #[cfg(windows)]
+    Native(super::windows::Child),
+}
+impl HostChild {
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self {
+            Self::Tokio(child) => child.wait().await,
+            #[cfg(windows)]
+            Self::Native(child) => child.wait().await,
+        }
+    }
+    async fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Tokio(child) => child.kill().await,
+            #[cfg(windows)]
+            Self::Native(child) => child.kill().await,
+        }
+    }
+}
+struct SpawnedHost {
+    child: HostChild,
+    pid: Option<u32>,
+    tree: Arc<crate::process_tree::ProcessTree>,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+}
+fn spawn_host(
+    launch: &HostLaunch,
+    mut command: tokio::process::Command,
+    _environment: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<SpawnedHost, String> {
+    #[cfg(windows)]
+    if let Some(sandbox) = &launch.windows {
+        let native = sandbox
+            .spawn(&launch.args, _environment, launch.memory_cap)
+            .map_err(|error| {
+                format!("failed to launch the verified Windows Native host: {error}")
+            })?;
+        let stdin =
+            tokio::process::ChildStdin::from_std(std::process::ChildStdin::from(native.stdin))
+                .map_err(|error| format!("host stdin conversion failed: {error}"))?;
+        let stdout =
+            tokio::process::ChildStdout::from_std(std::process::ChildStdout::from(native.stdout))
+                .map_err(|error| format!("host stdout conversion failed: {error}"))?;
+        let stderr =
+            tokio::process::ChildStderr::from_std(std::process::ChildStderr::from(native.stderr))
+                .map_err(|error| format!("host stderr conversion failed: {error}"))?;
+        let tree = Arc::clone(&native.child.tree);
+        let pid = Some(native.child.pid);
+        return Ok(SpawnedHost {
+            child: HostChild::Native(native.child),
+            pid,
+            tree,
+            stdin,
+            stdout,
+            stderr,
+        });
+    }
+    // On Linux a failure to apply the memory cap in the child surfaces
+    // here as a spawn error carrying only its errno, indistinguishable
+    // from a failed exec, so the message names both.
+    let mut child = command.spawn().map_err(|error| {
+            if cfg!(target_os = "linux") {
+                format!(
+                    "failed to start {}, or to apply its {} MiB memory cap (RLIMIT_DATA) before exec: {error}",
+                    launch.program.display(),
+                    launch.memory_cap / (1024 * 1024)
+                )
+            } else {
+                format!("failed to start {}: {error}", launch.program.display())
+            }
+        })?;
+    let pid = child.id();
+    let tree = match crate::process_tree::ProcessTree::attach_tokio(&child) {
+        Ok(tree) => Arc::new(tree),
+        Err(error) => {
+            let _ = child.start_kill();
+            return Err(format!("failed to contain the extension host: {error}"));
+        }
+    };
+    #[cfg(windows)]
+    if let Err(error) = tree.limit_process_memory(launch.memory_cap) {
+        let _ = tree.kill();
+        let _ = child.start_kill();
+        return Err(format!(
+            "failed to cap the extension host's memory: {error}"
+        ));
+    }
+    let stdin = child.stdin.take().ok_or("host stdin unavailable")?;
+    let stdout = child.stdout.take().ok_or("host stdout unavailable")?;
+    let stderr = child.stderr.take().ok_or("host stderr unavailable")?;
+
+    Ok(SpawnedHost {
+        child: HostChild::Tokio(child),
+        pid,
+        tree,
+        stdin,
+        stdout,
+        stderr,
+    })
+}
+
 impl HostProcess {
+    #[cfg(windows)]
+    pub(crate) async fn admit_windows_root(
+        &self,
+        authority: crate::plugins::types::PluginAuthority,
+    ) -> Result<(), String> {
+        let sandbox = self
+            .windows
+            .clone()
+            .ok_or("Native host has no verified LPAC plan")?;
+        let policy = crate::plugins::activation::extension_host_policy_enabled();
+        if !policy {
+            return Err("Native extensions are disabled".into());
+        }
+        #[cfg(test)]
+        let env_scope = crate::test_support::env_scope_ticket();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _env_scope = crate::test_support::join_env_scope(env_scope);
+            let _policy = crate::plugins::activation::PolicyScope::propagate(policy);
+            let capability = crate::plugins::activation::PluginActivationCapability::Native;
+            crate::plugins::registry::verify_plugin_component_authority(&authority, capability)?;
+            let root =
+                crate::plugins::agent_plugin::plugin_root_for_manifest(&authority.staged_manifest)
+                    .ok_or("reviewed runtime manifest has no bundle root")?;
+            sandbox.admit_root(root)?;
+            crate::plugins::registry::verify_plugin_component_authority(&authority, capability)
+        })
+        .await
+        .map_err(|error| format!("Windows bundle admission worker failed: {error}"))?
+    }
+
     /// Spawn the host and complete the handshake. `expected_sha256` is the
     /// digest of the bundle this process materialized; the host's
     /// self-reported digest must match (a consistency check, not
@@ -864,52 +1459,26 @@ impl HostProcess {
                 ("CODEWHALE_HOST_PARENT_PID", parent_pid.as_str()),
                 ("CODEWHALE_HOST_PROCESS_GROUP", own_group),
             ]);
-        for (key, value) in
-            crate::child_env::sanitized_plugin_mcp_env_from(std::env::vars_os(), overrides)
-        {
-            command.env(key, value);
-        }
+        let environment =
+            crate::child_env::sanitized_plugin_mcp_env_from(std::env::vars_os(), overrides);
+        command.envs(environment.iter().map(|(key, value)| (key, value)));
         #[cfg(unix)]
         command.process_group(0);
         limit_child_memory(&mut command, launch.memory_cap);
 
-        // On Linux a failure to apply the memory cap in the child surfaces
-        // here as a spawn error carrying only its errno, indistinguishable
-        // from a failed exec, so the message names both.
-        let mut child = command.spawn().map_err(|error| {
-            if cfg!(target_os = "linux") {
-                format!(
-                    "failed to start {}, or to apply its {} MiB memory cap (RLIMIT_DATA) before exec: {error}",
-                    launch.program.display(),
-                    launch.memory_cap / (1024 * 1024)
-                )
-            } else {
-                format!("failed to start {}: {error}", launch.program.display())
-            }
-        })?;
-        let pid = child.id();
-        let tree = match crate::process_tree::ProcessTree::attach_tokio(&child) {
-            Ok(tree) => Arc::new(tree),
-            Err(error) => {
-                let _ = child.start_kill();
-                return Err(format!("failed to contain the extension host: {error}"));
-            }
-        };
-        #[cfg(windows)]
-        if let Err(error) = tree.limit_process_memory(launch.memory_cap) {
-            let _ = tree.kill();
-            let _ = child.start_kill();
-            return Err(format!(
-                "failed to cap the extension host's memory: {error}"
-            ));
-        }
+        let SpawnedHost {
+            mut child,
+            pid,
+            tree,
+            stdin,
+            stdout,
+            stderr,
+        } = spawn_host(launch, command, &environment)?;
         let memory: Arc<std::sync::OnceLock<MemoryEnforcement>> = Arc::default();
-        let stdin = child.stdin.take().ok_or("host stdin unavailable")?;
-        let stdout = child.stdout.take().ok_or("host stdout unavailable")?;
-        let stderr = child.stderr.take().ok_or("host stderr unavailable")?;
 
         let (outbound, mut outbound_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
         let pending: Arc<Mutex<HashMap<u64, PendingCall>>> = Arc::default();
+        let inbound: Arc<InboundRequests> = Arc::default();
         let stderr_tail: Arc<Mutex<VecDeque<u8>>> = Arc::default();
         let (exited_tx, exited_rx) = tokio::sync::watch::channel(false);
         let (hello_tx, hello_rx) = oneshot::channel();
@@ -957,10 +1526,15 @@ impl HostProcess {
         // host is not ours).
         let (kill_tx, mut kill_rx) = mpsc::channel::<String>(1);
         {
-            let pending = Arc::clone(&pending);
-            let outbound = outbound.clone();
-            let events = Arc::clone(&events);
-            let handshake = Arc::clone(&handshake);
+            let reader = Reader {
+                kill: kill_tx.clone(),
+                pending: Arc::clone(&pending),
+                inbound: Arc::clone(&inbound),
+                outbound: outbound.clone(),
+                events: Arc::clone(&events),
+                handshake: Arc::clone(&handshake),
+            };
+            let tier = launch.tier;
             let kill_tx = kill_tx.clone();
             tokio::spawn(async move {
                 let mut stdout = stdout;
@@ -973,14 +1547,17 @@ impl HostProcess {
                             break;
                         }
                     };
-                    let message = match protocol::parse_host_message(value) {
+                    let message = match protocol::parse_host_message(value, tier) {
                         Ok(message) => message,
                         Err(error) => {
                             let _ = kill_tx.try_send(format!("protocol violation: {error}"));
                             break;
                         }
                     };
-                    handle_host_message(message, &pending, &outbound, events.as_ref(), &handshake);
+                    if let Err(violation) = reader.handle(message) {
+                        let _ = kill_tx.try_send(format!("protocol violation: {violation}"));
+                        break;
+                    }
                 }
             });
         }
@@ -988,6 +1565,7 @@ impl HostProcess {
         // Exit watcher: owns the child. On exit, fail everything and report.
         {
             let pending = Arc::clone(&pending);
+            let inbound = Arc::clone(&inbound);
             let tail = Arc::clone(&stderr_tail);
             let events = Arc::clone(&events);
             let tree = Arc::clone(&tree);
@@ -1018,6 +1596,8 @@ impl HostProcess {
                 for call in drained {
                     let _ = call.tx.send(Err(HostCallError::Exited(reason.clone())));
                 }
+                // Requests the host sent have nobody left to answer.
+                inbound.cancel_all();
                 // Give the stderr task a moment to capture the last lines.
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 events.exited(generation, reason, tail_string(&tail));
@@ -1025,6 +1605,8 @@ impl HostProcess {
         }
 
         let host = Arc::new(Self {
+            tier: launch.tier,
+            generation,
             pid,
             runtime: launch.runtime.clone(),
             runtime_version: std::sync::OnceLock::new(),
@@ -1032,8 +1614,11 @@ impl HostProcess {
             memory,
             sandbox: launch.sandbox.clone(),
             tree,
+            #[cfg(windows)]
+            windows: launch.windows.clone(),
             outbound,
             pending,
+            inbound,
             admission_closed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             #[cfg(test)]
@@ -1066,6 +1651,7 @@ impl HostProcess {
                     launch.runtime.kind.name()
                 ));
             }
+            check_hello_identity(&hello, launch.tier, launch.builtin_modules)?;
             // Restarts reuse the pinned runtime without probing it again, so
             // the binary at that path can have been replaced since (an
             // upgrade mid-session). Its flags and lockdown were chosen for
@@ -1221,6 +1807,17 @@ impl HostProcess {
         request: CoreRequest,
         owner: Option<String>,
     ) -> Result<(u64, CallReceiver), HostCallError> {
+        // A method reserved for another tier is never sent to this host.
+        if !protocol::allowed_on(Direction::CoreToHost, request.method(), self.tier) {
+            return Err(HostCallError::Rpc {
+                code: error_code::METHOD_NOT_FOUND,
+                message: format!(
+                    "`{}` is not allowed on the {} tier",
+                    request.method(),
+                    self.tier.name()
+                ),
+            });
+        }
         if self.has_exited() {
             return Err(HostCallError::Exited("already exited".to_string()));
         }
@@ -1250,6 +1847,12 @@ impl HostProcess {
                 PendingCall {
                     tx,
                     owner,
+                    handle: match &request {
+                        CoreRequest::ToolCall(params) => Some(params.handle),
+                        CoreRequest::CommandRun(params) => Some(params.handle),
+                        CoreRequest::HookEvaluate(params) => Some(params.handle),
+                        _ => None,
+                    },
                     revoked: false,
                     heartbeat: matches!(request, CoreRequest::Ping),
                 },
@@ -1274,20 +1877,44 @@ impl HostProcess {
         request: CoreRequest,
         owner: Option<String>,
     ) -> Result<Value, HostCallError> {
+        self.call_with_clock(request, owner, None).await
+    }
+
+    /// [`Self::call`] with the deadline measured on `clock`, which stops while
+    /// the caller waits on something that is not the host's time (a
+    /// `core/call` waiting on an approval card). `None` is a clock nothing
+    /// pauses: the plain deadline.
+    pub(crate) async fn call_with_clock(
+        &self,
+        request: CoreRequest,
+        owner: Option<String>,
+        clock: Option<Arc<Mutex<PauseClock>>>,
+    ) -> Result<Value, HostCallError> {
         let method = request.method();
         let deadline = request.deadline();
-        let (id, rx) = self.start_request(request, owner)?;
+        let clock = clock.unwrap_or_else(|| Arc::new(Mutex::new(PauseClock::new())));
+        let (id, mut rx) = self.start_request(request, owner)?;
         let mut guard = CancelOnDrop {
             host: self,
             id,
             armed: true,
         };
-        let Ok(answer) = tokio::time::timeout(deadline, rx).await else {
-            // `guard` is still armed: dropping it sends `$/cancel`.
-            return Err(HostCallError::Timeout {
-                method,
-                after: deadline,
-            });
+        let answer = loop {
+            let remaining = clock
+                .lock()
+                .expect("deadline clock lock")
+                .remaining(deadline);
+            let Some(remaining) = remaining else {
+                // `guard` is still armed: dropping it sends `$/cancel`.
+                return Err(HostCallError::Timeout {
+                    method,
+                    after: deadline,
+                });
+            };
+            tokio::select! {
+                answer = &mut rx => break answer,
+                () = tokio::time::sleep(remaining) => {}
+            }
         };
         // Answered, drained at exit, or resolved by revocation: nothing left
         // to cancel.
@@ -1310,11 +1937,27 @@ impl HostProcess {
     /// resolves as cancelled when the host answers or after `CANCEL_GRACE`,
     /// whichever is first — revocation never waits on the host.
     pub(crate) fn revoke_calls_of(self: &Arc<Self>, plugin_id: &str) {
+        // Requests the host sent for this owner are cancelled too (and
+        // answered `Cancelled`), whatever they are waiting for.
+        self.inbound.cancel_owner(plugin_id);
+        self.revoke_pending_where(|call| call.owner.as_deref() == Some(plugin_id));
+    }
+
+    /// Retiring one Native entry cancels exactly its admitted contribution
+    /// calls. Sibling entry requests and owner-wide broker lifecycle survive.
+    pub(crate) fn revoke_calls_for_handles(self: &Arc<Self>, plugin_id: &str, handles: &[u64]) {
+        self.revoke_pending_where(|call| {
+            call.owner.as_deref() == Some(plugin_id)
+                && call.handle.is_some_and(|handle| handles.contains(&handle))
+        });
+    }
+
+    fn revoke_pending_where(self: &Arc<Self>, drop_it: impl Fn(&PendingCall) -> bool) {
         let ids: Vec<u64> = {
             let mut pending = self.pending.lock().expect("pending lock");
             pending
                 .iter_mut()
-                .filter(|(_, call)| call.owner.as_deref() == Some(plugin_id))
+                .filter(|(_, call)| drop_it(call))
                 .map(|(id, call)| {
                     call.revoked = true;
                     *id
@@ -1382,80 +2025,166 @@ impl Drop for HostProcess {
     }
 }
 
-fn handle_host_message(
-    message: HostMessage,
-    pending: &Mutex<HashMap<u64, PendingCall>>,
-    outbound: &mpsc::Sender<Vec<u8>>,
-    events: &dyn HostEvents,
-    handshake: &Mutex<Handshake>,
-) {
-    let send = |value: Value| {
-        if let Ok(frame) = protocol::encode_frame(&value) {
-            let _ = outbound.try_send(frame);
-        }
-    };
-    match message {
-        HostMessage::Response { id, outcome } => {
-            let Some(call) = pending.lock().expect("pending lock").remove(&id) else {
-                tracing::debug!(target: "extension_host", id, "dropping late host response");
-                return;
-            };
-            let result = if call.revoked {
-                Err(HostCallError::Cancelled(
-                    "extension was revoked".to_string(),
-                ))
-            } else {
-                match outcome {
-                    Ok(value) => Ok(value),
-                    Err(error) if error.code == error_code::CANCELLED => {
-                        Err(HostCallError::Cancelled(error.message))
+/// What the channel's reader task holds: everything one decoded host→core
+/// message may touch.
+struct Reader {
+    kill: mpsc::Sender<String>,
+    pending: Arc<Mutex<HashMap<u64, PendingCall>>>,
+    inbound: Arc<InboundRequests>,
+    outbound: mpsc::Sender<Vec<u8>>,
+    events: Arc<dyn HostEvents>,
+    handshake: Arc<Mutex<Handshake>>,
+}
+
+impl Reader {
+    /// Route one validated host→core message. `Err` is a protocol violation
+    /// the caller ends the host for.
+    fn handle(&self, message: HostMessage) -> Result<(), String> {
+        match message {
+            HostMessage::Response { id, outcome } => {
+                let Some(call) = self.pending.lock().expect("pending lock").remove(&id) else {
+                    tracing::debug!(target: "extension_host", id, "dropping late host response");
+                    return Ok(());
+                };
+                if !call.revoked && !call.heartbeat {
+                    self.events.responded();
+                }
+                let result = if call.revoked {
+                    Err(HostCallError::Cancelled(
+                        "extension was revoked".to_string(),
+                    ))
+                } else {
+                    match outcome {
+                        Ok(value) => Ok(value),
+                        Err(error) if error.code == error_code::CANCELLED => {
+                            Err(HostCallError::Cancelled(error.message))
+                        }
+                        Err(error) => Err(HostCallError::Rpc {
+                            code: error.code,
+                            message: error.message,
+                        }),
                     }
-                    Err(error) => Err(HostCallError::Rpc {
-                        code: error.code,
-                        message: error.message,
-                    }),
+                };
+                let _ = call.tx.send(result);
+            }
+            HostMessage::Request { id, request } => self.start_host_request(id, request)?,
+            HostMessage::Notification(notification) => match notification {
+                HostNotification::Hello(hello) => {
+                    if let Some(tx) = self.handshake.lock().expect("handshake lock").hello.take() {
+                        let _ = tx.send(hello);
+                    }
                 }
-            };
-            let _ = call.tx.send(result);
+                HostNotification::Ready => {
+                    if let Some(tx) = self.handshake.lock().expect("handshake lock").ready.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                HostNotification::Faulted(params) => self.events.faulted(&params),
+                HostNotification::Log(log) => {
+                    self.events.log(&log);
+                    let plugin = log.plugin_id.as_deref().unwrap_or("host");
+                    match log.level.as_str() {
+                        "error" => tracing::warn!(target: "extension_host", plugin, "{}", log.msg),
+                        "warn" => tracing::info!(target: "extension_host", plugin, "{}", log.msg),
+                        _ => tracing::debug!(target: "extension_host", plugin, "{}", log.msg),
+                    }
+                }
+                // The host withdrawing a request of its own. One that has
+                // already been answered is not in flight: the cancel lost the
+                // race, and nothing is owed.
+                HostNotification::Cancel(params) => self.inbound.cancel_by_host(params.id),
+            },
         }
-        HostMessage::Request { id, request } => match request {
-            HostRequest::Register(params) => {
-                let result = events.register(&params);
-                send(protocol::response_ok(
-                    id,
-                    serde_json::to_value(result).unwrap_or_else(|_| json!({"refused": "internal"})),
-                ));
-            }
-            HostRequest::Unregister(params) => {
-                events.unregister(&params);
-                send(protocol::response_ok(id, json!({})));
-            }
-        },
-        HostMessage::Notification(notification) => match notification {
-            HostNotification::Hello(hello) => {
-                if let Some(tx) = handshake.lock().expect("handshake lock").hello.take() {
-                    let _ = tx.send(hello);
-                }
-            }
-            HostNotification::Ready => {
-                if let Some(tx) = handshake.lock().expect("handshake lock").ready.take() {
-                    let _ = tx.send(());
-                }
-            }
-            HostNotification::Faulted(params) => events.faulted(&params),
-            HostNotification::Log(log) => {
-                events.log(&log);
-                let plugin = log.plugin_id.as_deref().unwrap_or("host");
-                match log.level.as_str() {
-                    "error" => tracing::warn!(target: "extension_host", plugin, "{}", log.msg),
-                    "warn" => tracing::info!(target: "extension_host", plugin, "{}", log.msg),
-                    _ => tracing::debug!(target: "extension_host", plugin, "{}", log.msg),
-                }
-            }
-            // Phase 1 has no host-originated requests to cancel.
-            HostNotification::Cancel(_) => {}
-        },
+        Ok(())
     }
+
+    /// Run one host-originated request as its own task: tracked by id so the
+    /// host's `$/cancel`, the owner's revocation and the host's exit can
+    /// cancel it, and answered when the handler finishes unless it was
+    /// cancelled for a reason that makes the answer moot ([`CancelReason`]).
+    /// A handler that does not stop within [`CANCEL_GRACE`] of its cancel is
+    /// abandoned.
+    fn start_host_request(&self, id: u64, request: HostRequest) -> Result<(), String> {
+        let cancel = self.inbound.admit(id, request.plugin_id())?;
+        let events = Arc::clone(&self.events);
+        let inbound = Arc::clone(&self.inbound);
+        let outbound = self.outbound.clone();
+        let kill = self.kill.clone();
+        tokio::spawn(async move {
+            let cx = HostRequestContext {
+                id,
+                cancel: cancel.clone(),
+                kill,
+            };
+            let mut handler = std::pin::pin!(events.host_request(request, cx));
+            let outcome = tokio::select! {
+                outcome = &mut handler => Some(outcome),
+                () = async {
+                    cancel.cancelled().await;
+                    tokio::time::sleep(CANCEL_GRACE).await;
+                } => None,
+            };
+            let outcome = match (inbound.finish(id), outcome) {
+                // The host stopped waiting, or is gone: a late answer is dropped.
+                (Some(CancelReason::Host | CancelReason::Exit), _) => return,
+                (Some(CancelReason::Revoked), _) | (None, None) => Err(RpcErrorWire {
+                    code: error_code::CANCELLED,
+                    message: "extension was revoked".to_string(),
+                    data: None,
+                }),
+                (None, Some(outcome)) => outcome,
+            };
+            if let Ok(frame) = protocol::encode_frame(&protocol::response_value(id, &outcome)) {
+                let _ = outbound.send(frame).await;
+            }
+        });
+        Ok(())
+    }
+}
+
+/// What `host/hello` must say about the host's tier and built-in modules,
+/// checked the way its runtime name and version are: against what the core
+/// launched. The tier must be the one in the launch plan (`--tier=`), and the
+/// module digests the bundle embeds must be exactly the ones `modules` pins, so
+/// a host build and a Rust table that disagree about a built-in module are
+/// refused before any module can run. Pure.
+pub(crate) fn check_hello_identity(
+    hello: &HelloParams,
+    tier: HostTier,
+    modules: &[BuiltinModule],
+) -> Result<(), String> {
+    if hello.tier != tier {
+        return Err(format!(
+            "host reports the {} tier but the {} tier was launched",
+            hello.tier.name(),
+            tier.name()
+        ));
+    }
+    let describe = |rows: &[(String, String)]| {
+        rows.iter()
+            .map(|(id, digest)| format!("{id}={}", digest.chars().take(12).collect::<String>()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut reported: Vec<(String, String)> = hello
+        .builtin_modules
+        .iter()
+        .map(|module| (module.id.clone(), module.sha256.clone()))
+        .collect();
+    let mut pinned: Vec<(String, String)> = modules
+        .iter()
+        .map(|module| (module.id.to_string(), module.source_sha256.to_string()))
+        .collect();
+    reported.sort();
+    pinned.sort();
+    if reported != pinned {
+        return Err(format!(
+            "host bundle embeds the built-in module digests [{}] but the core pins [{}]",
+            describe(&reported),
+            describe(&pinned)
+        ));
+    }
+    Ok(())
 }
 
 /// Where the embedded bundle is written: `<root>/extension-host/<sha256>/`.
@@ -1468,22 +2197,59 @@ pub fn bundle_dir(root: &Path, sha256: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[test]
+    fn compiled_host_has_direct_argv_and_cannot_become_a_bun_cli() {
+        let runtime = HostRuntime {
+            kind: HostRuntimeKind::Bun,
+            path: PathBuf::from("/opt/codewhale-extension-host"),
+            version: (1, 4, 0),
+            native_code_flags: Vec::new(),
+            compiled: true,
+        };
+        assert!(runtime_args(&runtime).is_empty());
+        let temp = tempfile::tempdir().unwrap();
+        let launch = host_launch(
+            HostTier::Builtin,
+            &runtime,
+            vec![HostTier::Builtin.argv_flag()],
+            temp.path().to_path_buf(),
+            HOST_MEMORY_CAP,
+            Err("fixture unsupported platform".to_string()),
+        )
+        .unwrap();
+        assert_eq!(launch.program, runtime.path);
+        assert_eq!(launch.args, vec!["--tier=builtin".to_string()]);
+        assert!(
+            launch
+                .runtime_env
+                .contains(&("BUN_OPTIONS".to_string(), String::new()))
+        );
+        assert!(
+            launch
+                .runtime_env
+                .contains(&("BUN_BE_BUN".to_string(), "0".to_string()))
+        );
+        assert_eq!(
+            launch.memory,
+            MemoryEnforcement::planned(HostRuntimeKind::Bun)
+        );
+    }
+
     fn node() -> HostRuntime {
         HostRuntime {
             kind: HostRuntimeKind::Node,
             path: PathBuf::from("/opt/node/bin/node"),
             version: (22, 19, 0),
             native_code_flags: Vec::new(),
+            compiled: false,
         }
     }
 
-    /// The Linux launch decision, exercised on every platform: a bwrap that
-    /// is installed but cannot start (the probe's stderr as Ubuntu 24.04
-    /// prints it) launches the runtime itself, labelled unsandboxed with
-    /// bwrap's own error wherever the sandbox is reported — never
-    /// `linux-bwrap` — while a probe that ran keeps the wrapper's argv.
+    /// A failed exact sandbox probe refuses Native code on every platform.
+    /// The pinned Builtin exception keeps the concrete diagnostic; a verified
+    /// wrapper keeps its command and never silently falls through to raw JS.
     #[test]
-    fn a_bwrap_that_cannot_start_leaves_the_host_unsandboxed_and_says_why() {
+    fn missing_verified_sandbox_refuses_native_but_reports_pinned_builtin_exception() {
         let runtime = node();
         let data = PathBuf::from("/home/u/.codewhale/extension-host/data");
         let mut args = runtime_args(&runtime);
@@ -1503,7 +2269,19 @@ mod tests {
             refused.contains("kernel.apparmor_restrict_unprivileged_userns"),
             "{refused}"
         );
+        let error = host_launch(
+            HostTier::Plugin,
+            &runtime,
+            args.clone(),
+            data.clone(),
+            HOST_MEMORY_CAP,
+            Err(refused.clone()),
+        )
+        .unwrap_err();
+        assert!(error.contains("Native extensions require a verified OS sandbox"));
+        assert!(error.contains(&refused));
         let launch = host_launch(
+            HostTier::Builtin,
             &runtime,
             args.clone(),
             data.clone(),
@@ -1540,6 +2318,7 @@ mod tests {
             .chain(args.iter().cloned())
             .collect();
         let launch = host_launch(
+            HostTier::Plugin,
             &runtime,
             args.clone(),
             data.clone(),
@@ -1568,6 +2347,59 @@ mod tests {
         );
     }
 
+    /// Each tier has its own data directory, and neither is inside the other:
+    /// the data directory is the host's only writable root, so a nested
+    /// builtin directory would be writable by plugin code. The plugin tier
+    /// keeps the path it has always had, and the plugin tier's sandbox denies
+    /// reads of the builtin tier's directory.
+    #[test]
+    fn each_tier_has_its_own_data_directory_and_the_plugin_tier_cannot_read_the_builtin_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(tier_data_dir(&home, HostTier::Builtin)).unwrap();
+        let plugin = tier_data_dir(&home, HostTier::Plugin);
+        let builtin = tier_data_dir(&home, HostTier::Builtin);
+        assert_ne!(plugin, builtin);
+        assert!(!builtin.starts_with(&plugin) && !plugin.starts_with(&builtin));
+        assert_eq!(plugin, home.join("extension-host").join("data"));
+
+        for whole_homes in [false, true] {
+            let (denied, _) = host_denied_read_paths(HostTier::Plugin, &home, whole_homes);
+            assert!(
+                denied.contains(&builtin),
+                "plugin tier (whole_homes {whole_homes}) must deny {}",
+                builtin.display()
+            );
+            assert!(!denied.contains(&plugin));
+            let (denied, _) = host_denied_read_paths(HostTier::Builtin, &home, whole_homes);
+            assert!(
+                !denied.contains(&builtin),
+                "the builtin tier reads its own directory"
+            );
+        }
+    }
+
+    /// The per-plugin directory plugin config and context introduced keeps its
+    /// path, so an installed plugin's data survives the tier split; a built-in
+    /// module's is under the builtin tier's directory.
+    #[test]
+    fn the_per_plugin_data_directory_keeps_its_path() {
+        let home = PathBuf::from("/home/u/.codewhale");
+        let id = "user/0123456789ab/demo";
+        assert_eq!(
+            plugin_data_dir(&home, id, "demo"),
+            home.join("extension-host/data/plugins/demo-e9f63c6f1a7f")
+        );
+        assert_eq!(
+            owner_data_dir(&home, HostTier::Plugin, id, "demo"),
+            plugin_data_dir(&home, id, "demo")
+        );
+        assert_eq!(
+            owner_data_dir(&home, HostTier::Builtin, "host:mcp", "mcp"),
+            home.join("extension-host/data-builtin/modules/mcp")
+        );
+    }
+
     /// bubblewrap can mask only what exists, so under it each Codewhale home
     /// is denied whole (an entry created later is then denied too) and its
     /// readable entries come back as exceptions; Seatbelt's form is unchanged.
@@ -1578,7 +2410,7 @@ mod tests {
         std::fs::create_dir_all(home.join("extension-host")).unwrap();
         std::fs::write(home.join("config.toml.bak-1"), "").unwrap();
 
-        let (seatbelt, none) = host_denied_read_paths(&home, false);
+        let (seatbelt, none) = host_denied_read_paths(HostTier::Plugin, &home, false);
         assert!(none.is_empty());
         assert!(seatbelt.contains(&home.join("config.toml.bak-1")));
         assert!(
@@ -1588,12 +2420,444 @@ mod tests {
         assert!(!seatbelt.contains(&home));
         assert!(!seatbelt.contains(&home.join("extension-host")));
 
-        let (bwrap, exceptions) = host_denied_read_paths(&home, true);
+        let (bwrap, exceptions) = host_denied_read_paths(HostTier::Plugin, &home, true);
         assert!(bwrap.contains(&home));
         assert!(!bwrap.contains(&home.join("config.toml.bak-1")));
         for entry in HOST_READABLE_HOME_ENTRIES {
             assert!(exceptions.contains(&home.join(entry)), "{entry}");
             assert!(!bwrap.contains(&home.join(entry)), "{entry}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The host's tier and built-in module digests in `host/hello`
+    // -----------------------------------------------------------------------
+
+    const DEMO_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const OTHER_DIGEST: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    const PINNED: &[BuiltinModule] = &[
+        BuiltinModule {
+            id: "demo",
+            source_sha256: DEMO_DIGEST,
+            tools: &[],
+        },
+        BuiltinModule {
+            id: "other",
+            source_sha256: OTHER_DIGEST,
+            tools: &[],
+        },
+    ];
+
+    fn hello(tier: HostTier, modules: &[(&str, &str)]) -> HelloParams {
+        HelloParams {
+            protocol: protocol::ProtocolRange { min: 1, max: 1 },
+            host_version: "0.1.0".to_string(),
+            bundle_sha256: "0".repeat(64),
+            runtime: protocol::HelloRuntime {
+                name: "node".to_string(),
+                version: "22.20.0".to_string(),
+            },
+            tier,
+            builtin_modules: modules
+                .iter()
+                .map(|(id, sha256)| protocol::ModuleDigestWire {
+                    id: (*id).to_string(),
+                    sha256: (*sha256).to_string(),
+                })
+                .collect(),
+            memory_limit_mib: None,
+        }
+    }
+
+    #[test]
+    fn hello_must_report_the_launched_tier_and_exactly_the_pinned_module_digests() {
+        // Production: no module, so none may be reported, on either tier.
+        for tier in HostTier::ALL {
+            assert_eq!(check_hello_identity(&hello(tier, &[]), tier, &[]), Ok(()));
+        }
+        // Order is not part of the claim.
+        let reported = [("other", OTHER_DIGEST), ("demo", DEMO_DIGEST)];
+        assert_eq!(
+            check_hello_identity(
+                &hello(HostTier::Builtin, &reported),
+                HostTier::Builtin,
+                PINNED
+            ),
+            Ok(())
+        );
+
+        let refused = |hello: HelloParams, tier: HostTier| {
+            check_hello_identity(&hello, tier, PINNED).unwrap_err()
+        };
+        assert_eq!(
+            refused(hello(HostTier::Plugin, &reported), HostTier::Builtin),
+            "host reports the plugin tier but the builtin tier was launched"
+        );
+        assert_eq!(
+            refused(hello(HostTier::Builtin, &reported), HostTier::Plugin),
+            "host reports the builtin tier but the plugin tier was launched"
+        );
+        let pinned = "[demo=0123456789ab, other=fedcba987654]";
+        for (what, rows, shown) in [
+            ("none reported", vec![], "[]"),
+            (
+                "one missing",
+                vec![("demo", DEMO_DIGEST)],
+                "[demo=0123456789ab]",
+            ),
+            (
+                "an unpinned module",
+                vec![
+                    ("demo", DEMO_DIGEST),
+                    ("other", OTHER_DIGEST),
+                    ("extra", DEMO_DIGEST),
+                ],
+                "[demo=0123456789ab, extra=0123456789ab, other=fedcba987654]",
+            ),
+            (
+                "a changed digest",
+                vec![("demo", OTHER_DIGEST), ("other", OTHER_DIGEST)],
+                "[demo=fedcba987654, other=fedcba987654]",
+            ),
+            (
+                "a row twice",
+                vec![
+                    ("demo", DEMO_DIGEST),
+                    ("demo", DEMO_DIGEST),
+                    ("other", OTHER_DIGEST),
+                ],
+                "[demo=0123456789ab, demo=0123456789ab, other=fedcba987654]",
+            ),
+        ] {
+            assert_eq!(
+                refused(hello(HostTier::Builtin, &rows), HostTier::Builtin),
+                format!(
+                    "host bundle embeds the built-in module digests {shown} but the core pins {pinned}"
+                ),
+                "{what}"
+            );
+        }
+        // A host that reports modules when the core pins none is refused too.
+        assert!(
+            check_hello_identity(
+                &hello(HostTier::Plugin, &[("demo", DEMO_DIGEST)]),
+                HostTier::Plugin,
+                &[]
+            )
+            .is_err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Host-originated requests run as their own tracked tasks
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Notify;
+
+    /// How a stub handler waits.
+    #[derive(Clone, Copy)]
+    enum Behaviour {
+        /// Until `release`, or until its request is cancelled (then it stops).
+        WaitsUnlessCancelled,
+        /// Until `release`, whatever happens to its request.
+        IgnoresCancel,
+        /// Forever.
+        Hangs,
+    }
+
+    struct Stub {
+        behaviour: Behaviour,
+        release: Arc<Notify>,
+        started: AtomicUsize,
+        saw_cancel: AtomicBool,
+    }
+
+    impl Stub {
+        fn new(behaviour: Behaviour) -> Arc<Self> {
+            Arc::new(Self {
+                behaviour,
+                release: Arc::new(Notify::new()),
+                started: AtomicUsize::new(0),
+                saw_cancel: AtomicBool::new(false),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl HostEvents for Stub {
+        fn register(&self, _: &protocol::RegisterParams) -> RegisterResult {
+            unreachable!("the stub answers every request itself")
+        }
+        fn unregister(&self, _: &protocol::UnregisterParams) {}
+        fn faulted(&self, _: &protocol::FaultedParams) {}
+        fn log(&self, _: &protocol::LogParams) {}
+        fn exited(&self, _: u64, _: String, _: String) {}
+
+        async fn host_request(
+            &self,
+            _request: HostRequest,
+            cx: HostRequestContext,
+        ) -> Result<Value, RpcErrorWire> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            match self.behaviour {
+                Behaviour::WaitsUnlessCancelled => {
+                    tokio::select! {
+                        () = cx.cancel.cancelled() => {
+                            self.saw_cancel.store(true, Ordering::SeqCst);
+                            Err(RpcErrorWire {
+                                code: error_code::CANCELLED,
+                                message: "stub saw the cancel".to_string(),
+                                data: None,
+                            })
+                        }
+                        () = self.release.notified() => Ok(json!({"answered": cx.id})),
+                    }
+                }
+                Behaviour::IgnoresCancel => {
+                    self.release.notified().await;
+                    Ok(json!({"answered": cx.id}))
+                }
+                Behaviour::Hangs => std::future::pending().await,
+            }
+        }
+    }
+
+    /// An events implementation that keeps the trait's own answers for the
+    /// registry requests.
+    struct Plain;
+
+    #[async_trait]
+    impl HostEvents for Plain {
+        fn register(&self, _: &protocol::RegisterParams) -> RegisterResult {
+            RegisterResult::Admitted { handle: 9 }
+        }
+        fn unregister(&self, _: &protocol::UnregisterParams) {}
+        fn faulted(&self, _: &protocol::FaultedParams) {}
+        fn log(&self, _: &protocol::LogParams) {}
+        fn exited(&self, _: u64, _: String, _: String) {}
+    }
+
+    struct Rig {
+        reader: Reader,
+        frames: mpsc::Receiver<Vec<u8>>,
+    }
+
+    fn new_rig(events: Arc<dyn HostEvents>) -> Rig {
+        let (outbound, frames) = mpsc::channel(OUTBOUND_QUEUE);
+        Rig {
+            reader: Reader {
+                kill: mpsc::channel(1).0,
+                pending: Arc::default(),
+                inbound: Arc::default(),
+                outbound,
+                events,
+                handshake: Arc::default(),
+            },
+            frames,
+        }
+    }
+
+    fn owner(plugin: &str) -> protocol::OwnerRef {
+        protocol::OwnerRef {
+            plugin_id: plugin.to_string(),
+            generation: 1,
+            owner_token: "t".repeat(32),
+        }
+    }
+
+    fn register_request(plugin: &str) -> HostRequest {
+        HostRequest::Register(protocol::RegisterParams {
+            scope: None,
+            owner: owner(plugin),
+            kind: protocol::RegisterKind::Tool,
+            spec: protocol::RegisterSpecWire {
+                name: "t".to_string(),
+                description: "d".to_string(),
+                input_schema: Some(serde_json::Map::new()),
+                argument_hint: None,
+            },
+        })
+    }
+
+    fn request(rig: &Rig, id: u64, plugin: &str) -> Result<(), String> {
+        rig.reader.handle(HostMessage::Request {
+            id,
+            request: register_request(plugin),
+        })
+    }
+
+    fn cancel(rig: &Rig, id: u64) {
+        rig.reader
+            .handle(HostMessage::Notification(HostNotification::Cancel(
+                protocol::CancelParams { id },
+            )))
+            .unwrap();
+    }
+
+    /// The next frame the core wrote to the host, decoded.
+    async fn next_frame(rig: &mut Rig) -> Value {
+        let frame = tokio::time::timeout(Duration::from_secs(5), rig.frames.recv())
+            .await
+            .expect("a frame within 5 s")
+            .expect("the channel is open");
+        serde_json::from_slice(&frame[protocol::HEADER_LEN..]).expect("a JSON frame")
+    }
+
+    /// Nothing is written to the host for `ms`.
+    async fn no_frame(rig: &mut Rig, ms: u64) {
+        let frame = tokio::time::timeout(Duration::from_millis(ms), rig.frames.recv()).await;
+        assert!(frame.is_err(), "unexpected frame: {frame:?}");
+    }
+
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[tokio::test]
+    async fn registry_requests_are_answered_through_the_generic_handler_as_before() {
+        let mut rig = new_rig(Arc::new(Plain));
+        request(&rig, 5, "p").unwrap();
+        assert_eq!(
+            next_frame(&mut rig).await,
+            json!({"jsonrpc": "2.0", "id": 5, "result": {"handle": 9}})
+        );
+        rig.reader
+            .handle(HostMessage::Request {
+                id: 6,
+                request: HostRequest::Unregister(protocol::UnregisterParams {
+                    owner: owner("p"),
+                    handle: 9,
+                }),
+            })
+            .unwrap();
+        assert_eq!(
+            next_frame(&mut rig).await,
+            json!({"jsonrpc": "2.0", "id": 6, "result": {}})
+        );
+        until("the table to empty", || rig.reader.inbound.in_flight() == 0).await;
+    }
+
+    #[tokio::test]
+    async fn a_host_cancel_cancels_the_task_and_the_answer_is_dropped() {
+        // A handler that stops when cancelled answers nothing.
+        let stub = Stub::new(Behaviour::WaitsUnlessCancelled);
+        let mut rig = new_rig(stub.clone());
+        request(&rig, 1, "p").unwrap();
+        until("the handler to start", || {
+            stub.started.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        assert_eq!(rig.reader.inbound.in_flight(), 1);
+        cancel(&rig, 1);
+        until("the handler to see the cancel", || {
+            stub.saw_cancel.load(Ordering::SeqCst)
+        })
+        .await;
+        no_frame(&mut rig, 150).await;
+        until("the table to empty", || rig.reader.inbound.in_flight() == 0).await;
+        // A cancel for an id that is not in flight (answered, or never sent) is ignored.
+        cancel(&rig, 1);
+        cancel(&rig, 4242);
+
+        // A handler that ignores the cancel and finishes later: its late answer is dropped.
+        let stub = Stub::new(Behaviour::IgnoresCancel);
+        let mut rig = new_rig(stub.clone());
+        request(&rig, 2, "p").unwrap();
+        until("the handler to start", || {
+            stub.started.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        cancel(&rig, 2);
+        stub.release.notify_one();
+        no_frame(&mut rig, 150).await;
+        until("the table to empty", || rig.reader.inbound.in_flight() == 0).await;
+
+        // One that never finishes is abandoned CANCEL_GRACE after the cancel,
+        // and frees its slot.
+        let mut rig = new_rig(Stub::new(Behaviour::Hangs));
+        request(&rig, 3, "p").unwrap();
+        cancel(&rig, 3);
+        assert_eq!(
+            rig.reader.inbound.in_flight(),
+            1,
+            "held until the grace ends"
+        );
+        until("the abandoned request to leave the table", || {
+            rig.reader.inbound.in_flight() == 0
+        })
+        .await;
+        no_frame(&mut rig, 100).await;
+    }
+
+    #[tokio::test]
+    async fn revoking_an_owner_answers_its_requests_cancelled_and_leaves_others_alone() {
+        let stub = Stub::new(Behaviour::WaitsUnlessCancelled);
+        let mut rig = new_rig(stub.clone());
+        request(&rig, 1, "a").unwrap();
+        request(&rig, 2, "b").unwrap();
+        until("both handlers to start", || {
+            stub.started.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        rig.reader.inbound.cancel_owner("a");
+        // The revoked owner's host is told (its own `$/cancel` never came).
+        let frame = next_frame(&mut rig).await;
+        assert_eq!(frame["id"], 1);
+        assert_eq!(frame["error"]["code"], error_code::CANCELLED);
+        assert_eq!(frame["error"]["message"], "extension was revoked");
+        // The other owner's request is untouched and answers when released.
+        assert_eq!(rig.reader.inbound.in_flight(), 1);
+        stub.release.notify_one();
+        assert_eq!(
+            next_frame(&mut rig).await,
+            json!({"jsonrpc": "2.0", "id": 2, "result": {"answered": 2}})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_exit_cancels_every_request_answers_none_and_admits_no_more() {
+        let stub = Stub::new(Behaviour::WaitsUnlessCancelled);
+        let mut rig = new_rig(stub.clone());
+        request(&rig, 1, "a").unwrap();
+        request(&rig, 2, "b").unwrap();
+        until("both handlers to start", || {
+            stub.started.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        rig.reader.inbound.cancel_all();
+        no_frame(&mut rig, 150).await;
+        until("the table to empty", || rig.reader.inbound.in_flight() == 0).await;
+        assert!(
+            request(&rig, 3, "a")
+                .unwrap_err()
+                .contains("after the host exited")
+        );
+    }
+
+    #[tokio::test]
+    async fn host_requests_are_capped_and_an_id_cannot_be_reused_in_flight() {
+        let rig = new_rig(Stub::new(Behaviour::Hangs));
+        for id in 1..=protocol::MAX_INFLIGHT as u64 {
+            request(&rig, id, "p").unwrap_or_else(|reason| panic!("request {id}: {reason}"));
+        }
+        assert_eq!(rig.reader.inbound.in_flight(), protocol::MAX_INFLIGHT);
+        let over = request(&rig, 9999, "p").unwrap_err();
+        assert!(
+            over.contains("more than 256 host requests in flight"),
+            "{over}"
+        );
+        let reused = request(&rig, 1, "p").unwrap_err();
+        assert!(reused.contains("already in flight"), "{reused}");
+        // Both are protocol violations (the reader ends the host); neither
+        // disturbed what was admitted.
+        assert_eq!(rig.reader.inbound.in_flight(), protocol::MAX_INFLIGHT);
+        rig.reader.inbound.cancel_all();
     }
 }

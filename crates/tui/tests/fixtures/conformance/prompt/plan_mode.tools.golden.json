@@ -1,7 +1,7 @@
 [
   {
     "name": "bash",
-    "description": "Execute a shell command in the workspace and return stdout and stderr. Output keeps the last 2000 lines or 50KB. An optional timeout is expressed in seconds; when omitted the command is killed after 120 seconds, so pass an explicit timeout for work expected to take longer. In Ask, after a sandbox denial, retry the exact command once with sandbox_permissions (the narrowest wider mode that suffices) and a one-sentence justification; the approval prompt asks the user.",
+    "description": "Execute a shell command in the workspace and return stdout and stderr. Output keeps the last 2000 lines or 50KB. An optional timeout is the seconds to wait in the foreground (default 120 seconds); a command still running then is never killed for time: it moves to the background and you get its output so far and a task_id, so long builds and tests need no special timeout. Find task_shell_wait with tool_search to read more or wait for it. In Ask, after a sandbox denial, retry the exact command once with sandbox_permissions (the narrowest wider mode that suffices) and a one-sentence justification; the approval prompt asks the user.",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
@@ -26,7 +26,7 @@
           "type": "string"
         },
         "timeout": {
-          "description": "Optional timeout in seconds; when omitted the command is killed after 120 seconds.",
+          "description": "Optional seconds to wait in the foreground (default 120 seconds). A command still running then is not killed: it moves to the background and you get its output so far and a task_id. Find task_shell_wait with tool_search to read more or wait for it.",
           "type": "number"
         }
       },
@@ -42,7 +42,7 @@
   },
   {
     "name": "create_goal",
-    "description": "Create the session's one persistent goal: a completion objective Codewhale keeps working toward across turns until it is verified complete, blocked, or the user stops it. You decide when a request is a durable objective worth carrying across turns — a multi-step outcome the user will want continued and verified. Do not create a goal for a question, a greeting, a one-shot edit, or a conversational probe; those are ordinary turns. When the user explicitly asks to use `/goal` or asks you to make something the goal, call `create_goal` before doing the rest of the work; acknowledging it in prose is not sufficient. Keep the user's full objective, not a shortened one-turn version. Set token_budget only when the user explicitly provides one. Creating a goal shows the user a one-line receipt (they can /goal pause or /goal clear); do not also ask for confirmation. Only one unfinished goal exists at a time: complete or clear it before creating another.",
+    "description": "Create the session's one persistent goal: a completion objective Codewhale keeps working toward across turns until it is verified complete, blocked, or the user stops it. A goal is for a durable objective that outlasts one turn: a multi-step outcome the user wants continued and verified. A question, a greeting, or a one-shot edit completes as an ordinary turn. When the user explicitly asks to use `/goal` or to make something the goal, `create_goal` is what records it; acknowledging it in prose records nothing. The objective is the user's full objective, not a shortened one-turn version. token_budget carries a budget the user stated; with none stated it stays unset. Creating a goal shows the user a one-line receipt (they can /goal pause or /goal clear), so it needs no separate confirmation. Only one unfinished goal exists at a time: an existing one is completed or cleared before another is created.",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
@@ -147,7 +147,7 @@
   },
   {
     "name": "read",
-    "description": "Read a text file. The whole file comes back in one call when it fits this call's output budget — 100000 bytes by default, raisable to 500000 with max_bytes. There is no line cap. Use offset and limit for an exact line range; when output is budget-limited the footer names the exact offset to continue from. Every response reports the file's byte size, line count, and whether output was truncated.",
+    "description": "Read a file. A text file comes back whole in one call when it fits this call's output budget — 100000 bytes by default, raisable to 500000 with max_bytes. There is no line cap. Use offset and limit for an exact line range; when output is budget-limited the footer names the exact offset to continue from. Every text response reports the file's byte size, line count, and whether output was truncated. A PNG, JPEG, GIF or WebP image comes back as image content you can see (large images are downscaled), including one the user attached from outside the workspace; read an image instead of running OCR or taking screenshots of it.",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
@@ -180,7 +180,7 @@
   },
   {
     "name": "todo_write",
-    "description": "Replace the To-do list shown to the user. Optional: use it when a visible plan helps; at most one item may be in_progress at a time.",
+    "description": "Replace the To-do list the user watches. For any task with three or more steps or more than one file, write the list before you start, keep exactly one item in_progress, and mark items done as you finish them. Skip it only for a single quick answer or edit.",
     "input_schema": {
       "properties": {
         "todos": {

@@ -584,8 +584,15 @@ pub struct ToolContext {
 /// useful, without growing the top-level context by another field per feature.
 #[derive(Clone)]
 pub struct ToolExecutionState {
+    /// Actual Core caller admission for per-round Python RPCs. Kernels do not
+    /// retain it; unattached tool contexts cannot make model calls.
+    pub(crate) rlm_caller: Option<Arc<crate::core::engine::rlm_host::CapturedRlmCaller>>,
     /// Effective session/ancestor tool ceiling, carried to MCP dispatch and runtime registration.
     pub(crate) disallowed_tools: Vec<String>,
+    /// Trusted local host narrowing; inherited by every alias/nested context.
+    pub(crate) acp_host: Option<codewhale_config::AppMode>,
+    /// Captured child grant; retained through aliases and context overrides.
+    pub(crate) child_host: Option<Arc<crate::tools::subagent::engine::ChildAuthority>>,
     /// Set only on the context of one call a person approved on a card.
     pub(crate) human_decision: Option<crate::core::engine::HumanDecision>,
     /// Shared shell manager for background tasks and streaming IO.
@@ -788,7 +795,10 @@ impl ToolContext {
         Self {
             workspace,
             execution: Box::new(ToolExecutionState {
+                rlm_caller: None,
                 disallowed_tools: Vec::new(),
+                acp_host: None,
+                child_host: None,
                 human_decision: None,
                 shell_manager,
                 file_read_tracker: new_shared_file_read_tracker(),
@@ -872,19 +882,11 @@ impl ToolContext {
         &mut self,
     ) -> Option<crate::core::engine::LiveRuntimeAuthority> {
         let live = self.live_posture.clone()?;
-        Some(live.apply(self))
-    }
-
-    /// Resolves once the live posture differs from what it is now; never for
-    /// a context without a live source.
-    pub(crate) async fn live_posture_moved(&self) {
-        let Some(live) = self.live_posture.as_ref() else {
-            return std::future::pending().await;
-        };
-        let start = live.read();
-        while live.read() == start {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let authority = live.apply(self);
+        if let Some(child) = self.child_host.as_ref() {
+            self.shell_policy = self.shell_policy.min_with(child.grant.shell_policy());
         }
+        Some(authority)
     }
 
     /// Stamp tool work with the sub-agent that owns it.
@@ -981,10 +983,13 @@ impl ToolContext {
     }
 
     fn authority_clamped_shell_policy(&self, policy: ShellPolicy) -> ShellPolicy {
-        match self.tool_authority.as_deref() {
+        let policy = match self.tool_authority.as_deref() {
             Some(cap) => policy.min_with(cap.shell.shell_policy()),
             None => policy,
-        }
+        };
+        self.child_host
+            .as_ref()
+            .map_or(policy, |child| policy.min_with(child.grant.shell_policy()))
     }
 
     /// Attach an external sandbox backend for remote shell execution.
@@ -1610,6 +1615,16 @@ pub trait ToolSpec: Send + Sync {
     /// grant covers one reviewed plugin build: an updated plugin, or another
     /// plugin that later registers the same name, is asked again.
     fn approval_scope(&self) -> Option<String> {
+        None
+    }
+
+    /// Who this tool is, if it is an extension tool: composed by Rust from its
+    /// registration. `Some` makes the turn loop serve a permission gate for
+    /// the tool's call, through which its `core/call`s are planned and
+    /// approved like a model's, and makes the tool unreachable from any other
+    /// extension's `core/call` (no recursion). `None` (every built-in, script
+    /// and MCP tool) changes nothing.
+    fn extension_caller(&self) -> Option<crate::tools::codemode::ExtensionCaller> {
         None
     }
 

@@ -343,7 +343,7 @@ codewhale_dev_cache_exec_cargo() {
     && [ -z "${CODEWHALE_BUILD_LOCK_HELD:-}" ] \
     && [ -f "$_cw_lock_script" ] \
     && command -v python3 >/dev/null 2>&1; then
-    exec python3 "$_cw_lock_script" "${CODEWHALE_BUILD_LOCK_FILE:-$(codewhale_dev_cache_root)/build.lock}" -- cargo "$@"
+    CARGOWHALE=off exec python3 "$_cw_lock_script" "${CODEWHALE_BUILD_LOCK_FILE:-$(codewhale_dev_cache_root)/build.lock}" -- cargo "$@"
   fi
   exec cargo "$@"
 }

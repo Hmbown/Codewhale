@@ -32,6 +32,7 @@ import {
 } from "./context";
 import {
   isInsideRoot,
+  isRealPathInsideRoot,
   projectItem,
   statusForEvent,
   type ItemView,
@@ -421,7 +422,7 @@ export class ChatView implements vscode.WebviewViewProvider {
 
     if (path.isAbsolute(candidate)) {
       const resolved = path.resolve(candidate);
-      const inWorkspace = folders.some((folder) => isInsideRoot(folder.uri.fsPath, resolved));
+      const inWorkspace = await insideAnyFolder(folders, resolved);
       if (!inWorkspace) {
         const choice = await vscode.window.showWarningMessage(
           `Open a file outside this workspace?\n\n${resolved}`,
@@ -436,8 +437,9 @@ export class ChatView implements vscode.WebviewViewProvider {
     } else {
       for (const folder of folders) {
         // joinPath keeps the folder's scheme (remote/virtual workspaces); the
-        // containment check runs on the resolved filesystem path.
-        if (isInsideRoot(folder.uri.fsPath, candidate)) {
+        // containment check runs on the resolved filesystem path, with links
+        // followed, so a link inside the workspace cannot lead out of it.
+        if (await isInsideFolder(folder, candidate)) {
           targets.push(vscode.Uri.joinPath(folder.uri, candidate));
         }
       }
@@ -767,6 +769,31 @@ export class ChatView implements vscode.WebviewViewProvider {
 </body>
 </html>`;
   }
+}
+
+/**
+ * Whether `candidate` is inside the workspace folder. Local folders are
+ * checked on their real path (links followed); a folder on a non-file scheme
+ * (virtual workspace) has no local disk to resolve, so it keeps the lexical
+ * check.
+ */
+async function isInsideFolder(folder: vscode.WorkspaceFolder, candidate: string): Promise<boolean> {
+  return folder.uri.scheme === "file"
+    ? isRealPathInsideRoot(folder.uri.fsPath, candidate)
+    : isInsideRoot(folder.uri.fsPath, candidate);
+}
+
+/** Whether `candidate` is inside any of the workspace folders. */
+async function insideAnyFolder(
+  folders: readonly vscode.WorkspaceFolder[],
+  candidate: string,
+): Promise<boolean> {
+  for (const folder of folders) {
+    if (await isInsideFolder(folder, candidate)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function readPayloadItem(payload: unknown): Partial<ItemRecord> | undefined {

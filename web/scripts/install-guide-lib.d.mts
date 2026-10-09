@@ -3,6 +3,6 @@ export type InstallGuide = {
   anchors: string[];
   chunks: { kind: "html" | "code"; text: string }[];
 };
-export function buildInstallGuide(source: string): InstallGuide;
+export function buildInstallGuide(source: string, options?: { sourcePath?: string; tableLabel?: string }): InstallGuide;
 export function installAnchorErrors(text: string, anchors: readonly string[]): string[];
-export function renderInstallGuideModule(source: string): string;
+export function renderInstallGuideModule(source: string, chineseSource?: string): string;

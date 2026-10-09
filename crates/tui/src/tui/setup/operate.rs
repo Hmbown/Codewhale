@@ -27,10 +27,21 @@ impl Default for SetupOperateFacts {
 impl SetupOperateFacts {
     pub(super) fn from_app_config(app: &App, config: &Config, provider_ready: bool) -> Self {
         let provider_identity = app.provider_identity_for_persistence();
-        let subagents_enabled = config.subagents_enabled_for_provider(app.api_provider);
-        let max_subagents = config.max_subagents_for_provider(app.api_provider);
-        let launch_concurrency = config.launch_concurrency_for_provider(app.api_provider);
-        let max_admitted = config.max_admitted_subagents_for_provider(app.api_provider);
+        let identity = app
+            .admitted_provider_identity()
+            .ok()
+            .filter(|identity| config.verify_provider_identity(identity).is_ok());
+        let subagents_enabled = identity.map_or(false, |identity| {
+            config.subagents_enabled_for_provider(identity)
+        });
+        let max_subagents =
+            identity.map_or(0, |identity| config.max_subagents_for_provider(identity));
+        let launch_concurrency = identity.map_or(0, |identity| {
+            config.launch_concurrency_for_provider(identity)
+        });
+        let max_admitted = identity.map_or(0, |identity| {
+            config.max_admitted_subagents_for_provider(identity)
+        });
         let runtime_disabled_reason = if subagents_enabled {
             None
         } else {
@@ -40,7 +51,9 @@ impl SetupOperateFacts {
                     .unwrap_or("disabled for active provider"),
             )
         };
-        let max_spawn_depth = config.subagent_max_spawn_depth_for_provider(app.api_provider);
+        let max_spawn_depth = identity.map_or(0, |identity| {
+            config.subagent_max_spawn_depth_for_provider(identity)
+        });
         let runtime_configured =
             subagents_enabled && max_subagents > 0 && launch_concurrency > 0 && max_spawn_depth > 0;
         // Conversation and read-only discovery do not require a worker. This

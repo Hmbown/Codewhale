@@ -85,7 +85,7 @@ async function generateCurate(env: AgentEnv): Promise<Record<string, unknown>> {
 }
 
 async function generateTriage(env: AgentEnv): Promise<Record<string, unknown>> {
-  const repo = env.GITHUB_REPO ?? "Hmbown/CodeWhale";
+  const repo = env.GITHUB_REPO ?? "codewhale-hq/CodeWhale";
   try {
     const res = await fetch(
       `https://api.github.com/repos/${repo}/issues?state=open&sort=created&direction=desc&per_page=30`,
@@ -152,7 +152,7 @@ async function generateTriage(env: AgentEnv): Promise<Record<string, unknown>> {
 }
 
 async function generatePrReview(env: AgentEnv): Promise<Record<string, unknown>> {
-  const repo = env.GITHUB_REPO ?? "Hmbown/CodeWhale";
+  const repo = env.GITHUB_REPO ?? "codewhale-hq/CodeWhale";
   try {
     const res = await fetch(
       `https://api.github.com/repos/${repo}/pulls?state=open&sort=created&direction=desc&per_page=20`,
@@ -237,7 +237,7 @@ async function generatePrReview(env: AgentEnv): Promise<Record<string, unknown>>
 }
 
 async function generateStale(env: AgentEnv): Promise<Record<string, unknown>> {
-  const repo = env.GITHUB_REPO ?? "Hmbown/CodeWhale";
+  const repo = env.GITHUB_REPO ?? "codewhale-hq/CodeWhale";
   const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   try {
     const res = await fetch(
@@ -305,7 +305,7 @@ async function generateStale(env: AgentEnv): Promise<Record<string, unknown>> {
 }
 
 async function generateDupes(env: AgentEnv): Promise<Record<string, unknown>> {
-  const repo = env.GITHUB_REPO ?? "Hmbown/CodeWhale";
+  const repo = env.GITHUB_REPO ?? "codewhale-hq/CodeWhale";
   try {
     const res = await fetch(
       `https://api.github.com/repos/${repo}/issues?state=open&per_page=100`,
@@ -366,7 +366,7 @@ async function generateDupes(env: AgentEnv): Promise<Record<string, unknown>> {
 }
 
 async function generateDigest(env: AgentEnv): Promise<Record<string, unknown>> {
-  const repo = env.GITHUB_REPO ?? "Hmbown/CodeWhale";
+  const repo = env.GITHUB_REPO ?? "codewhale-hq/CodeWhale";
   const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
   // Compute week ID

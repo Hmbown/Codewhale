@@ -212,7 +212,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand("codewhale.openRuntimeDocs", () => {
       void vscode.env.openExternal(
-        vscode.Uri.parse("https://github.com/Hmbown/CodeWhale/blob/main/docs/RUNTIME_API.md"),
+        vscode.Uri.parse("https://github.com/codewhale-hq/CodeWhale/blob/main/docs/RUNTIME_API.md"),
       );
     }),
     vscode.commands.registerCommand("codewhale.ask", async () => {

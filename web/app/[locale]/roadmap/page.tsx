@@ -20,17 +20,20 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
   });
 }
 
-const tracksEn = [
+type TrackItem = { title: string; note: string; href?: string };
+type Track = { title: string; items: TrackItem[] };
+
+const tracksEn: Track[] = [
   {
     title: "Shipped",
     items: [
-      { title: "Small searchable toolbox", note: "Every turn starts with read, write, edit, bash, agent, and tool_search. Specialized native, Web, MCP, plugin, memory, task, and verification tools are policy-filtered and searchable; activated schemas stay in a bounded per-conversation toolbox." },
+      { title: "Small searchable toolbox", note: "Every turn starts with a small pinned set — read, write, edit, file_search, bash, agent, workflow, todo and goal controls, and skills — plus synthetic tool_search. Specialized native, Web, MCP, plugin, memory, task, and verification tools are policy-filtered and searchable; activated schemas stay in a bounded per-conversation toolbox." },
       { title: "Sub-agent parallel execution", note: "agent; 64 concurrent sessions by default, configurable to 128, with bounded result handles" },
       { title: "RLM batched processing", note: "Persistent sandboxed Python REPL with 1–16 cheap parallel children for long-input analysis" },
       { title: "Three operating modes", note: "Plan (read-only authority), Work (execution), and Operate (Fleet/Workflow orchestration) keep one primitive vocabulary; Ask / Auto-Review / Full Access remains an orthogonal approval posture." },
       { title: "OS command sandbox", note: "Seatbelt on macOS when available; opt-in bubblewrap on Linux when installed. Windows currently reports no OS sandbox." },
       { title: "Durable sessions + tasks", note: "Save, resume, rollback; background task queue with replayable timelines" },
-      { title: "Bidirectional MCP", note: "Consume tools from external servers; expose as server via `codewhale mcp`" },
+      { title: "Bidirectional MCP", note: "Consume tools from external servers; expose as a server via `codewhale serve --mcp`" },
       { title: "Skills + unified slash palette", note: "Skills load automatically from your Codewhale folder; /help, /mode, /status, /config, /trust, /feedback" },
       { title: "OpenRouter provider", note: "OpenRouter integration with 300+ models across dozens of providers" },
       { title: "OpenAI-compatible & local runtimes", note: "Generic `openai` route for any OpenAI-compatible gateway, plus vLLM, SGLang, and Ollama against your own localhost endpoints — no key required" },
@@ -55,7 +58,7 @@ const tracksEn = [
       { title: "Workrooms", note: "Durable, addressable agent-work threads over the Runtime API and user surfaces" },
       { title: "Exa web-search backend", note: "Bundled alternative to the existing DDG + Bing path" },
       { title: "Homebrew core formula", note: "Tap exists; pursuing homebrew-core inclusion" },
-      { title: "Native Windows installer", note: "MSI / WinGet; Scoop manifest already ships" },
+      { title: "Native Windows installer", note: "MSI installer; the WinGet package, Scoop manifest, and NSIS setup already ship" },
       { title: "Unsloth / NeMo / Arcee fine-tune integration", note: "One-click fine-tuning workflows backed by Unsloth, NVIDIA NeMo, and Arcee toolkits" },
     ],
   },
@@ -79,17 +82,17 @@ const tracksEn = [
   },
 ];
 
-const tracksZh = [
+const tracksZh: Track[] = [
   {
     title: "已完成",
     items: [
-      { title: "小型可搜索工具箱", note: "每轮以 read、write、edit、bash、agent 与 tool_search 开始。原生专用工具、Web、MCP、插件、记忆、任务和验证工具按策略过滤并可搜索；激活的 schema 保存在有界的会话工具箱中。" },
+      { title: "小型可搜索工具箱", note: "每轮以一组固定的核心工具开始——read、write、edit、file_search、bash、agent、workflow、todo 与目标控制、技能——外加合成的 tool_search。原生专用工具、Web、MCP、插件、记忆、任务和验证工具按策略过滤并可搜索；激活的 schema 保存在有界的会话工具箱中。" },
       { title: "子 Agent 并行执行", note: "agent；默认 64 个并发会话，可配置到 128 个，通过 var_handle 有界读取结果" },
       { title: "RLM 批量处理", note: "持久沙箱 Python REPL，支持 1–16 路廉价并行子调用，处理长文本分析" },
       { title: "三种运行模式", note: "Plan（只读权限）、Work（执行）与 Operate（Fleet / Workflow 编排）使用同一套基础工具名称；Ask、Auto-Review 与 Full Access 审批姿态独立设置。" },
       { title: "OS 命令沙箱", note: "macOS 在可用时使用 Seatbelt；Linux 在安装后可显式启用 bubblewrap。Windows 当前报告无 OS 沙箱。" },
       { title: "持久化会话 + 后台任务", note: "保存、恢复、回滚；后台任务队列，可回放时间线" },
-      { title: "双向 MCP 协议", note: "消费外部服务器工具；通过 `codewhale mcp` 暴露为服务器" },
+      { title: "双向 MCP 协议", note: "消费外部服务器工具；通过 `codewhale serve --mcp` 暴露为服务器" },
       { title: "技能 + 统一命令面板", note: "技能从 Codewhale 目录自动加载；/help、/mode、/status、/config、/trust、/feedback" },
       { title: "OpenRouter 提供商", note: "原生集成 OpenRouter，支持 300+ 模型，覆盖数十个提供商" },
       { title: "OpenAI 兼容与本地运行时", note: "通用 `openai` 路由可接入任意 OpenAI 兼容网关；vLLM、SGLang、Ollama 直连本地端点，无需密钥" },
@@ -114,7 +117,7 @@ const tracksZh = [
       { title: "Workrooms 工作间", note: "基于 Runtime API 与用户界面的持久、可寻址 Agent 工作线程" },
       { title: "Exa 网页搜索后端", note: "内建替代 DDG + Bing 的搜索路由" },
       { title: "Homebrew 核心仓库", note: "Tap 已有；正在争取进入 homebrew-core" },
-      { title: "Windows 原生安装器", note: "MSI / WinGet；Scoop 清单已发布" },
+      { title: "Windows 原生安装器", note: "MSI 安装器；WinGet 包、Scoop 清单与 NSIS 安装程序均已发布" },
       { title: "Unsloth / NeMo / Arcee 微调集成", note: "一键微调工作流，由 Unsloth、NVIDIA NeMo 和 Arcee 工具链驱动" },
     ],
   },
@@ -152,7 +155,7 @@ export default async function RoadmapPage({ params }: { params: Promise<{ locale
 
   // Live feed: shipped from GitHub Releases; underway/considered/ruled-out from issue labels.
   // Per-category fallback to the static items so unlabeled categories stay populated.
-  let tracks = baseTracks;
+  let tracks: Track[] = baseTracks;
   try {
     const env = await getEnv();
     const feed = await getCachedRoadmap(env.CURATED_KV, env.GITHUB_TOKEN);
@@ -170,7 +173,7 @@ export default async function RoadmapPage({ params }: { params: Promise<{ locale
       tracks = baseTracks.map((t) => {
         const live = liveByCategory[t.title];
         if (live && live.length > 0) {
-          return { ...t, items: live.map((it) => ({ title: it.title, note: it.note })) };
+          return { ...t, items: live.map((it) => ({ title: it.title, note: it.note, href: it.href })) };
         }
         return t;
       });
@@ -180,9 +183,9 @@ export default async function RoadmapPage({ params }: { params: Promise<{ locale
   }
 
   const links = [
-    { title: "Issues", detail: t.issuesDetail, href: "https://github.com/Hmbown/CodeWhale/issues" },
-    { title: "Discussions", detail: t.discussionsDetail, href: "https://github.com/Hmbown/CodeWhale/discussions/new?category=ideas" },
-    { title: "Pull requests", detail: t.pullsDetail, href: "https://github.com/Hmbown/CodeWhale/pulls" },
+    { title: "Issues", detail: t.issuesDetail, href: "https://github.com/codewhale-hq/CodeWhale/issues" },
+    { title: "Discussions", detail: t.discussionsDetail, href: "https://github.com/codewhale-hq/CodeWhale/discussions/new?category=ideas" },
+    { title: "Pull requests", detail: t.pullsDetail, href: "https://github.com/codewhale-hq/CodeWhale/pulls" },
   ];
 
   return (
@@ -194,7 +197,7 @@ export default async function RoadmapPage({ params }: { params: Promise<{ locale
           id="roadmap-status"
           title={t.sectionTitle}
           link={
-            <Link href="https://github.com/Hmbown/CodeWhale/issues" className="section-link">
+            <Link href="https://github.com/codewhale-hq/CodeWhale/issues" className="section-link">
               {t.browseIssues}
               <Icon name="external" className="icon" />
             </Link>
@@ -212,7 +215,9 @@ export default async function RoadmapPage({ params }: { params: Promise<{ locale
                 <ul className="group-card" role="list">
                   {track.items.map((item) => (
                     <li key={`${item.title}-${item.note}`} className="group-row roadmap-item">
-                      <p className="roadmap-item-title">{roadmapText(item.title)}</p>
+                      <p className="roadmap-item-title">
+                        {item.href ? <Link href={item.href}>{roadmapText(item.title)}</Link> : roadmapText(item.title)}
+                      </p>
                       <p className="roadmap-item-note">{roadmapText(item.note)}</p>
                     </li>
                   ))}

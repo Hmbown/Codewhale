@@ -174,7 +174,7 @@ remote 的 git 仓库（作用域 id 就是它的哈希）。
 
 未来的一等后端，必须在每个记忆入口覆盖捕获、搜索、纠正、删除，
 以及作用域和错误报告。它还必须在上面的缓存契约下，把易变的召回内容放进只追加的历史里。
-这次完整迁移记录在 [#6050](https://github.com/Hmbown/CodeWhale/issues/6050) 里。
+这次完整迁移记录在 [#6050](https://github.com/codewhale-hq/CodeWhale/issues/6050) 里。
 0.9.13 没有声称完成这次迁移，也没有声称提供商业记忆集成。
 
 ## 配置参考
@@ -197,5 +197,5 @@ enabled = true                    # default false; or set DEEPSEEK_MEMORY=on
 
 - `docs/SUBAGENTS.md`——子智能体（sub-agent）会继承记忆，也可以使用 `remember` 工具。
 - `docs/CONFIGURATION.md`——完整的配置参考。
-- Issue [#489](https://github.com/Hmbown/CodeWhale/issues/489)
+- Issue [#489](https://github.com/codewhale-hq/CodeWhale/issues/489)
   ——跟踪这项工作的第一阶段 EPIC。

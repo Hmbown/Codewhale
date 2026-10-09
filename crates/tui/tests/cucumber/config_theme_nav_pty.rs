@@ -31,7 +31,7 @@ const EDITOR_LEGEND: &str = "or click choose";
 const CHOICE_CURSOR: char = '▸';
 
 fn spawn(workspace: &SealedWorkspace) -> Harness {
-    Harness::builder(Harness::cargo_bin("codewhale-tui"))
+    Harness::builder(Harness::codewhale_binary())
         .cwd(workspace.workspace())
         .clear_env()
         .seal_home(workspace.home())

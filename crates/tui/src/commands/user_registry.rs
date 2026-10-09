@@ -25,6 +25,9 @@ struct UserCommandRegistryState {
     plugin_workspace: Option<PathBuf>,
     plugin_sources: Vec<crate::plugins::runtime::PluginComponentSource>,
     plugin_errors: Vec<String>,
+    /// `extension_host::command::epoch()` when `registry` was built: it
+    /// reloads when the live extension commands may have changed.
+    extension_epoch: u64,
     registry: UserCommandRegistry,
 }
 
@@ -55,6 +58,9 @@ pub struct UserCommandMetadata {
     pub aliases: Vec<String>,
     pub hidden: bool,
     pub plugin_authority: Option<crate::plugins::types::PluginAuthority>,
+    /// Set for a command contributed by an extension-host plugin: it runs in
+    /// the host (`command/run`) instead of expanding `body`.
+    pub extension: Option<crate::extension_host::command::ExtensionCommandRef>,
 }
 
 impl UserCommandMetadata {
@@ -321,6 +327,58 @@ impl UserCommandRegistry {
         self.load_errors.push(LoadError { path, message });
     }
 
+    /// Load commands contributed by extension-host plugins. They go last, so
+    /// a built-in, a user, workspace or manifest command with the same name
+    /// always wins: an extension command never shadows another command, and
+    /// the one it loses to is named in a load error.
+    pub(crate) fn load_extension_commands(
+        &mut self,
+        commands: Vec<crate::extension_host::command::ExtensionCommandEntry>,
+    ) {
+        for entry in commands {
+            let registration = &entry.registration;
+            let name = registration.name.to_ascii_lowercase();
+            let origin = PathBuf::from(format!("extension:{}", registration.plugin_name));
+            if super::registry().get(&name).is_some() {
+                self.record_load_error(
+                    origin,
+                    format!(
+                        "Extension command '/{name}' collides with a built-in command and was not loaded"
+                    ),
+                );
+                continue;
+            }
+            if self.commands.contains_key(&name) || self.aliases.contains_key(&name) {
+                self.record_load_error(
+                    origin,
+                    format!(
+                        "Extension command '/{name}' collides with another command; using the other definition"
+                    ),
+                );
+                continue;
+            }
+            let reference = entry.reference();
+            self.commands.insert(
+                name.clone(),
+                UserCommandMetadata {
+                    name,
+                    // Never expanded: dispatch runs the command in the host.
+                    body: String::new(),
+                    description: Some(registration.description.clone()),
+                    usage: None,
+                    arguments: None,
+                    argument_hint: registration.argument_hint.clone(),
+                    allowed_tools: None,
+                    pausable: false,
+                    aliases: Vec::new(),
+                    hidden: false,
+                    plugin_authority: Some(entry.authority),
+                    extension: Some(reference),
+                },
+            );
+        }
+    }
+
     pub fn get(&self, name: &str) -> Option<&UserCommandMetadata> {
         self.get_unchecked(name)
             .filter(|command| plugin_command_is_current(command))
@@ -402,6 +460,7 @@ fn parse_metadata(
         aliases: Vec::new(),
         hidden: false,
         plugin_authority: None,
+        extension: None,
     };
     let mut configured_name = None;
 
@@ -682,8 +741,12 @@ fn registry_needs_reload(
     guard: &UserCommandRegistryState,
     workspace: &Option<PathBuf>,
     snapshot: &[CommandDirSnapshot],
+    extension_epoch: u64,
 ) -> bool {
-    !guard.initialized || guard.workspace != *workspace || guard.command_dirs_snapshot != snapshot
+    !guard.initialized
+        || guard.workspace != *workspace
+        || guard.command_dirs_snapshot != snapshot
+        || guard.extension_epoch != extension_epoch
 }
 
 #[cfg(test)]
@@ -734,24 +797,32 @@ pub fn with_registry_for_workspace<R>(
         }
     };
     let snapshot = command_dirs_snapshot_with_plugins(workspace.as_deref(), &plugin_sources);
+    // Read before the extension commands themselves: a change that lands
+    // while the registry is being built leaves the epoch behind, so the next
+    // read reloads.
+    let extension_epoch = crate::extension_host::command::epoch();
     {
         let guard = lock.read().expect("user command registry lock poisoned");
-        if !registry_needs_reload(&guard, &workspace, &snapshot) {
+        if !registry_needs_reload(&guard, &workspace, &snapshot, extension_epoch) {
             return f(&guard.registry);
         }
     }
 
-    let replacement = UserCommandRegistry::load_with_sources(
+    let mut replacement = UserCommandRegistry::load_with_sources(
         &user_commands::commands_dirs(workspace.as_deref()),
         &user_commands::workflow_dirs(workspace.as_deref()),
         &plugin_sources,
         &plugin_errors,
     );
+    if let Some(workspace) = workspace.as_deref() {
+        replacement.load_extension_commands(crate::extension_host::live_commands_for(workspace));
+    }
     let mut guard = lock.write().expect("user command registry lock poisoned");
-    if registry_needs_reload(&guard, &workspace, &snapshot) {
+    if registry_needs_reload(&guard, &workspace, &snapshot, extension_epoch) {
         guard.initialized = true;
         guard.workspace = workspace;
         guard.command_dirs_snapshot = snapshot;
+        guard.extension_epoch = extension_epoch;
         guard.registry = replacement;
     }
     f(&guard.registry)
@@ -779,27 +850,54 @@ pub fn install_plugin_registry(
     errors
 }
 
+pub fn with_registry_for_plugins<R>(
+    plugins: &crate::plugins::PluginRegistry,
+    f: impl FnOnce(&UserCommandRegistry) -> R,
+) -> R {
+    with_registry_for_workspace(Some(plugins.workspace()), |base| {
+        let mut selected = base.clone();
+        selected
+            .commands
+            .retain(|_, metadata| metadata.extension.is_none());
+        selected.load_extension_commands(crate::extension_host::live_commands_for_plugins(plugins));
+        f(&selected)
+    })
+}
+pub fn with_registry_for_app<R>(app: &App, f: impl FnOnce(&UserCommandRegistry) -> R) -> R {
+    with_registry_for_plugins(app.extension_plugin_view().as_ref(), f)
+}
+
 pub fn try_dispatch(app: &mut App, input: &str) -> Option<CommandResult> {
     let parts: Vec<&str> = input.trim().splitn(2, ' ').collect();
     let command = normalize_name(parts.first().copied().unwrap_or_default());
     let args = parts.get(1).copied().unwrap_or("").trim();
 
-    let (dispatch_error, metadata) =
-        with_registry_for_workspace(Some(&app.workspace), |registry| {
-            // Dispatch must see a just-revoked plugin command long enough to
-            // return a visible authority error. Discovery and palettes use
-            // `get`/`iter`, which hide it immediately.
-            let metadata = registry.get_unchecked(&command).cloned();
-            let dispatch_error = metadata
-                .as_ref()
-                .and_then(|_| registry.dispatch_error(&command));
-            (dispatch_error, metadata)
-        });
+    let (dispatch_error, metadata) = with_registry_for_app(app, |registry| {
+        // Dispatch must see a just-revoked plugin command long enough to
+        // return a visible authority error. Discovery and palettes use
+        // `get`/`iter`, which hide it immediately.
+        let metadata = registry.get_unchecked(&command).cloned();
+        let dispatch_error = metadata
+            .as_ref()
+            .and_then(|_| registry.dispatch_error(&command));
+        (dispatch_error, metadata)
+    });
     if let Some(error) = dispatch_error {
         return Some(CommandResult::error(error));
     }
 
     let metadata = metadata?;
+    if let Some(extension) = metadata.extension.clone() {
+        // Runs in the extension host, asynchronously: the UI event loop
+        // handles the action. Its liveness, receipt and host checks happen
+        // there, immediately before the call. Unlike a template command, it
+        // leaves the goal, todos and plan alone.
+        return Some(CommandResult::action(AppAction::RunExtensionCommand {
+            command: extension,
+            name: metadata.name,
+            input: args.to_string(),
+        }));
+    }
     if let Some(authority) = metadata.plugin_authority.as_ref()
         && let Err(reason) = crate::plugins::registry::verify_plugin_component_authority(
             authority,

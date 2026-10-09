@@ -14,6 +14,11 @@
 
 - Paste a clipboard image into the composer with the normal terminal paste
   shortcut, or run `/attach <path>` for an existing PNG, JPEG, GIF, or WebP.
+- Drag an image file onto the terminal, or paste its absolute path (plain,
+  quoted, shell-escaped, or as a `file://` URL), and it attaches the same way.
+  A paste becomes an attachment only when every path in it names an existing
+  image; otherwise it stays text. A text-only model gets a notice instead of
+  the image.
 - A visible attachment row appears above the composer before the turn is sent.
   Temporary macOS `NSIRD_screencaptureui` paths are copied into Codewhale's
   stable attachment store when ingested.
@@ -23,6 +28,10 @@
 
 `read_media` is the corresponding agent-side path for inspecting another
 image later in the task without requiring the operator to attach it again.
+The everyday `read` tool also returns a PNG, JPEG, GIF, or WebP as image
+content (downscaled when over the inline limit). Both may open an image the
+user attached from outside the workspace — that exact file, not its
+directory.
 
 ---
 

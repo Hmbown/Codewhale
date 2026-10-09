@@ -29,8 +29,8 @@ use super::profile::{
     FleetRole as FleetProfileRole, FleetSlot, ProfileOrigin, canonical_public_role_name,
 };
 use super::role::runtime_role_for_member;
-use crate::config::{ApiProvider, Config};
-use crate::route_runtime::{resolve_route_candidate, resolve_runtime_route};
+use crate::config::{Config, ProviderKind};
+use crate::route_runtime::resolve_route_candidate;
 use crate::tools::subagent::{AgentWorkerSpec, AgentWorkerToolProfile, FleetRole};
 use crate::worker_profile::{ChildLaunchManifest, ModelRoute, ToolScope, WorkerRuntimeProfile};
 
@@ -58,6 +58,8 @@ struct FrozenFleetMember {
     reasoning_effort: Option<String>,
     max_spawn_depth: Option<u32>,
     origin: ProfileOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_preset: Option<crate::extension_host::composition_scope::NativePresetRef>,
 }
 
 impl FrozenFleetMember {
@@ -78,6 +80,7 @@ impl FrozenFleetMember {
             reasoning_effort: profile.profile.reasoning_effort.clone(),
             max_spawn_depth: profile.profile.delegation.max_spawn_depth,
             origin: profile.origin,
+            native_preset: profile.native_preset.clone(),
         }
     }
 
@@ -87,6 +90,7 @@ impl FrozenFleetMember {
         }
         Ok(AgentProfile {
             id: self.id,
+            native_preset: self.native_preset,
             display_name: self.display_name,
             description: self.description,
             requires: self.requires,
@@ -287,8 +291,8 @@ pub fn validate_fleet_task_routes(
         }
         if config.is_none()
             && let Some(provider_id) = explicit_provider.as_deref()
-            && ApiProvider::parse(provider_id)
-                .is_none_or(|provider| provider == ApiProvider::Custom)
+            && ProviderKind::parse(provider_id)
+                .is_none_or(|provider| provider == ProviderKind::Custom)
         {
             bail!(
                 "Fleet task `{}` names custom provider=`{provider_id}`, but a provider name alone does not prove its endpoint or model; attach the live route config before creating the run",
@@ -297,7 +301,10 @@ pub fn validate_fleet_task_routes(
         }
         if pinned_model && explicit_provider.is_none() {
             let config = config.expect("provider authority checked above");
-            let (provider, base_url) = (config.api_provider(), config.active_route_base_url());
+            let identity = config
+                .active_provider_identity()
+                .map_err(anyhow::Error::msg)?;
+            let (provider, base_url) = (identity.provider, config.base_url_for_route(&identity));
             if let Err(reason) =
                 crate::route_runtime::validate_unpinned_model_provider(provider, &model, &base_url)
             {
@@ -363,7 +370,7 @@ fn validate_fleet_reasoning_effort(
         // the more useful provider/model diagnosis.
         return Ok(());
     };
-    let provider = ApiProvider::parse(&route.provider_kind).unwrap_or(ApiProvider::Custom);
+    let provider = ProviderKind::parse(&route.provider_kind).unwrap_or(ProviderKind::Custom);
     let capability = crate::config::provider_capability(provider, &route.wire_model_id);
     if capability.thinking_supported {
         return Ok(());
@@ -686,33 +693,39 @@ pub(crate) fn resolve_fleet_route_with_config(
     let (candidate, provider_id, provider_exact_id, route_source) = if let Some(config) = config {
         let identity = match explicit_provider_id.as_deref() {
             Some(provider_id) => config.resolve_provider_identity(provider_id).ok()?,
-            None => config
-                .resolve_provider_identity(&config.provider_identity_for(config.api_provider()))
-                .ok()?,
+            None => config.active_provider_identity().ok()?,
         };
-        let mut scoped = config.clone();
-        scoped.scope_to_provider_identity(&identity);
-        let route = resolve_runtime_route(&scoped, identity.provider, model_selector)
-            .ok()?
-            .validate()
-            .ok()?;
-        let provider_exact_id = (route.identity.provider == ApiProvider::Custom)
-            .then_some(route.identity.exact_id)
-            .flatten();
+        let route = crate::route_runtime::resolve_runtime_route_for_identity(
+            config,
+            &identity,
+            model_selector,
+        )
+        .ok()?
+        .validate()
+        .ok()?;
+        let provider_exact_id = route.identity.persisted_id().map(str::to_string);
         (
             route.candidate,
-            route.identity.key,
+            route.identity.key.to_string(),
             provider_exact_id,
             "runtime_route",
         )
     } else {
         let provider_id = explicit_provider_id.as_deref()?;
-        let provider = ApiProvider::parse(provider_id)?;
-        if provider == ApiProvider::Custom {
+        let metadata = codewhale_config::descriptors::compatibility_for_selector(provider_id)?;
+        let provider = metadata.kind;
+        if provider == ProviderKind::Custom {
             return None;
         }
-        let candidate =
-            resolve_route_candidate(provider, model_selector, None, None, None, None).ok()?;
+        let candidate = resolve_route_candidate(
+            provider,
+            model_selector,
+            Some(metadata.default_model),
+            Some(metadata.base_url.to_owned()),
+            None,
+            None,
+        )
+        .ok()?;
         let provider_id = candidate.provider_id().as_str().to_string();
         (candidate, provider_id, None, "resolver")
     };
@@ -767,8 +780,8 @@ pub(crate) fn resolve_fleet_route_from_worker_report(
         Some(provider_exact_id) => Some(non_empty_trimmed(provider_exact_id)?),
         None => None,
     };
-    let provider_kind = ApiProvider::parse(provider)?;
-    if provider_exact_id.is_some() && provider_kind != ApiProvider::Custom {
+    let provider_kind = ProviderKind::parse(provider)?;
+    if provider_exact_id.is_some() && provider_kind != ProviderKind::Custom {
         return None;
     }
     let provider_id = provider_exact_id.unwrap_or(provider);
@@ -1190,7 +1203,7 @@ fn effective_fleet_model_with_source(
 /// The provider id a resolved agent profile EXPLICITLY pins, if any (#4093).
 ///
 /// This preserves user-named OpenAI-compatible custom providers such as
-/// `lm-studio` instead of collapsing them through [`ApiProvider`]. Runtime
+/// `lm-studio` instead of collapsing them through [`ProviderKind`]. Runtime
 /// launch paths can set `Config.provider` to this exact id so the normal config
 /// resolver finds `[providers.<id>]` (#3965).
 ///
@@ -1220,10 +1233,12 @@ pub(crate) fn explicit_fleet_provider_id(agent_profile: Option<&AgentProfile>) -
 /// instead of re-deriving it and risking a second, divergent policy. User-named
 /// custom providers intentionally return `None` here; launch paths that can
 /// carry strings should use [`explicit_fleet_provider_id`].
-pub(crate) fn explicit_fleet_provider(agent_profile: Option<&AgentProfile>) -> Option<ApiProvider> {
+pub(crate) fn explicit_fleet_provider(
+    agent_profile: Option<&AgentProfile>,
+) -> Option<ProviderKind> {
     explicit_fleet_provider_id(agent_profile)
         .as_deref()
-        .and_then(ApiProvider::parse)
+        .and_then(ProviderKind::parse)
 }
 
 pub(crate) fn effective_fleet_reasoning_effort(
@@ -1888,6 +1903,7 @@ mod tests {
         loadout: codewhale_config::FleetLoadout,
     ) -> AgentProfile {
         AgentProfile {
+            native_preset: None,
             id: id.to_string(),
             display_name: Some(format!("{role} profile")),
             description: Some(format!("{role} description")),
@@ -3158,7 +3174,7 @@ mod tests {
         // provider actually drove resolution, whatever wire id/aggregator
         // mapping the resolver's catalog assigns.
         let openrouter_candidate = resolve_route_candidate(
-            ApiProvider::Openrouter,
+            ProviderKind::Openrouter,
             Some("deepseek-v4-flash"),
             None,
             None,
@@ -3233,7 +3249,7 @@ mod tests {
             .expect("saved cross-provider profile route should resolve");
 
         let openrouter_candidate = resolve_route_candidate(
-            ApiProvider::Openrouter,
+            ProviderKind::Openrouter,
             Some("deepseek-v4-flash"),
             None,
             None,
@@ -4693,7 +4709,7 @@ mod tests {
 
     #[test]
     fn fleet_route_parity_uses_shared_router_candidates() {
-        use crate::config::ApiProvider;
+        use crate::config::ProviderKind;
         use crate::model_routing::{RouterCandidates, provider_router_candidates};
 
         // Fleet emits the SAME `ModelRoute` seam the sub-agent assignment path
@@ -4744,7 +4760,7 @@ mod tests {
             ModelRoute::Inherit => parent.to_string(),
         };
 
-        let deepseek = provider_router_candidates(ApiProvider::Deepseek, parent);
+        let deepseek = provider_router_candidates(ProviderKind::Deepseek, parent);
         assert_eq!(
             resolve(
                 &fleet_model_route_for_loadout("auto", &codewhale_config::FleetLoadout::Fast),
@@ -4756,7 +4772,7 @@ mod tests {
 
         // A provider with no known fast sibling must keep children on the parent
         // model rather than fabricating a cloud id (#3166 route assertion).
-        let no_sibling = provider_router_candidates(ApiProvider::Anthropic, parent);
+        let no_sibling = provider_router_candidates(ProviderKind::Anthropic, parent);
         assert_eq!(no_sibling.cheap, None);
         assert_eq!(
             resolve(

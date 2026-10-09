@@ -2,10 +2,13 @@ import Link from "next/link";
 import { Icon, type IconName } from "@/components/icon";
 import { PageHeader, Section } from "@/components/page-header";
 import { Status, type StatusTone } from "@/components/status-badge";
+import { NativeTerminalGallery } from "@/components/native-terminal-gallery";
 import { getFacts } from "@/lib/facts";
 import { PRODUCT_COPY } from "@/lib/content/product";
 import { fill, getHome, pickText } from "@/lib/i18n/dictionaries";
 import { buildPageMetadata } from "@/lib/page-meta";
+import { getNativeTerminalCopy } from "@/lib/content/native-terminal";
+import { TERMINAL_SCREENSHOT } from "@/lib/media-manifest";
 
 export const revalidate = 300;
 
@@ -22,9 +25,10 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
 // Row order is fixed by PRODUCT_COPY and the home dictionary, so marks and
 // states follow the row, not a translated word.
 const GAIN_ICONS: IconName[] = ["layers", "users", "shield"];
-// Terminal released · local browser ships with it · hosted web preview ·
-// desktop development build · cloud computers in development.
-const AVAILABILITY_TONES: StatusTone[] = ["ready", "ready", "attention", "idle", "idle"];
+// Terminal released · local browser ships with it · CodeWhale GUI
+// available · hosted web preview · desktop development build · cloud
+// computers in development.
+const AVAILABILITY_TONES: StatusTone[] = ["ready", "ready", "ready", "attention", "idle", "idle"];
 
 /**
  * /product — what Codewhale is and what a person gains, with availability
@@ -37,6 +41,7 @@ export default async function ProductPage({ params }: { params: Promise<{ locale
   const t = (text: { en: string; zh: string }) => pickText(text, locale);
   const facts = await getFacts();
   const home = getHome(locale);
+  const terminal = getNativeTerminalCopy(locale);
   const providerCount = facts.providers.length;
 
   return (
@@ -58,6 +63,17 @@ export default async function ProductPage({ params }: { params: Promise<{ locale
       />
 
       <div className="page-body">
+        <Section id="product-terminal" title={terminal.title} scope={terminal.description}>
+          <div className="figure-frame">
+            <NativeTerminalGallery
+              locale={locale}
+              defaultFrame="composer"
+              regionLabel={home.shotPreview}
+              label={fill(home.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}
+            />
+          </div>
+        </Section>
+
         <Section
           id="product-gain"
           title={t(PRODUCT_COPY.gainHeading)}
@@ -145,9 +161,20 @@ export default async function ProductPage({ params }: { params: Promise<{ locale
                   {row.href && row.linkLabel && (
                     <>
                       {" "}
-                      <Link href={`/${locale}${row.href}`} className="link">
-                        {t(row.linkLabel)}
-                      </Link>
+                      {row.href.startsWith("http") ? (
+                        <a
+                          href={row.href}
+                          className="link"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          {t(row.linkLabel)}
+                        </a>
+                      ) : (
+                        <Link href={`/${locale}${row.href}`} className="link">
+                          {t(row.linkLabel)}
+                        </Link>
+                      )}
                     </>
                   )}
                 </dd>

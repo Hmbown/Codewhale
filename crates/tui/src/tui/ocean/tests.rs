@@ -667,3 +667,103 @@ fn life_presence_user_driven_states_are_immediate() {
     assert_eq!(life_presence(None, None, false, false, false), 0.0);
     assert_eq!(life_presence(None, Some(50_000), false, false, false), 0.0);
 }
+
+#[test]
+fn live_semantic_tints_change_absolute_column_samples_and_cache_identity() {
+    let default_theme = codewhale_palette::UNDERWATER_UI_THEME;
+    let custom_theme = UiTheme {
+        warning: Color::Rgb(235, 175, 55),
+        error_fg: Color::Rgb(210, 70, 60),
+        ..default_theme
+    };
+    let viewport = Rect::new(7, 9, 80, 24);
+    for phase in [ShellPhase::Approval, ShellPhase::Failed] {
+        let ordinary = OceanColumn::new(
+            OceanRamp::for_theme(&default_theme).unwrap(),
+            viewport,
+            0,
+            None,
+            phase,
+            false,
+            0,
+            30,
+        );
+        let custom = OceanColumn::new(
+            OceanRamp::for_theme(&custom_theme).unwrap(),
+            viewport,
+            0,
+            None,
+            phase,
+            false,
+            0,
+            30,
+        );
+        assert_ne!(
+            ordinary.color_at_y(viewport.y),
+            custom.color_at_y(viewport.y)
+        );
+        assert_ne!(ordinary.ramp_fingerprint(), custom.ramp_fingerprint());
+        let moved = custom.with_viewport(Rect::new(7, 19, 80, 24));
+        assert_eq!(custom.color_at_y(9), moved.color_at_y(19));
+    }
+}
+
+#[test]
+fn a_stale_success_clock_cannot_mask_attention_or_failure_water() {
+    let ramp = OceanRamp::for_theme(&codewhale_palette::UNDERWATER_UI_THEME).unwrap();
+    let viewport = Rect::new(7, 9, 80, 24);
+    for phase in [
+        ShellPhase::Waiting,
+        ShellPhase::Approval,
+        ShellPhase::Failed,
+    ] {
+        for (animated, presence) in [(false, 0), (true, 1000)] {
+            let plain = OceanColumn::new(ramp, viewport, 0, None, phase, animated, presence, 30);
+            let stale =
+                OceanColumn::new(ramp, viewport, 0, Some(320), phase, animated, presence, 30);
+            assert_eq!(plain.ramp_fingerprint(), stale.ramp_fingerprint());
+            assert_eq!(
+                stale.completion_elapsed_ms(),
+                Some(320),
+                "the pet clock stays caller-owned"
+            );
+            for y in viewport.top()..viewport.bottom() {
+                assert_eq!(plain.color_at_y(y), stale.color_at_y(y));
+            }
+        }
+    }
+}
+
+#[test]
+fn motion_off_ignores_success_pulse_without_losing_the_reported_pet_clock() {
+    let ramp = OceanRamp::for_theme(&codewhale_palette::UNDERWATER_UI_THEME).unwrap();
+    let viewport = Rect::new(7, 9, 80, 24);
+    let plain = OceanColumn::new(ramp, viewport, 0, None, ShellPhase::Done, false, 0, 30);
+    let reported = OceanColumn::new(ramp, viewport, 0, Some(320), ShellPhase::Done, false, 0, 30);
+    assert_eq!(reported.completion_elapsed_ms(), Some(320));
+    assert_eq!(plain.ramp_fingerprint(), reported.ramp_fingerprint());
+    for y in viewport.top()..viewport.bottom() {
+        assert_eq!(plain.color_at_y(y), reported.color_at_y(y));
+    }
+}
+
+#[test]
+fn semantic_finishing_clips_the_request_and_preserves_reversed_cells() {
+    use ratatui::style::Modifier;
+    let theme = codewhale_palette::UNDERWATER_UI_THEME;
+    let ramp = OceanRamp::for_theme(&theme).unwrap();
+    let viewport = Rect::new(7, 9, 80, 24);
+    let area = Rect::new(11, 13, 8, 4);
+    let mut buf = Buffer::empty(area);
+    for cell in &mut buf.content {
+        cell.set_bg(theme.surface_bg);
+    }
+    buf[(12, 13)].modifier.insert(Modifier::REVERSED);
+    buf[(13, 13)].set_bg(theme.selection_bg);
+    let before = buf.clone();
+    let column = OceanColumn::new(ramp, viewport, 0, None, ShellPhase::Idle, false, 0, 30);
+    column.paint_matching(Rect::new(0, 0, 120, 80), &mut buf, theme.surface_bg);
+    assert_eq!(buf[(12, 13)], before[(12, 13)]);
+    assert_eq!(buf[(13, 13)], before[(13, 13)]);
+    assert_eq!(buf[(11, 13)].bg, ramp.color_at_context(4, 24, 30));
+}

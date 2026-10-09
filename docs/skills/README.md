@@ -14,6 +14,17 @@ To activate:
   `/skills`, or bundle into `crates/tui/assets/skills/` + register in
   `crates/tui/src/skills/system.rs` to ship it.
 
-Skills: gh-file-issue, gh-compile-issues, gh-assign-issues, gh-find-prs,
-gh-treasure-hunt, gh-close-issues, gh-credit-harvest, codew-release-qa-sweep,
-contributor-onboarding, feedback.
+The maintainer loop, in order — each skill links the next:
+
+| Stage | Skill | Use it for |
+| --- | --- | --- |
+| 1 | [cw-orient](cw-orient/SKILL.md) | Live checkout, branch, dirt and version truth before editing |
+| 2 | [cw-slice](cw-slice/SKILL.md) | Find the existing owner, bound one slice, fix the evidence bar |
+| 3 | [cw-gates](cw-gates/SKILL.md) | The focused-to-broad verification ladder and CI budget checks |
+| 4 | [cw-dogfood](cw-dogfood/SKILL.md) | Stamped build, atomic install, real-product QA |
+| 5 | [cw-land](cw-land/SKILL.md) | Commits, PRs, contributor credit, merging under a gate |
+| 6 | [cw-handoff](cw-handoff/SKILL.md) | A paste-ready continuation grounded in live state |
+
+GitHub stewardship and release: gh-file-issue, gh-compile-issues,
+gh-assign-issues, gh-find-prs, gh-treasure-hunt, gh-close-issues,
+gh-credit-harvest, codew-release-qa-sweep, contributor-onboarding, feedback.

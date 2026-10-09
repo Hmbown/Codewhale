@@ -52,19 +52,16 @@ function contrast(a: string, b: string): number {
 }
 
 const light = () => roleBlock(":root");
-const osDark = () => roleBlock(':root:not([data-theme="light"])');
 const pinnedDark = () => roleBlock(':root[data-theme="dark"]');
 const stage = () => roleBlock(".stage,\n.site-footer");
 
 describe("role tokens", () => {
-  it("defines every role in light, OS-dark, pinned-dark and the stage", () => {
-    for (const [name, scheme] of [["light", light()], ["os-dark", osDark()], ["pinned", pinnedDark()], ["stage", stage()]] as const) {
+  it("defines every role in light, pinned-dark and the stage", () => {
+    for (const [name, scheme] of [["light", light()], ["pinned", pinnedDark()], ["stage", stage()]] as const) {
       for (const role of ROLES) expect(scheme, `${name}.${role}`).toHaveProperty(role);
     }
-    // The OS-dark scheme is guarded so a pinned light page stays light, and
-    // the pinned dark block repeats it exactly.
-    expect(CSS).toMatch(/@media \(prefers-color-scheme: dark\)\s*\{\s*:root:not\(\[data-theme="light"\]\)\s*\{/);
-    expect(pinnedDark()).toEqual(osDark());
+    // Paper is the site's appearance: dark is a reader's pin, never the OS.
+    expect(CSS).not.toMatch(/@media \(prefers-color-scheme: dark\)/);
   });
 
   it("inks with the versioned GPUI artifact in both appearances", () => {
@@ -72,7 +69,7 @@ describe("role tokens", () => {
       text: "foreground", muted: "muted_foreground", accent: "primary", "on-accent": "primary_foreground",
       ring: "primary", live: "live", attention: "attention", danger: "danger",
     };
-    for (const [mode, scheme] of [["light", light()], ["dark", osDark()], ["dark", stage()]] as const) {
+    for (const [mode, scheme] of [["light", light()], ["dark", pinnedDark()], ["dark", stage()]] as const) {
       for (const [role, key] of Object.entries(inks)) {
         expect(scheme[role], `${mode}.${role}`).toMatch(/^var\(--gpui-(light|dark)-[\w-]+\)$/);
         expect(hex(scheme[role]), `${mode}.${role}`).toBe(`#${DESIGN.colors[mode][key]}`);
@@ -82,11 +79,11 @@ describe("role tokens", () => {
     // Light keeps the artifact's paper grounds; dark reaches for the ocean.
     expect(hex(light().bg)).toBe(`#${DESIGN.colors.light.background}`);
     expect(hex(light().panel)).toBe(`#${DESIGN.colors.light.surface}`);
-    for (const role of GROUNDS) expect(osDark()[role], role).toMatch(/^var\(--ocean-[\w-]+\)$/);
+    for (const role of GROUNDS) expect(pinnedDark()[role], role).toMatch(/^var\(--ocean-[\w-]+\)$/);
   });
 
   it("keeps every text ink at WCAG AA on every ground, in every scheme", () => {
-    for (const [name, scheme] of [["light", light()], ["dark", osDark()], ["stage", stage()]] as const) {
+    for (const [name, scheme] of [["light", light()], ["dark", pinnedDark()], ["stage", stage()]] as const) {
       for (const ground of GROUNDS) {
         for (const ink of TEXT_INKS) {
           expect(contrast(hex(scheme[ink]), hex(scheme[ground])), `${name}: ${ink} on ${ground}`).toBeGreaterThanOrEqual(4.5);
@@ -109,13 +106,35 @@ describe("role tokens", () => {
     expect(hex("var(--brand-light)")).toBe("#1e8fd8");
   });
 
-  it("keeps footer text readable on the sea below its waterline", () => {
-    const sea = CSS.match(/--sea:\s*linear-gradient\(([^;]+)\);/)?.[1] ?? "";
-    const stops = [...sea.matchAll(/#[0-9a-f]{6}/gi)].map((m) => m[0].toLowerCase());
-    // The first stop is the bright waterline; content starts below it.
-    for (const stop of stops.slice(1)) {
-      expect(contrast(hex(stage().muted), stop), `muted on ${stop}`).toBeGreaterThanOrEqual(4.5);
+  function stops(token: string): string[] {
+    const ramp = CSS.match(new RegExp(`--${token}:\\s*linear-gradient\\(([^;]+)\\);`))?.[1] ?? "";
+    return [...ramp.matchAll(/#[0-9a-f]{6}|var\(--[\w-]+\)/gi)].map((m) => hex(m[0]));
+  }
+
+  it("keeps sea text readable on every stop of the sea ramps", () => {
+    for (const token of ["sea", "sea-band"]) {
+      const ramp = stops(token);
+      expect(ramp.length, token).toBeGreaterThanOrEqual(3);
+      for (const stop of ramp) {
+        expect(contrast(hex(stage().muted), stop), `${token}: muted on ${stop}`).toBeGreaterThanOrEqual(4.5);
+        expect(contrast(hex(stage().text), stop), `${token}: text on ${stop}`).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+  });
+
+  it("keeps stage text readable over the deep tide stops", () => {
+    // The tide runs paper -> aqua -> logo light -> logo deep -> mid -> navy.
+    // Only its deep stops can carry stage text; the pale stops cannot.
+    const ramp = stops("tide");
+    const deep = ramp.indexOf(hex("var(--brand-deep)"));
+    const mid = ramp.indexOf(hex("var(--sea-mid)"));
+    expect(deep).toBeGreaterThan(0);
+    expect(mid).toBeGreaterThan(deep);
+    for (const stop of ramp.slice(deep)) {
       expect(contrast(hex(stage().text), stop), `text on ${stop}`).toBeGreaterThanOrEqual(4.5);
+    }
+    for (const stop of ramp.slice(mid)) {
+      expect(contrast(hex(stage().muted), stop), `muted on ${stop}`).toBeGreaterThanOrEqual(4.5);
     }
   });
 });

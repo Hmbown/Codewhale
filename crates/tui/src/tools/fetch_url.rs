@@ -208,7 +208,7 @@ impl ToolSpec for FetchUrlTool {
                         &fetched.bytes,
                         is_success,
                         body_text.as_deref(),
-                        PdfTextCommand::system(context.cancel_token.as_ref()),
+                        PdfTextCommand::system(Some(context)),
                     )
                     .await?;
                     Ok((extracted, fields))
@@ -292,7 +292,7 @@ async fn extract_fetched_document(
     is_success: bool,
     decoded_body: Option<&str>,
     pdf_command: PdfTextCommand<'_>,
-) -> Result<ExtractedDocument, ToolError> {
+) -> super::web::adapter::AdapterResult<ExtractedDocument> {
     let extraction = if format == Format::Raw
         && super::web::extract::validate_pdf_response(url, Some(content_type), bytes)?
     {
@@ -316,8 +316,10 @@ async fn extract_fetched_document(
     };
     match extraction {
         Ok(document) => Ok(document),
-        Err(_error)
-            if (format == Format::Raw || !is_success) && is_declared_textual(content_type) =>
+        Err(error)
+            if error.content()
+                && (format == Format::Raw || !is_success)
+                && is_declared_textual(content_type) =>
         {
             let body_text = match decoded_body {
                 Some(body_text) => body_text.to_string(),
@@ -479,6 +481,14 @@ fn artifact_metadata(write: ArtifactWrite) -> Value {
         "artifact_relative_path": crate::artifacts::format_artifact_relative_path(&write.relative_path),
         "artifact_byte_size": write.byte_size,
         "artifact_preview": write.preview,
+        // Every artifact this tool writes is retrievable evidence, so flag it
+        // for the engine's `activate_result_dependencies` (same contract as
+        // the shell-truncation spillover): the next turn auto-activates
+        // `retrieve_tool_result`. Text overflows name that tool in their
+        // footer; binary PDF/media saves name only the saved-artifact path in
+        // their inline pointer, so this flag is what makes that pointer
+        // actionable rather than a dead end.
+        "evidence_available": true,
     })
 }
 
@@ -550,6 +560,52 @@ mod tests {
 
     fn ctx() -> ToolContext {
         ToolContext::new(PathBuf::from("."))
+    }
+
+    /// `fetch_url` can disclose local data through a URL or query, so it always
+    /// asks: the tool declares `Required`, and the default-ask policy resolves
+    /// that to a prompt rather than running it.
+    #[test]
+    fn fetch_url_always_requires_approval() {
+        use crate::tools::spec::{ApprovalRequirement, ToolSpec};
+        assert_eq!(
+            FetchUrlTool.approval_requirement(),
+            ApprovalRequirement::Required
+        );
+        assert!(
+            FetchUrlTool
+                .capabilities()
+                .contains(&ToolCapability::Network)
+        );
+
+        // Under the default Ask posture that requirement resolves to a prompt,
+        // and only full access (or an explicit bypass) lets it through.
+        use crate::core::authority::{ToolPermission, TurnAuthority, resolve_tool_permission};
+        use codewhale_config::AppMode;
+        use codewhale_execpolicy::ApprovalMode;
+        let requirement = FetchUrlTool.approval_requirement();
+        let ask = TurnAuthority::from_effective_fields(
+            AppMode::Agent,
+            true,
+            false,
+            false,
+            ApprovalMode::Suggest,
+        );
+        assert_eq!(
+            resolve_tool_permission(&ask, requirement, false),
+            ToolPermission::Prompt
+        );
+        let never = TurnAuthority::from_effective_fields(
+            AppMode::Agent,
+            true,
+            false,
+            false,
+            ApprovalMode::Never,
+        );
+        assert_eq!(
+            resolve_tool_permission(&never, requirement, false),
+            ToolPermission::Deny
+        );
     }
 
     #[test]
@@ -627,8 +683,17 @@ mod tests {
         assert!(inline.contains("retrieve_tool_result"));
         assert!(inline.chars().count() <= inline_char_budget(&context));
         assert_eq!(
-            std::fs::read_to_string(artifact.absolute_path).unwrap(),
+            std::fs::read_to_string(&artifact.absolute_path).unwrap(),
             full
+        );
+        // The footer names `retrieve_tool_result` as the recovery path; the
+        // evidence flag is what makes the engine auto-activate that tool on
+        // the next turn, so the named tool is actually present.
+        let metadata = artifact_metadata(artifact);
+        assert_eq!(
+            metadata.get("evidence_available"),
+            Some(&json!(true)),
+            "artifact metadata must flag retrievable evidence:\n{metadata}"
         );
     }
 

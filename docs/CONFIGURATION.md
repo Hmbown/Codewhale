@@ -137,15 +137,15 @@ Each repo can carry two distinct, complementary files:
   additionally **mechanically enforced** in the tool gate. See
   [Enforced repo-law invariants](#enforced-repo-law-invariants) below.
 
-  This is the **repo-local law** layer in Codewhale's hierarchy: *bundled global
-  Constitution* → *user-global constitution* (`$CODEWHALE_HOME/constitution.json`,
-  rendered as prose) → *repo constitution* (`.codewhale/constitution.json`, this
-  file) → *AGENTS/project instructions* → *memory and handoffs* → *current
-  request and live evidence for the active turn*. Runtime policy
-  (permissions/sandbox/cost limits enforced in code) is separate from all of
-  these prompt layers. The repo constitution gives project decision rules; it
-  does not replace the bundled Constitution, the user-global constitution, or
-  the current user request.
+  This is the **repo-local law** layer. When guidance conflicts, the
+  **Whose word wins** section of the effective base constitution owns the
+  ordering; the bundled source is
+  [`BASE_PROMPT`](../crates/tui/src/prompts/text.rs). Use `/constitution base`
+  to inspect the effective base, including any opted-in expert override.
+  The order in which these files are described or assembled is not an
+  authority ranking. Runtime policy (permissions, sandbox and cost limits
+  enforced in code) is separate from prompt guidance; editing a constitution
+  does not grant permissions.
 
 > **`WHALE.md` is deprecated.** It overlapped confusingly with `AGENTS.md`.
 > Codewhale no longer reads `WHALE.md` as project or global context. If one is
@@ -329,29 +329,50 @@ If a repo-local config declares `api_key`, `base_url`, `providers`, `provider`,
 `mcp_config_path`, `notes_path`, `hotbar`, `allow_shell = true`, or `instructions`,
 Codewhale ignores that key and keeps the user's global setting.
 
-The consolidated `codewhale` runtime uses one config file for DeepSeek auth
-and model defaults. `codewhale auth set --provider deepseek` saves
-the key to `~/.codewhale/config.toml` (migrating legacy `~/.deepseek/config.toml`
-on first launch when needed), and `codewhale --model deepseek-v4-flash` is
-forwarded to the TUI as `CODEWHALE_MODEL`. The dispatcher no longer writes the
-`DEEPSEEK_*` twins of these variables; a `DEEPSEEK_*` value you set yourself is
-still read as a legacy alias when the `CODEWHALE_*` one is unset.
+The consolidated `codewhale` runtime uses `~/.codewhale/config.toml` for
+provider and model settings. `codewhale auth set --provider deepseek` saves
+the key in the local secret store (a private file under `~/.codewhale/secrets/`
+by default; the OS keychain is an explicit option), rather than writing it
+into that config file. Legacy `~/.deepseek/config.toml` is migrated on first
+launch when needed. `codewhale --model deepseek-v4-flash` is forwarded to the
+TUI as `CODEWHALE_MODEL`. The dispatcher no longer writes `DEEPSEEK_*` twins;
+a value you set yourself remains a legacy alias when its `CODEWHALE_*`
+equivalent is unset.
 
-`codewhale login` signs in to the Codewhale account — it is the same browser
-device flow as `codewhale account login`, not a provider-key command. Provider
-credentials are configured exclusively through `codewhale auth set
---provider <provider>`.
+### Account provider keys
 
-That provider credential is distinct from the optional managed-product
-account. `codewhale account login` starts the Codewhale browser device flow;
-`codewhale account status` and `codewhale account logout` inspect or remove the
-session for the selected `--profile`. Account sessions prefer the OS
-credential manager and fall back automatically to the private `0600`
-Codewhale secrets file when no credential manager is available (headless
-hosts, SSH, containers).
-`codewhale account keys list|set|remove` manages the
-signed-in account's BYOK vault without displaying secret values. The older
-`codewhale cloud ...` spelling remains a command alias.
+A Codewhale account lets you **manage your provider API keys in one place**.
+[Register](https://app.codewhale.net/register) or [sign in](https://app.codewhale.net/login),
+then add, replace or remove keys in [Providers settings](https://app.codewhale.net/providers)
+or from the terminal:
+
+```bash
+codewhale login                         # browser sign-in; also: account login
+codewhale account keys set deepseek      # hidden prompt; add or replace a key
+codewhale account keys list              # configured status, never secret values
+codewhale --provider codewhale           # use the account's model route
+```
+
+Account keys stay on the service and are used for account-routed requests.
+Sign in on another device and choose Codewhale in `/provider` to use them
+without pasting keys again. `/models` lists models available to that account.
+Replacing a saved account key affects subsequent requests through this route;
+it does not change independent local copies or revoke keys at the provider.
+`codewhale account keys remove deepseek` removes the account's saved key.
+
+Login does **not** upload existing local keys. If you want to copy one, choose
+`codewhale account keys set deepseek --from-local` explicitly. Normal local
+provider setup remains `codewhale auth set --provider <provider>`; local keys
+and local models work without a Codewhale account. Signing in preserves an
+explicit or already configured local provider. Choose `--provider codewhale`
+when you want the account route instead.
+
+The account session is separate from provider keys. `codewhale account status`
+inspects it; `codewhale account logout` removes it for the selected `--profile`
+without removing your provider keys. Account sessions use the private `0600`
+Codewhale secrets file, scoped to the profile and account API origin; they do
+not use the OS keychain. The older `codewhale cloud ...` spelling remains an
+alias for account commands.
 
 ### Portable config bundles
 
@@ -411,9 +432,10 @@ For the active provider, the runtime resolves the API key in this exact order
 
 1. **Route-specific auth contract.** Routes whose `auth_mode` disables API
    keys stop here with no credential. OAuth routes use their explicitly
-   consented token: `openai-codex` reads `OPENAI_CODEX_ACCESS_TOKEN`, then
-   Codewhale-owned ChatGPT PKCE tokens from `codewhale auth chatgpt`, then the
-   consent-granted Codex CLI login (read-only, never refreshed or rewritten);
+   granted token: the official `openai-codex` plan route accepts only
+   Codewhale-owned credentials from `codewhale auth chatgpt`, bound to its
+   issued registration and verified account. Imported Codex CLI and process
+   tokens cannot authorize this route;
    `[providers.xai] auth_mode = "oauth"` reads Codewhale's own xAI
    device-login store (or a consent-granted Grok CLI file).
 2. **Explicit CLI key.** `--api-key` forwarded with its source marker wins
@@ -467,7 +489,7 @@ Anthropic providers, set `provider = "<id>"` or pass
 For the provider-by-provider registry, including wire protocol, auth variables,
 default base URLs, model IDs, and capability metadata, see
 [PROVIDERS.md](PROVIDERS.md).
-The facade saves provider credentials to the shared user config and forwards
+The facade saves provider credentials in the local secret store and forwards
 the resolved key, base URL, provider, and model to the TUI process. Use
 `codewhale auth set --provider nvidia-nim --api-key "YOUR_NVIDIA_API_KEY"` or
 `codewhale auth set --provider openai --api-key "YOUR_OPENAI_COMPATIBLE_API_KEY"` or
@@ -724,7 +746,8 @@ A classifier call happens only when `[auto.router]` names both `provider` and
 `ModelInventory::from_config` (`crates/tui/src/model_inventory.rs`). If either
 condition fails, or the classifier call errors or times out, the local
 fallback decides: the default model, or the fast sibling under `cost_saving`.
-The turn's route receipt (`/status` → Auto) records which path was taken, and a
+The turn's route receipt (Turn Inspector, Ctrl+Alt+O or `/turn inspect`, "Model
+route + tokens/cost") records which path was taken, and a
 router you configured that cannot run or fails (missing key, HTTP error,
 timeout, invalid answer) is shown as `Auto router: failing — …` rather than
 silently ignored.
@@ -1042,8 +1065,10 @@ rung:
 4. `static Kimi Code safe floor` — 262,144 tokens for Kimi Code memberships,
    because 1M access is plan-gated (Allegretto and above).
 5. `catalog` — the bundled route catalog (hand-curated offerings first, then
-   the bundled Models.dev rows). For `openai-codex`, a fresh (under 24 hours)
-   `$CODEX_HOME` model roster corrects this rung.
+   the bundled Models.dev rows). The official `openai-codex` roster supplies
+   account-specific model choices, not context-window metadata. Refresh it
+   with `codewhale models --update --provider openai-codex`; Codewhale does
+   not read `$CODEX_HOME` for this route.
 6. `model-name hint` — an `_Nk` suffix parsed from the model name itself
    (`qwen3-32b-256k` → 256,000), vendor-agnostic. A naming convention the
    serving engine may not honor is not a fact about the route, so this rung
@@ -1067,11 +1092,11 @@ window is a hard override and renders as `configured` (or
 `configured (per-model)`) with no marker.
 
 Output ceilings follow the same rule (#5440): an Anthropic-family model the
-catalog does not describe keeps the 64K Messages floor as its clamp, and the
-ChatGPT/Codex OAuth route keeps its long-standing 4K policy, but receipts and
-pickers label those numbers `unverified` (or an "assumed floor") instead of
-`documented`. Clamping to a defensible floor is a product choice; presenting
-it as a documented fact is not.
+catalog does not describe keeps the 64K Messages floor as its clamp, labeled
+`unverified` (or an "assumed floor") instead of `documented`. The official
+ChatGPT plan preview does not accept `max_output_tokens`; Codewhale sends no
+output-token cap on that route. A local request budget is not an upstream
+limit or a guarantee about the completed response length.
 
 There is no environment variable for the context window; the provider-table
 `context_window` and per-model `model_context_windows` keys are the user
@@ -1346,10 +1371,11 @@ Remaining variables:
 - `QIANFAN_API_KEY` or `BAIDU_QIANFAN_API_KEY`
 - `QIANFAN_BASE_URL` or `BAIDU_QIANFAN_BASE_URL`
 - `QIANFAN_MODEL` or `BAIDU_QIANFAN_MODEL`
-- `OPENAI_CODEX_ACCESS_TOKEN` or `CODEX_ACCESS_TOKEN`
+- `OPENAI_CODEX_ACCESS_TOKEN` or `CODEX_ACCESS_TOKEN` (legacy process tokens; ignored by the official ChatGPT plan route)
 - `OPENAI_CODEX_BASE_URL` or `CODEX_BASE_URL`
 - `OPENAI_CODEX_MODEL` or `CODEX_MODEL`
-- `OPENAI_CODEX_ACCOUNT_ID` or `CODEX_ACCOUNT_ID`
+- `OPENAI_CODEX_ACCOUNT_ID` or `CODEX_ACCOUNT_ID` (legacy identity hints; ignored by the official ChatGPT plan route)
+- `CODEWHALE_CHATGPT_NEW_ACCOUNT=1` explicitly replaces the single selected ChatGPT registration after a validated browser sign-in
 - `ANTHROPIC_API_KEY`
 - `ANTHROPIC_BASE_URL`
 - `ANTHROPIC_MODEL`
@@ -2095,12 +2121,12 @@ reasoning contract, and all four membership ids omit generic sampling fields.
 
 ### Core keys (used by the TUI/engine)
 
-- `provider` (string, optional): `deepseek` (default), `deepseek-anthropic`, `nvidia-nim`, `openai`, `atlascloud`, `wanjie-ark`, `volcengine`, `openrouter`, `xiaomi-mimo`, `novita`, `fireworks`, `siliconflow`, `arcee`, `siliconflow-CN`, `moonshot`, `sglang`, `vllm`, `ollama`, `ollama-cloud`, `huggingface`, `modelscope`, `together`, `qianfan`, `openai-codex`, `anthropic`, `openmodel`, `zai`, `stepfun`, `minimax`, `deepinfra`, `sakana`, `longcat`, `opencode-go`, `meta`, `mistral`, `telecomjs`, `xai`, `orcarouter`, `modelstudio-token-plan`, `google`, `edenai`, or `custom`. Legacy `deepseek-cn` configs are still accepted as an alias for `deepseek`; DeepSeek uses the same official host [`https://api.deepseek.com`](https://api-docs.deepseek.com/) worldwide. `deepseek-anthropic` targets DeepSeek's Anthropic Messages-compatible endpoint at `https://api.deepseek.com/anthropic` using `DEEPSEEK_API_KEY`; `nvidia-nim` targets NVIDIA's NIM-hosted DeepSeek endpoints through `https://integrate.api.nvidia.com/v1`; `openai` targets a generic OpenAI-compatible endpoint, defaulting to `https://api.openai.com/v1`; `atlascloud` targets AtlasCloud's OpenAI-compatible endpoint at `https://api.atlascloud.ai/v1`; `wanjie-ark` targets Wanjie Ark's OpenAI-compatible endpoint at `https://maas-openapi.wanjiedata.com/api/v1`; `volcengine` targets Volcengine Ark's OpenAI-compatible coding endpoint at `https://ark.cn-beijing.volces.com/api/coding/v3`; `openrouter` targets `https://openrouter.ai/api/v1`; `xiaomi-mimo` targets Xiaomi MiMo's OpenAI-compatible endpoint, using `https://token-plan-sgp.xiaomimimo.com/v1` by default for Token Plan keys (`tp-...`) and `https://api.xiaomimimo.com/v1` for pay-as-you-go keys. For Token Plan accounts outside the Singapore default, set `base_url` explicitly or use `mode = "token-plan-cn"` for China and `mode = "token-plan-ams"` for Europe/Amsterdam; `novita` targets `https://api.novita.ai/openai/v1`; `fireworks` targets `https://api.fireworks.ai/inference/v1`; `siliconflow` targets SiliconFlow, defaulting to `https://api.siliconflow.com/v1`; `arcee` targets Arcee AI's OpenAI-compatible endpoint at `https://api.arcee.ai/api/v1`; `siliconflow-CN` targets the SiliconFlow China regional endpoint through `[providers.siliconflow_cn]`; `moonshot` targets Moonshot/Kimi, defaulting to `https://api.moonshot.ai/v1`; `sglang` targets a self-hosted OpenAI-compatible endpoint, defaulting to `http://localhost:30000/v1`; `vllm` targets a self-hosted vLLM OpenAI-compatible endpoint, defaulting to `http://localhost:8000/v1`; `ollama` targets Ollama's OpenAI-compatible endpoint, defaulting to `http://localhost:11434/v1`; `huggingface` targets Hugging Face Inference Providers at `https://router.huggingface.co/v1`; `modelscope` targets ModelScope's OpenAI-compatible inference API at `https://api-inference.modelscope.cn/v1`; `together` targets Together AI at `https://api.together.xyz/v1`; `qianfan` targets Baidu Qianfan at `https://api.baiduqianfan.ai/v1`; `openai-codex` targets ChatGPT/Codex OAuth; `anthropic` targets Claude's native Messages API; `openmodel` targets OpenModel's Anthropic-compatible Messages API at `https://api.openmodel.ai`; `zai` targets Z.ai at `https://api.z.ai/api/coding/paas/v4`; `stepfun` targets StepFun at `https://api.stepfun.ai/v1`; `minimax` targets MiniMax at `https://api.minimax.io/v1`; `deepinfra` targets DeepInfra at `https://api.deepinfra.com/v1/openai`; `sakana` targets Sakana AI Fugu at `https://api.sakana.ai/v1`; `longcat` targets Meituan LongCat at `https://api.longcat.chat/openai/v1`; `opencode-go` targets the subscription-backed OpenCode Go model-aware route (Chat Completions, Responses, or Messages according to the documented model) at `https://opencode.ai/zen/go/v1`; `meta` targets Meta Model API; `mistral` targets Mistral AI's OpenAI-compatible endpoint at `https://api.mistral.ai/v1`; `telecomjs` targets TelecomJS TokenHub at `https://aigw.telecomjs.com/v1`; and `xai` targets xAI's API-key or OAuth route.
+- `provider` (string, optional): `deepseek` (default), `deepseek-anthropic`, `nvidia-nim`, `openai`, `atlascloud`, `wanjie-ark`, `volcengine`, `openrouter`, `xiaomi-mimo`, `novita`, `fireworks`, `siliconflow`, `arcee`, `siliconflow-CN`, `moonshot`, `sglang`, `vllm`, `ollama`, `ollama-cloud`, `huggingface`, `modelscope`, `together`, `qianfan`, `openai-codex`, `anthropic`, `openmodel`, `zai`, `stepfun`, `minimax`, `deepinfra`, `sakana`, `longcat`, `opencode-go`, `meta`, `mistral`, `telecomjs`, `xai`, `orcarouter`, `modelstudio-token-plan`, `google`, `edenai`, or `custom`. Legacy `deepseek-cn` configs are still accepted as an alias for `deepseek`; DeepSeek uses the same official host [`https://api.deepseek.com`](https://api-docs.deepseek.com/) worldwide. `deepseek-anthropic` targets DeepSeek's Anthropic Messages-compatible endpoint at `https://api.deepseek.com/anthropic` using `DEEPSEEK_API_KEY`; `nvidia-nim` targets NVIDIA's NIM-hosted DeepSeek endpoints through `https://integrate.api.nvidia.com/v1`; `openai` targets a generic OpenAI-compatible endpoint, defaulting to `https://api.openai.com/v1`; `atlascloud` targets AtlasCloud's OpenAI-compatible endpoint at `https://api.atlascloud.ai/v1`; `wanjie-ark` targets Wanjie Ark's OpenAI-compatible endpoint at `https://maas-openapi.wanjiedata.com/api/v1`; `volcengine` targets Volcengine Ark's OpenAI-compatible coding endpoint at `https://ark.cn-beijing.volces.com/api/coding/v3`; `openrouter` targets `https://openrouter.ai/api/v1`; `xiaomi-mimo` targets Xiaomi MiMo's OpenAI-compatible endpoint, using `https://token-plan-sgp.xiaomimimo.com/v1` by default for Token Plan keys (`tp-...`) and `https://api.xiaomimimo.com/v1` for pay-as-you-go keys. For Token Plan accounts outside the Singapore default, set `base_url` explicitly or use `mode = "token-plan-cn"` for China and `mode = "token-plan-ams"` for Europe/Amsterdam; `novita` targets `https://api.novita.ai/openai/v1`; `fireworks` targets `https://api.fireworks.ai/inference/v1`; `siliconflow` targets SiliconFlow, defaulting to `https://api.siliconflow.com/v1`; `arcee` targets Arcee AI's OpenAI-compatible endpoint at `https://api.arcee.ai/api/v1`; `siliconflow-CN` targets the SiliconFlow China regional endpoint through `[providers.siliconflow_cn]`; `moonshot` targets Moonshot/Kimi, defaulting to `https://api.moonshot.ai/v1`; `sglang` targets a self-hosted OpenAI-compatible endpoint, defaulting to `http://localhost:30000/v1`; `vllm` targets a self-hosted vLLM OpenAI-compatible endpoint, defaulting to `http://localhost:8000/v1`; `ollama` targets Ollama's OpenAI-compatible endpoint, defaulting to `http://localhost:11434/v1`; `huggingface` targets Hugging Face Inference Providers at `https://router.huggingface.co/v1`; `modelscope` targets ModelScope's OpenAI-compatible inference API at `https://api-inference.modelscope.cn/v1`; `together` targets Together AI at `https://api.together.xyz/v1`; `qianfan` targets Baidu Qianfan at `https://api.baiduqianfan.ai/v1`; `openai-codex` targets official ChatGPT plan inference with Codewhale-owned OAuth at `https://api.openai.com/v1`; `anthropic` targets Claude's native Messages API; `openmodel` targets OpenModel's Anthropic-compatible Messages API at `https://api.openmodel.ai`; `zai` targets Z.ai at `https://api.z.ai/api/coding/paas/v4`; `stepfun` targets StepFun at `https://api.stepfun.ai/v1`; `minimax` targets MiniMax at `https://api.minimax.io/v1`; `deepinfra` targets DeepInfra at `https://api.deepinfra.com/v1/openai`; `sakana` targets Sakana AI Fugu at `https://api.sakana.ai/v1`; `longcat` targets Meituan LongCat at `https://api.longcat.chat/openai/v1`; `opencode-go` targets the subscription-backed OpenCode Go model-aware route (Chat Completions, Responses, or Messages according to the documented model) at `https://opencode.ai/zen/go/v1`; `meta` targets Meta Model API; `mistral` targets Mistral AI's OpenAI-compatible endpoint at `https://api.mistral.ai/v1`; `telecomjs` targets TelecomJS TokenHub at `https://aigw.telecomjs.com/v1`; and `xai` targets xAI's API-key or OAuth route.
 - `opencode-zen` (string provider value): selects the model-aware OpenCode Zen gateway through `[providers.opencode_zen]`. The default base URL is `https://opencode.ai/zen/v1`, the default model is `gpt-5.6`, and credentials come from `api_key`, `OPENCODE_ZEN_API_KEY`, or fallback `OPENCODE_API_KEY`—never ChatGPT/Codex OAuth. `OPENCODE_ZEN_BASE_URL` and `OPENCODE_ZEN_MODEL` are accepted. The selected model's wire comes from the curated Zen snapshot, then from the AI SDK package its Models.dev `opencode` row names (refresh with `codewhale models --update`): GPT, Grok, and Muse Spark use Responses; Claude and most Qwen rows use Anthropic Messages; DeepSeek, MiniMax, GLM, Kimi, `qwen3.8-max`, and the free rows use Chat Completions. Gemini, Models.dev rows marked `deprecated`, and models no loaded catalog lists fail closed because Codewhale has no proven supported wire contract for them. See the exact current model groups in [`PROVIDERS.md`](PROVIDERS.md#opencode-zen-protocol-catalog).
 - `minimax-anthropic` (string provider value): selects MiniMax's Anthropic-compatible Messages route through `[providers.minimax_anthropic]`. The default Base URL is `https://api.minimax.io/anthropic`; set `https://api.minimaxi.com/anthropic` for China. Keep the `/anthropic` suffix because Codewhale appends `/v1/messages`. The route uses `MINIMAX_API_KEY` and defaults to `MiniMax-M3`; `MiniMax-M2.7` is also registered. Official M3 input modalities are text, image, and video, with adaptive or disabled thinking. M2.7 is text-only and always keeps thinking enabled.
 - `api_key` (string, required for hosted providers): must be non-empty for DeepSeek/hosted providers (or set the provider API key env var). Self-hosted SGLang, vLLM, and local `ollama` can omit it. `ollama-cloud` requires a key saved for that provider or supplied by `OLLAMA_CLOUD_API_KEY`, then `OLLAMA_API_KEY`.
 - `auth_mode` (string, optional provider-table key): selects a provider-specific authentication contract. Kimi Code membership uses `auth_mode = "api_key"` (or omit the field), a key created in the [Kimi Code console](https://www.kimi.com/code/console), `base_url = "https://api.kimi.com/coding/v1"`, and bare `model = "k3"` for K3. Codewhale gives that route a safe 262,144-token baseline; set `context_window = 1048576` only when the Kimi Code plan includes 1M access (Allegretto and above). `k3[1m]` is a Claude Code-only convention, not an API model ID, and Codewhale rejects it instead of silently changing the wire model or assuming an entitlement. `model = "kimi-for-coding"` remains the valid K2.7 compatibility route available to all Kimi Code members. Legacy `auth_mode = "kimi_oauth"` fails closed with API-key guidance and never probes, reads, refreshes, or rewrites `kimi_cli`/`kimi_code_cli` credential files. First-class OAuth requires Codewhale's own vendor-registered client identity and remains tracked in #4417.
-- `base_url` (string, optional, `[providers.<name>]` key; see [Legacy top-level `base_url` and `api_key`](#legacy-top-level-base_url-and-api_key) for the older top-level spelling): defaults to `https://api.deepseek.com/beta` for DeepSeek's OpenAI-compatible Chat Completions API, including legacy `provider = "deepseek-cn"` configs. Other defaults are `https://api.deepseek.com/anthropic` for `deepseek-anthropic`, `https://integrate.api.nvidia.com/v1` for `nvidia-nim`, `https://api.openai.com/v1` for `openai`, `https://api.atlascloud.ai/v1` for `atlascloud`, `https://maas-openapi.wanjiedata.com/api/v1` for `wanjie-ark`, `https://ark.cn-beijing.volces.com/api/coding/v3` for `volcengine`, `https://openrouter.ai/api/v1` for `openrouter`, `https://token-plan-sgp.xiaomimimo.com/v1` for `xiaomi-mimo` when the API key starts with `tp-...` and `https://api.xiaomimimo.com/v1` otherwise, `https://api.novita.ai/openai/v1` for `novita`, `https://api.fireworks.ai/inference/v1` for `fireworks`, `https://api.siliconflow.com/v1` for `siliconflow`, `https://api.siliconflow.cn/v1` for `siliconflow-CN`, `https://api.arcee.ai/api/v1` for `arcee`, `https://api.moonshot.ai/v1` for `moonshot`, `https://api.minimax.io/v1` for `minimax`, `https://api.openmodel.ai` for `openmodel`, `https://api.z.ai/api/coding/paas/v4` for `zai`, `https://api.stepfun.ai/v1` for `stepfun`, `https://api.deepinfra.com/v1/openai` for `deepinfra`, `https://api.sakana.ai/v1` for `sakana`, `https://router.huggingface.co/v1` for `huggingface`, `https://api-inference.modelscope.cn/v1` for `modelscope`, `https://api.together.xyz/v1` for `together`, `https://api.baiduqianfan.ai/v1` for `qianfan`, `https://chatgpt.com/backend-api` for `openai-codex`, `https://api.anthropic.com` for `anthropic`, `https://api.mistral.ai/v1` for `mistral`, `http://localhost:30000/v1` for `sglang`, `http://localhost:8000/v1` for `vllm`, `http://localhost:11434/v1` for `ollama`, and `https://ollama.com/v1` for `ollama-cloud`. Set `base_url = "https://token-plan-cn.xiaomimimo.com/v1"` for China-region Xiaomi MiMo Token Plan accounts or `base_url = "https://token-plan-ams.xiaomimimo.com/v1"` for Europe/Amsterdam accounts. Mistral-specific reasoning fields and polymorphic replay are enabled only on the documented first-party HTTPS `/v1` hosts; a custom Mistral base URL keeps generic Chat semantics. Set `https://api.deepseek.com` or `https://api.deepseek.com/v1` explicitly to opt out of DeepSeek beta features.
+- `base_url` (string, optional, `[providers.<name>]` key; see [Legacy top-level `base_url` and `api_key`](#legacy-top-level-base_url-and-api_key) for the older top-level spelling): defaults to `https://api.deepseek.com/beta` for DeepSeek's OpenAI-compatible Chat Completions API, including legacy `provider = "deepseek-cn"` configs. Other defaults are `https://api.deepseek.com/anthropic` for `deepseek-anthropic`, `https://integrate.api.nvidia.com/v1` for `nvidia-nim`, `https://api.openai.com/v1` for `openai`, `https://api.atlascloud.ai/v1` for `atlascloud`, `https://maas-openapi.wanjiedata.com/api/v1` for `wanjie-ark`, `https://ark.cn-beijing.volces.com/api/coding/v3` for `volcengine`, `https://openrouter.ai/api/v1` for `openrouter`, `https://token-plan-sgp.xiaomimimo.com/v1` for `xiaomi-mimo` when the API key starts with `tp-...` and `https://api.xiaomimimo.com/v1` otherwise, `https://api.novita.ai/openai/v1` for `novita`, `https://api.fireworks.ai/inference/v1` for `fireworks`, `https://api.siliconflow.com/v1` for `siliconflow`, `https://api.siliconflow.cn/v1` for `siliconflow-CN`, `https://api.arcee.ai/api/v1` for `arcee`, `https://api.moonshot.ai/v1` for `moonshot`, `https://api.minimax.io/v1` for `minimax`, `https://api.openmodel.ai` for `openmodel`, `https://api.z.ai/api/coding/paas/v4` for `zai`, `https://api.stepfun.ai/v1` for `stepfun`, `https://api.deepinfra.com/v1/openai` for `deepinfra`, `https://api.sakana.ai/v1` for `sakana`, `https://router.huggingface.co/v1` for `huggingface`, `https://api-inference.modelscope.cn/v1` for `modelscope`, `https://api.together.xyz/v1` for `together`, `https://api.baiduqianfan.ai/v1` for `qianfan`, `https://api.openai.com/v1` for `openai-codex`, `https://api.anthropic.com` for `anthropic`, `https://api.mistral.ai/v1` for `mistral`, `http://localhost:30000/v1` for `sglang`, `http://localhost:8000/v1` for `vllm`, `http://localhost:11434/v1` for `ollama`, and `https://ollama.com/v1` for `ollama-cloud`. Set `base_url = "https://token-plan-cn.xiaomimimo.com/v1"` for China-region Xiaomi MiMo Token Plan accounts or `base_url = "https://token-plan-ams.xiaomimimo.com/v1"` for Europe/Amsterdam accounts. Mistral-specific reasoning fields and polymorphic replay are enabled only on the documented first-party HTTPS `/v1` hosts; a custom Mistral base URL keeps generic Chat semantics. Set `https://api.deepseek.com` or `https://api.deepseek.com/v1` explicitly to opt out of DeepSeek beta features.
 - `ollama-cloud` route: select `provider = "ollama-cloud"`, configure `[providers.ollama_cloud]` when overriding the default `https://ollama.com/v1` / `gpt-oss:120b` tuple, and save a key from [Ollama account settings](https://ollama.com/settings/keys) with `codewhale auth set --provider ollama-cloud`. Ambient precedence is `OLLAMA_CLOUD_API_KEY`, then `OLLAMA_API_KEY`; arbitrary Ollama model IDs pass through unchanged.
 - Legacy Ollama Cloud migration: a released `provider = "ollama"` config whose normalized `[providers.ollama].base_url` is exactly `https://ollama.com/v1` is upgraded to the `ollama-cloud` runtime identity in memory. Only that exact tuple may read its old `ollama` provider table and secret slot. The config and secrets are never rewritten, and neighboring paths, HTTP downgrades, lookalike hosts, or an explicit `ollama-cloud` selection never consume the fallback.
 - `telecomjs` base URL and catalog: `[providers.telecomjs]` defaults to `https://aigw.telecomjs.com/v1`; `TELECOMJS_BASE_URL` overrides it. With `TELECOMJS_API_KEY`, `/models` refreshes a key-scoped catalog without mixing rows into another provider.
@@ -2163,6 +2189,7 @@ reasoning contract, and all four membership ids omit generic sampling fields.
 - `[approval] default_selection` (string, optional): which option an approval
   card highlights when it first appears — `deny` (default) or `allow_once`.
   `deny` means a reflexive Enter on a card you have not read refuses the call.
+  The highlighted row is tagged `(Enter)`; press `y` to allow once.
   Set `allow_once` to restore the pre-v0.9.6 Enter-to-approve muscle memory
   (#5293). It moves the highlight only: which calls are prompted for is still
   `approval_policy` plus the rules in `permissions.toml`.
@@ -2185,9 +2212,9 @@ reasoning contract, and all four membership ids omit generic sampling fields.
   ```
 - `sandbox_mode` (string, optional): `read-only`, `workspace-write`, `danger-full-access`, `external-sandbox`.
   Platform support is not identical. macOS uses Seatbelt when its runtime
-  probe succeeds. Linux uses bubblewrap only when `prefer_bwrap = true` and
-  `/usr/bin/bwrap` is executable; without that opt-in it reports no OS command
-  sandbox. Windows does not currently advertise an OS sandbox; its planned helper contract starts
+  probe succeeds. Linux uses bubblewrap by default whenever `/usr/bin/bwrap`
+  is installed and a probe proves it can confine a child; `prefer_bwrap =
+  false` opts out and reports no OS command sandbox. Windows does not currently advertise an OS sandbox; its planned helper contract starts
   with process-tree containment only and must not be described as read-only
   filesystem isolation, workspace-write enforcement, network blocking,
   registry isolation, or AppContainer isolation until those are implemented.
@@ -2620,7 +2647,7 @@ reasoning contract, and all four membership ids omit generic sampling fields.
 
 - `tui.stream_chunk_timeout_secs` (int, optional, default `900`): per-SSE-chunk idle timeout for streamed model responses. Slow local or compatible servers can raise this with `/config stream_chunk_timeout_secs <seconds>` (add `--save` to write canonical `stream.chunk_timeout_secs`); `0` maps to the default and explicit values must be `1..=3600`. The legacy `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` env var is still honored when this key is omitted.
 - `tui.osc8_links` (bool, optional, default on for macOS/Linux, off for Windows): emit OSC 8 escape sequences around URLs in transcript output so supporting terminals (iTerm2, Terminal.app 13+, Ghostty, Kitty, WezTerm, Alacritty, recent gnome-terminal/konsole) can open them with the terminal's link gesture—usually Cmd-click on macOS and Ctrl-click on Linux/Windows. Terminals without OSC 8 support render the plain label and ignore the escape. The escapes are emitted out-of-band (not inside buffer cells), so column corruption is not a concern; set `false` only for terminals that misrender the OSC 8 terminator itself. Windows legacy consoles default off; opt in with `true`.
-- `tui.max_model_steps` (int, optional, default uncapped): optional model-step ceiling for one ordinary turn. Omission or `0` leaves model steps uncapped; explicit positive values are clamped to `1..=100000`. Headless `exec` and Fleet workers also have no implicit model-step ceiling; `exec --max-turns N` and positive worker budgets still apply. At ~80% of an explicit step budget the model gets one soft-landing notice; at exhaustion the turn ends `Failed` with `Maximum model steps reached before completion (limit: N)` after one bounded final-report response when needed. Cumulative wall-clock and per-stream limits remain independent. Active interactive goal turns use `goal.max_steps` instead (default `1000`); see the Goal loop section below.
+- `tui.max_model_steps` (int, optional, default uncapped): optional model-step ceiling for one ordinary turn. Omission or `0` leaves model steps uncapped; explicit positive values are clamped to `1..=100000`. Headless `exec` and Fleet workers also have no implicit model-step ceiling; `exec --max-turns N` and positive worker budgets still apply. At ~80% of an explicit step budget the model gets one soft-landing notice; at exhaustion the turn ends `Failed` with `Maximum model steps reached before completion (limit: N)` after one bounded final-report response when needed. Cumulative wall-clock and per-stream limits remain independent. Active interactive goal turns use `goal.max_steps` instead (also uncapped by default); see the Goal loop section below.
 - `tui.turn_wall_clock_secs` (int, optional, default: no limit): cumulative per-turn wall-clock budget in seconds, measured across every model step of one turn (not per request). Time blocked on a human approval is excluded. Omitted or `0` means no limit; positive values clamp to `30..=86400` (24 hours is the ceiling). When exhausted the turn stops before authorizing another billable request with a message naming the limit and the key to raise.
 - `tui.stream_max_resumes` (int, optional, default `3`): how many times one turn re-issues a model request after its stream failed — the request never opened (connect failure or response-header stall), the stream died before any content, the host slept mid-stream, or the network dropped mid-stream. Every one of those paths spends this one budget, and a healthy stream resets it. `0` disables turn-level re-issues (a failed stream then fails the turn); values clamp to `0..=10`.
 - `tui.stream_max_transparent_retries` (int, optional, default `2`): in-stream re-requests while nothing has streamed yet. `0` disables them; values clamp to `0..=10`.
@@ -2748,12 +2775,10 @@ max_continuations = 100
 # provider turn open. Default: 0 (continue immediately).
 continuation_delay_seconds = 300
 
-# Per-turn step allowance while a goal is active (#5994). Goal turns get a
-# larger but still finite budget than an ordinary interactive turn.
-# Default: 1000 (0 or absent resolves to 1000, never unlimited). Range:
-# 1..=100,000. This bounds each provider turn, never the number of
-# continuation passes.
-max_steps = 1000
+# Optional per-turn model-step ceiling while a goal is active (#6512).
+# Default: uncapped (0 or absent). Positive values clamp to 1..=100,000.
+# This bounds each provider turn, never the number of continuation passes.
+max_steps = 0
 ```
 
 The effective delay is capped at 86,400 seconds (24 hours); use an automation
@@ -2763,11 +2788,11 @@ When an explicit backstop fires, the goal pauses with a status message naming
 `[goal] max_continuations` and a warning is logged; resume the goal after
 inspecting progress, or raise/disable the backstop.
 
-`[goal] max_steps` governs one engine turn at a time: the ordinary interactive
-turn has no implicit model-step ceiling. Explicit per-invocation
+`[goal] max_steps` governs one engine turn at a time. Like ordinary interactive
+turns, omitted or `0` leaves model steps uncapped. Explicit per-invocation
 ceilings — `exec --max-turns N`, child-worker caps — always win over it. At
-about 80% of the selected budget the model is told to land; at exhaustion it
-gets one bounded final report and the turn classifies as budget-exhausted. An
+about 80% of an explicit positive budget the model is told to land; at exhaustion
+it gets one bounded final report and the turn classifies as budget-exhausted. An
 unfinished goal then pauses with the BudgetLimit reason instead of re-arming
 another goal turn — resume it explicitly after reviewing the report. Wall-clock
 and stream protections are separate and still apply.
@@ -2955,7 +2980,7 @@ Script Editor icon and owns the System Settings → Notifications entry
 (alert style, previews, Do Not Disturb). `display notification` has no
 icon parameter, so this cannot be fixed from the notification code; it
 needs Codewhale to ship a real `.app` bundle. Tracked in
-[#4834](https://github.com/Hmbown/CodeWhale/issues/4834). In the meantime,
+[#4834](https://github.com/codewhale-hq/CodeWhale/issues/4834). In the meantime,
 iTerm2, WezTerm, Ghostty, and kitty are matched first and use their own
 notification protocols, and `method = "osc9"` / `"bel"` / `"off"` opt out
 of the `osascript` path explicitly.
@@ -3208,9 +3233,11 @@ request and nested calls go through the same permission gate as direct calls
 `code_mode = false` to defer it behind `tool_search` again.
 
 `extension_host` is experimental and off by default. Turning it on lets reviewed
-plugins run their `native` TypeScript/JavaScript tool code in a Node sidecar;
-toggling it in either direction changes the plugin activation policy, so every
-plugin is reviewed again after a restart. See
+plugins run their `native` TypeScript/JavaScript tool and slash-command code in
+a separate Node (or, opt-in, Bun) process; toggling it in either direction
+changes the plugin activation policy, so every plugin is reviewed again after a
+restart. Its `[extension_host]` table (`runtime`, `node`, `bun`) and what the
+host's sandbox does on each platform are in
 [Writing an extension tool](EXTENSIONS.md).
 
 Every flag has a row in [`docs/features.toml`](features.toml), the feature

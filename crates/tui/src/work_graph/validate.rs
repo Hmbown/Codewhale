@@ -315,7 +315,7 @@ fn check_structural(snapshot: &WorkGraphSnapshot, out: &mut Vec<Violation>) {
             }
         } else {
             let api_provider = provider_kind.expect("provenance bounded above");
-            if api_provider != crate::config::ApiProvider::Custom
+            if api_provider != crate::config::ProviderKind::Custom
                 && provider != api_provider.as_str()
             {
                 out.push(Violation {
@@ -326,7 +326,9 @@ fn check_structural(snapshot: &WorkGraphSnapshot, out: &mut Vec<Violation>) {
                 continue;
             }
             let constrained = match api_provider {
-                crate::config::ApiProvider::Custom => Some(super::ReasoningEffortTier::Unavailable),
+                crate::config::ProviderKind::Custom => {
+                    Some(super::ReasoningEffortTier::Unavailable)
+                }
                 api_provider => super::model::constrained_effective_reasoning_for_route(
                     *requested,
                     api_provider,

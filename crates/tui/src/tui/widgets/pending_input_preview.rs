@@ -11,19 +11,17 @@
 //! Wired into `ui.rs::render` between the chat area and the composer; the user
 //! can see when typed input has been captured for later delivery.
 
+use codewhale_ratatui::{
+    Paint, PendingCard, PendingCardContext, PendingCardStyles, PendingCardWords,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
 
 use crate::tui::menu_style;
 use crate::tui::widgets::Renderable;
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
-
-/// Per-item line cap before we collapse the rest into a `…` overflow row.
-const PREVIEW_LINE_LIMIT: usize = 3;
 
 /// Description of the keybinding the hint line at the bottom should advertise
 /// for the "edit last queued message" action.
@@ -76,158 +74,65 @@ impl PendingInputPreview {
         }
     }
 
-    fn has_pending_inputs(&self) -> bool {
-        !self.pending_steers.is_empty()
-            || !self.queued_messages.is_empty()
-            || self.editing_queued_message.is_some()
-    }
-
-    fn is_queued_only(&self) -> bool {
-        self.context_items.is_empty()
-            && self.pending_steers.is_empty()
-            && self.editing_queued_message.is_none()
-            && !self.queued_messages.is_empty()
-    }
-
-    /// Build the (possibly empty) ordered line list this widget would render
-    /// at `width`. Pulled out so `desired_height` can ask the same renderer
-    /// without duplicating wrapping logic.
-    fn lines(&self, width: u16) -> Vec<Line<'static>> {
-        if width < 4 {
-            return Vec::new();
-        }
-        // A child agent waiting on the person outranks queued input: it is
-        // work that has stopped until someone answers.
-        let mut lines: Vec<Line<'static>> = self
-            .pending_approvals
+    fn kit(&self) -> PendingCard<'_> {
+        let mut card = PendingCard::new(PendingCardWords {
+            context_header: tr(self.locale, MessageId::PendingContextHeader),
+            inputs_header: tr(self.locale, MessageId::PendingInputsHeader),
+            sending_prefix: tr(self.locale, MessageId::PendingSendingIntoTurnPrefix),
+            editing_prefix: tr(self.locale, MessageId::PendingEditingFollowUpPrefix),
+            editing_restore: tr(self.locale, MessageId::PendingEscRestore),
+            queued_prefix: tr(self.locale, MessageId::PendingQueuedFollowUpPrefix),
+            queued_one_prefix: tr(self.locale, MessageId::PendingQueuedOnePrefix),
+            queued_many_prefix: tr(self.locale, MessageId::PendingQueuedManyPrefix),
+            queued_controls: tr(self.locale, MessageId::PendingSendNowControls)
+                .replace("{key}", self.edit_binding.label)
+                .into(),
+            compact_controls: tr(self.locale, MessageId::PendingSendNowDropControls)
+                .replace("{key}", self.edit_binding.label)
+                .into(),
+            // These are the existing context suffixes; their copy has not
+            // acquired new localization authority in this rendering slice.
+            removable: "removable".into(),
+            selected_remove: "Backspace/Delete removes".into(),
+        });
+        card.context = self
+            .context_items
             .iter()
-            .map(|row| {
-                Line::from(Span::styled(
-                    codewhale_localization::truncate_to_width(row, usize::from(width)),
-                    Style::default().fg(palette::STATUS_WARNING),
-                ))
+            .map(|item| PendingCardContext {
+                kind: item.kind.as_str().into(),
+                label: item.label.as_str().into(),
+                detail: item.detail.as_deref().map(Into::into),
+                included: item.included,
+                removable: item.removable,
+                selected: item.selected,
             })
             .collect();
-        lines.extend(self.input_lines(width));
-        lines
-    }
-
-    fn input_lines(&self, width: u16) -> Vec<Line<'static>> {
-        if self.context_items.is_empty() && !self.has_pending_inputs() {
-            return Vec::new();
-        }
-
-        let dim = Style::default()
-            .fg(palette::TEXT_DIM)
-            .add_modifier(Modifier::DIM);
-        let dim_italic = dim.add_modifier(Modifier::ITALIC);
-
-        let mut lines: Vec<Line<'static>> = Vec::new();
-
-        // The common queued-only state must remain actionable at the release
-        // floor. A compact summary avoids spending scarce rows on a section
-        // heading and two separate command choruses.
-        if self.is_queued_only() {
-            let count = self.queued_messages.len();
-            let prefix = if count == 1 {
-                tr(self.locale, MessageId::PendingQueuedOnePrefix).into_owned()
-            } else {
-                tr(self.locale, MessageId::PendingQueuedManyPrefix)
-                    .replace("{count}", &count.to_string())
-            };
-            let next = self.queued_messages[0].replace('\n', " ");
-            let summary = codewhale_localization::truncate_to_width(
-                &format!("{prefix}{next}"),
-                usize::from(width),
-            );
-            let controls = codewhale_localization::truncate_to_width(
-                &tr(self.locale, MessageId::PendingSendNowDropControls)
-                    .replace("{key}", self.edit_binding.label),
-                usize::from(width),
-            );
-            lines.push(Line::from(Span::styled(summary, dim_italic)));
-            lines.push(Line::from(Span::styled(controls, dim)));
-            return lines;
-        }
-
-        if !self.context_items.is_empty() {
-            push_section_header(
-                &mut lines,
-                Line::from(vec![
-                    Span::raw("• "),
-                    Span::raw(tr(self.locale, MessageId::PendingContextHeader).into_owned()),
-                ]),
-            );
-            for item in &self.context_items {
-                push_context_item(&mut lines, item, width);
-            }
-        }
-
-        if self.has_pending_inputs() {
-            if !lines.is_empty() {
-                lines.push(Line::from(""));
-            }
-            push_section_header(
-                &mut lines,
-                Line::from(vec![
-                    Span::raw("• "),
-                    Span::raw(tr(self.locale, MessageId::PendingInputsHeader).into_owned()),
-                ]),
-            );
-            let sending_prefix =
-                tr(self.locale, MessageId::PendingSendingIntoTurnPrefix).into_owned();
-            let sending_indent = continuation_indent(&sending_prefix);
-            for steer in &self.pending_steers {
-                push_truncated_item(
-                    &mut lines,
-                    steer,
-                    width,
-                    dim,
-                    &sending_prefix,
-                    &sending_indent,
-                );
-            }
-            if let Some(draft) = self.editing_queued_message.as_deref() {
-                let editing_prefix =
-                    tr(self.locale, MessageId::PendingEditingFollowUpPrefix).into_owned();
-                let editing_indent = continuation_indent(&editing_prefix);
-                push_truncated_item(
-                    &mut lines,
-                    draft,
-                    width,
-                    dim_italic,
-                    &editing_prefix,
-                    &editing_indent,
-                );
-                lines.push(Line::from(vec![Span::styled(
-                    tr(self.locale, MessageId::PendingEscRestore).into_owned(),
-                    dim,
-                )]));
-            }
-            for (idx, message) in self.queued_messages.iter().enumerate() {
-                let row_number = idx + 1;
-                let queued_prefix = tr(self.locale, MessageId::PendingQueuedFollowUpPrefix)
-                    .replace("{number}", &row_number.to_string());
-                let queued_message_indent = continuation_indent(&queued_prefix);
-                push_truncated_item(
-                    &mut lines,
-                    message,
-                    width,
-                    dim_italic,
-                    &queued_prefix,
-                    &queued_message_indent,
-                );
-            }
-            if !self.queued_messages.is_empty() {
-                lines.push(Line::from(vec![Span::styled(
-                    tr(self.locale, MessageId::PendingSendNowControls)
-                        .replace("{key}", self.edit_binding.label),
-                    dim,
-                )]));
-            }
-        }
-
-        lines
+        card.sending = self
+            .pending_steers
+            .iter()
+            .map(|value| value.as_str().into())
+            .collect();
+        card.queued = self
+            .queued_messages
+            .iter()
+            .map(|value| value.as_str().into())
+            .collect();
+        card.editing = self.editing_queued_message.as_deref().map(Into::into);
+        card.priority_rows = self
+            .pending_approvals
+            .iter()
+            .map(|value| value.as_str().into())
+            .collect();
+        card.styles = Some(PendingCardStyles {
+            input: Style::default()
+                .fg(palette::TEXT_DIM)
+                .add_modifier(Modifier::DIM),
+            warning: Style::default().fg(palette::STATUS_WARNING),
+            context_muted: Style::default().fg(palette::TEXT_MUTED),
+            context_label: Style::default().fg(palette::TEXT_PRIMARY),
+            selected: menu_style::selected_row_bg_style().fg(palette::SELECTION_TEXT),
+        });
+        card
     }
 }
 
@@ -239,177 +144,20 @@ impl Default for PendingInputPreview {
 
 impl Renderable for PendingInputPreview {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        if area.is_empty() {
-            return;
-        }
-        let mut lines = self.lines(area.width);
-        if lines.is_empty() {
-            return;
-        }
-        // If the rest of a 40x12 layout leaves one preview row, preserve the
-        // direct action rather than a non-actionable message summary.
-        if self.is_queued_only()
-            && self.pending_approvals.is_empty()
-            && area.height == 1
-            && lines.len() == 2
-        {
-            lines.remove(0);
-        }
-        Paragraph::new(lines).render(area, buf);
+        // The existing backend owns terminal punctuation/color projection.
+        // This pure card receives exact host styles and authors one row plan.
+        self.kit()
+            .paint(area, buf, &crate::tui::infoline::source_theme(false));
     }
-
     fn desired_height(&self, width: u16) -> u16 {
-        let lines = self.lines(width);
-        u16::try_from(lines.len()).unwrap_or(u16::MAX)
+        self.kit()
+            .height(width, &crate::tui::infoline::source_theme(false))
     }
 }
 
-fn continuation_indent(prefix: &str) -> String {
-    " ".repeat(display_width(prefix))
-}
-
-fn push_section_header(lines: &mut Vec<Line<'static>>, header: Line<'static>) {
-    lines.push(header);
-}
-
-fn push_context_item(lines: &mut Vec<Line<'static>>, item: &ContextPreviewItem, width: u16) {
-    let status_style = if item.selected {
-        menu_style::selected_row_style()
-    } else if item.included {
-        Style::default().fg(palette::TEXT_MUTED)
-    } else {
-        Style::default().fg(palette::STATUS_WARNING)
-    };
-    let label_style = if item.selected {
-        menu_style::selected_row_bg_style().fg(palette::SELECTION_TEXT)
-    } else if item.included {
-        Style::default().fg(palette::TEXT_PRIMARY)
-    } else {
-        Style::default().fg(palette::TEXT_MUTED)
-    };
-    let detail = item
-        .detail
-        .as_deref()
-        .filter(|detail| !detail.trim().is_empty())
-        .map(|detail| format!(" · {detail}"))
-        .unwrap_or_default();
-    let action = if item.selected {
-        " · Backspace/Delete removes"
-    } else if item.removable {
-        " · removable"
-    } else {
-        ""
-    };
-    let body = format!("[{}] {}{}{}", item.kind, item.label, detail, action);
-    let body_width = width.saturating_sub(4).max(1) as usize;
-    for (idx, segment) in wrap_to_width(&body, body_width).into_iter().enumerate() {
-        let prefix = if idx == 0 {
-            if item.selected { "  ▸ " } else { "  ↳ " }
-        } else {
-            "    "
-        };
-        lines.push(Line::from(vec![
-            Span::styled(prefix.to_string(), status_style),
-            Span::styled(segment, label_style),
-        ]));
-    }
-}
-
-/// Render a single bucket item with `↳` prefix, truncating to
-/// [`PREVIEW_LINE_LIMIT`] visible rows. Multi-line input wraps at the given
-/// column budget and the continuation rows get the `subsequent_indent` so
-/// the prefix and the body stay column-aligned.
-fn push_truncated_item(
-    lines: &mut Vec<Line<'static>>,
-    raw: &str,
-    width: u16,
-    style: Style,
-    prefix: &str,
-    subsequent_indent: &str,
-) {
-    let body_width = width.saturating_sub(display_width(prefix) as u16) as usize;
-    let body_width = body_width.max(1);
-
-    let mut produced: Vec<String> = Vec::new();
-    for (idx, paragraph) in raw.split('\n').enumerate() {
-        let wrapped = wrap_to_width(paragraph, body_width);
-        for (j, segment) in wrapped.into_iter().enumerate() {
-            let row = if idx == 0 && j == 0 {
-                format!("{prefix}{segment}")
-            } else {
-                format!("{subsequent_indent}{segment}")
-            };
-            produced.push(row);
-            if produced.len() > PREVIEW_LINE_LIMIT {
-                break;
-            }
-        }
-        if produced.len() > PREVIEW_LINE_LIMIT {
-            break;
-        }
-    }
-
-    let truncated = produced.len() > PREVIEW_LINE_LIMIT;
-    for (i, row) in produced.into_iter().enumerate() {
-        if i >= PREVIEW_LINE_LIMIT {
-            break;
-        }
-        lines.push(Line::from(Span::styled(row, style)));
-    }
-    if truncated {
-        lines.push(Line::from(Span::styled(
-            format!("{subsequent_indent}…"),
-            style,
-        )));
-    }
-}
-
-/// Naive word-aware wrap that respects unicode display widths. Matches the
-/// behavior expected by snapshot tests in the codex source — long URL-like
-/// tokens that exceed `width` are emitted on their own row instead of being
-/// hard-broken mid-character.
-fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
-    if width == 0 || text.is_empty() {
-        return vec![text.to_string()];
-    }
-
-    let mut out: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut current_width = 0usize;
-
-    for word in text.split_inclusive(' ') {
-        let word_width = display_width(word);
-        if current_width + word_width > width && !current.is_empty() {
-            out.push(std::mem::take(&mut current));
-            current_width = 0;
-        }
-        if word_width > width {
-            // Token longer than the budget: flush current, emit the word as
-            // its own row even though it overflows. Avoids the codex-issue
-            // of a long URL fanning out into N junk-ellipsis rows.
-            if !current.is_empty() {
-                out.push(std::mem::take(&mut current));
-                current_width = 0;
-            }
-            out.push(word.trim_end().to_string());
-            continue;
-        }
-        current.push_str(word);
-        current_width += word_width;
-    }
-    if !current.is_empty() {
-        out.push(current);
-    }
-    out
-}
-
-// Delegates to the canonical width contract (`ui_text::text_display_width`):
-// tabs are 4 columns and control chars occupy one, matching what the renderer
-// draws. The old local copy used `unwrap_or(0)` and ignored tabs, so preview
-// word-wrap disagreed with the real layout on those inputs (#3924).
-fn display_width(s: &str) -> usize {
-    crate::tui::ui_text::text_display_width(s)
-}
+#[cfg(test)]
+#[path = "pending_input_preview/legacy_fixture.rs"]
+mod legacy_fixture;
 
 #[cfg(test)]
 mod tests {
@@ -676,5 +424,229 @@ mod tests {
         let mut preview = PendingInputPreview::new();
         preview.queued_messages.push("hi".to_string());
         assert_eq!(preview.desired_height(2), 0);
+    }
+    // Append inside pending_input_preview.rs's existing tests module.
+    // This frozen production counterpart measures both cell contents and styles;
+    // it does not restate the new kit's implementation as its own expectation.
+    fn legacy_counterpart(preview: &PendingInputPreview) -> legacy_fixture::PendingInputPreview {
+        legacy_fixture::PendingInputPreview {
+            locale: preview.locale,
+            context_items: preview
+                .context_items
+                .iter()
+                .map(|item| legacy_fixture::ContextPreviewItem {
+                    kind: item.kind.clone(),
+                    label: item.label.clone(),
+                    detail: item.detail.clone(),
+                    included: item.included,
+                    removable: item.removable,
+                    selected: item.selected,
+                })
+                .collect(),
+            pending_steers: preview.pending_steers.clone(),
+            queued_messages: preview.queued_messages.clone(),
+            editing_queued_message: preview.editing_queued_message.clone(),
+            edit_binding: legacy_fixture::EditBinding {
+                label: preview.edit_binding.label,
+            },
+            pending_approvals: preview.pending_approvals.clone(),
+        }
+    }
+
+    fn guarded_preview_buffer(area: Rect) -> Buffer {
+        // A nonzero buffer origin catches accidental use of local coordinates.
+        // A guard around the whole requested rectangle catches stray painting;
+        // cells inside are initially empty with a caller-owned background
+        // and modifier, including wide-character continuation cells.
+        let canvas = Rect::new(2, 3, area.width + 12, area.height + 8);
+        let mut buffer = Buffer::empty(canvas);
+        for y in canvas.y..canvas.bottom() {
+            for x in canvas.x..canvas.right() {
+                buffer[(x, y)].set_style(
+                    Style::default()
+                        .fg(ratatui::style::Color::Rgb(13, 41, 67))
+                        .bg(ratatui::style::Color::Rgb(19, 47, 73))
+                        .add_modifier(Modifier::UNDERLINED),
+                );
+                if x < area.x || x >= area.right() || y < area.y || y >= area.bottom() {
+                    buffer[(x, y)].set_symbol("~");
+                }
+            }
+        }
+        buffer
+    }
+
+    fn assert_preview_matches_legacy(preview: &PendingInputPreview, case: &str) {
+        let legacy = legacy_counterpart(preview);
+        for width in [0, 2, 4, 12, 40, 80] {
+            assert_eq!(
+                preview.desired_height(width),
+                legacy.desired_height(width),
+                "height case={case} locale={:?} width={width}",
+                preview.locale,
+            );
+            for height in [0, 1, 2, 3, 12] {
+                let area = Rect::new(7, 6, width, height);
+                let mut actual = guarded_preview_buffer(area);
+                let mut expected = actual.clone();
+                preview.render(area, &mut actual);
+                legacy.render(area, &mut expected);
+                assert_eq!(
+                    actual, expected,
+                    "buffer case={case} locale={:?} area={area:?}",
+                    preview.locale,
+                );
+            }
+        }
+    }
+
+    fn parity_context(included: bool, removable: bool, selected: bool) -> ContextPreviewItem {
+        ContextPreviewItem {
+            kind: "file 文件".to_string(),
+            label: "資料/cafe\u{0301}-①-1\u{20e3}-👩‍💻.txt".to_string(),
+            detail: Some("CJK 你好 and cafe\u{0301} ① 1\u{20e3} attachment".to_string()),
+            included,
+            removable,
+            selected,
+        }
+    }
+
+    #[test]
+    fn kit_pending_preview_matches_frozen_native_in_every_shipped_locale_and_geometry() {
+        let long_url = "https://example.test/api/v1/projects/資料/releases/2026-10-02/build/1234567890/artifacts/abcdefghijklmnopqrstuvwxyz";
+        for &locale in Locale::shipped() {
+            let mut empty = PendingInputPreview::new();
+            empty.locale = locale;
+            let mut queued = empty.clone();
+            queued
+                .queued_messages
+                .push(format!("你好 cafe\u{0301} {long_url}"));
+            let mut queued_many = queued.clone();
+            queued_many
+                .queued_messages
+                .push("second follow-up".to_string());
+            let mut mixed = queued_many.clone();
+            mixed.context_items.push(parity_context(true, true, false));
+            mixed.context_items.push(parity_context(false, false, true));
+            mixed.pending_steers.push(format!(
+                "你好 cafe\u{0301} ① 1\u{20e3} 👩‍💻 first paragraph\nsecond paragraph {long_url}\nthird\nfourth"
+            ));
+            mixed.editing_queued_message =
+                Some("revise 你好 cafe\u{0301}\nnext paragraph".to_string());
+            mixed.edit_binding = EditBinding { label: "Alt+↑" };
+            let mut context_only = empty.clone();
+            context_only
+                .context_items
+                .push(parity_context(false, true, true));
+            context_only
+                .context_items
+                .push(parity_context(true, false, false));
+            let mut priority_only = empty.clone();
+            priority_only.pending_approvals = vec![
+                "Approval needed in 資料/cafe\u{0301} — /agents".to_string(),
+                "Another child needs input — /agents".to_string(),
+            ];
+            let mut child_and_queued = queued.clone();
+            child_and_queued.pending_approvals = priority_only.pending_approvals.clone();
+            for (case, preview) in [
+                ("empty", empty),
+                ("queued-only", queued),
+                ("queued-many", queued_many),
+                ("mixed", mixed),
+                ("context-only", context_only),
+                ("priority-only", priority_only),
+                ("child-and-queued", child_and_queued),
+            ] {
+                assert_preview_matches_legacy(&preview, case);
+            }
+        }
+    }
+
+    #[test]
+    fn kit_pending_context_flags_remain_independent_of_each_other() {
+        for &locale in Locale::shipped() {
+            for included in [false, true] {
+                for removable in [false, true] {
+                    for selected in [false, true] {
+                        let mut preview = PendingInputPreview::new();
+                        preview.locale = locale;
+                        preview
+                            .context_items
+                            .push(parity_context(included, removable, selected));
+                        assert_preview_matches_legacy(
+                            &preview,
+                            &format!(
+                                "included={included} removable={removable} selected={selected}"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kit_pending_control_and_bidi_sanitization_precedes_measurement_and_paint() {
+        // Sanitization is an intentional safety change, so this uses explicit
+        // sanitized user text rather than comparing against the old renderer.
+        for &locale in Locale::shipped() {
+            let mut safe = PendingInputPreview::new();
+            safe.locale = locale;
+            safe.context_items.push(ContextPreviewItem {
+                kind: "ABCD".to_string(),
+                label: "ABCD".to_string(),
+                detail: Some("ABCD".to_string()),
+                included: false,
+                removable: true,
+                selected: true,
+            });
+            safe.pending_steers.push("ABCD".to_string());
+            safe.queued_messages.push("ABCD".to_string());
+            safe.editing_queued_message = Some("ABCD".to_string());
+            safe.pending_approvals.push("ABCD".to_string());
+            let mut unsafe_text = safe.clone();
+            let value = "A\u{202e}B\u{2066}C\u{001b}\0\t\rD".to_string();
+            unsafe_text.context_items[0].kind = value.clone();
+            unsafe_text.context_items[0].label = value.clone();
+            unsafe_text.context_items[0].detail = Some(value.clone());
+            unsafe_text.pending_steers[0] = value.clone();
+            unsafe_text.queued_messages[0] = value.clone();
+            unsafe_text.editing_queued_message = Some(value.clone());
+            unsafe_text.pending_approvals[0] = value;
+            for width in [4, 12, 40, 80] {
+                assert_eq!(
+                    unsafe_text.desired_height(width),
+                    safe.desired_height(width)
+                );
+                let area = Rect::new(7, 6, width, 12);
+                let mut actual = guarded_preview_buffer(area);
+                let mut expected = actual.clone();
+                unsafe_text.render(area, &mut actual);
+                safe.render(area, &mut expected);
+                assert_eq!(
+                    actual, expected,
+                    "sanitization locale={locale:?} width={width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kit_pending_multiline_body_keeps_three_rows_and_one_overflow_marker() {
+        for &locale in Locale::shipped() {
+            let mut preview = PendingInputPreview::new();
+            preview.locale = locale;
+            preview
+                .pending_steers
+                .push("one\ntwo\nthree\nfour\nfive\nsix\nseven".to_string());
+            assert_eq!(preview.desired_height(160), 5, "locale={locale:?}");
+            let rows = render_to_string(&preview, 160);
+            assert_eq!(rows.len(), 5);
+            assert!(rows[1].ends_with("one"));
+            assert!(rows[2].ends_with("two"));
+            assert!(rows[3].ends_with("three"));
+            assert_eq!(rows[4].trim(), "…");
+            assert!(!rows.iter().any(|row| row.contains("four")));
+        }
     }
 }

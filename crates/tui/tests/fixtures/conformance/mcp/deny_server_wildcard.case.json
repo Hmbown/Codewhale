@@ -1,0 +1,150 @@
+{
+  "description": "A deny rule covering a whole server namespace (mcp_conformance_*). Pins Rust McpPool::server_denied_by / authorize_call: the server's tools and resource meta-tools leave the catalog, its tool calls are refused as unknown, and the resource tools refuse it as a server that cannot be found. Nothing reaches the server's side-effecting methods.",
+  "server_name": "conformance",
+  "disallowed_tools": [
+    "mcp_conformance_*"
+  ],
+  "server": {
+    "initialize": {
+      "result": {
+        "protocolVersion": "2025-06-18",
+        "serverInfo": {
+          "name": "deny-fixture",
+          "version": "1.0.0"
+        },
+        "capabilities": {
+          "tools": {},
+          "resources": {},
+          "prompts": {}
+        }
+      }
+    },
+    "tools/list": {
+      "result": {
+        "tools": [
+          {
+            "name": "echo",
+            "inputSchema": {
+              "type": "object"
+            }
+          },
+          {
+            "name": "fails",
+            "inputSchema": {
+              "type": "object"
+            }
+          }
+        ]
+      }
+    },
+    "resources/list": {
+      "result": {
+        "resources": [
+          {
+            "uri": "fixture://readme",
+            "name": "readme",
+            "mimeType": "text/plain"
+          }
+        ]
+      }
+    },
+    "prompts/list": {
+      "result": {
+        "prompts": [
+          {
+            "name": "summarize",
+            "description": "Summarize."
+          }
+        ]
+      }
+    },
+    "resources/read": [
+      {
+        "match": {
+          "uri": "fixture://readme"
+        },
+        "result": {
+          "contents": [
+            {
+              "uri": "fixture://readme",
+              "mimeType": "text/plain",
+              "text": "readme\n"
+            }
+          ]
+        }
+      }
+    ],
+    "prompts/get": [
+      {
+        "match": {
+          "name": "summarize"
+        },
+        "result": {
+          "messages": [
+            {
+              "role": "user",
+              "content": {
+                "type": "text",
+                "text": "Summarize."
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "tools/call": [
+      {
+        "match": {
+          "name": "echo"
+        },
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "echo"
+            }
+          ]
+        }
+      },
+      {
+        "match": {
+          "name": "fails"
+        },
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "ran"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "steps": [
+    {
+      "op": "catalog"
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_echo",
+      "input": {}
+    },
+    {
+      "op": "call",
+      "tool": "mcp_read_resource",
+      "input": {
+        "server": "conformance",
+        "uri": "fixture://readme"
+      }
+    },
+    {
+      "op": "call",
+      "tool": "mcp_get_prompt",
+      "input": {
+        "server": "conformance",
+        "name": "summarize"
+      }
+    }
+  ]
+}

@@ -3,7 +3,7 @@
 //!
 //! Prompts are assembled from composable layers loaded at compile time from
 //! the single [`text`] module:
-//!   constitution + personality overlay → `message[0]` (byte-stable).
+//!   constitution → `message[0]` (byte-stable).
 //!   approval policy → request-time runtime metadata.
 //! Tool availability comes only from the per-turn model catalog.
 //!
@@ -89,6 +89,21 @@ impl Default for PromptSessionContext<'_> {
 pub const HANDOFF_RELATIVE_PATH: &str = ".codewhale/handoff.md";
 /// Legacy handoff path for reading from existing installs.
 const LEGACY_HANDOFF_RELATIVE_PATH: &str = ".deepseek/handoff.md";
+
+/// The relay artifact a new session reads: the primary path when a file
+/// exists there, otherwise the legacy fallback. Returns the file to read and
+/// its workspace-relative name, so every caller names the path actually read.
+pub(crate) fn resolve_handoff_path(workspace: &Path) -> (PathBuf, &'static str) {
+    let primary = workspace.join(HANDOFF_RELATIVE_PATH);
+    if primary.exists() {
+        (primary, HANDOFF_RELATIVE_PATH)
+    } else {
+        (
+            workspace.join(LEGACY_HANDOFF_RELATIVE_PATH),
+            LEGACY_HANDOFF_RELATIVE_PATH,
+        )
+    }
+}
 
 /// Per-file size cap for `instructions = [...]` entries (#454). Mirrors
 /// the existing project-context cap in `project_context::load_context_file`
@@ -246,14 +261,104 @@ fn translation_target_language_for_tag(locale_tag: &str) -> &'static str {
 /// path is delivered per-turn via `<turn_meta>` (see `turn_metadata_block`).
 pub(crate) fn render_environment_block(_workspace: &Path, locale_tag: &str) -> String {
     let (platform, shell) = environment_host_facts();
+    format_environment_block(locale_tag, &platform, &shell, npm_launcher_fact())
+}
 
-    format!(
+/// Format the `## Environment` block from already-resolved facts. Pure, so
+/// the plain and npm-launcher shapes can both be tested on any host.
+fn format_environment_block(
+    locale_tag: &str,
+    platform: &str,
+    shell: &str,
+    launcher: Option<&str>,
+) -> String {
+    let mut block = format!(
         "## Environment\n\
          \n\
          - lang: {locale_tag}\n\
          - platform: {platform}\n\
          - shell: {shell}"
+    );
+    if let Some(launcher) = launcher {
+        block.push_str("\n- launcher: ");
+        block.push_str(launcher);
+    }
+    block
+}
+
+/// On Windows an npm install keeps the launcher's `node.exe` as this
+/// process's parent for the whole session, and Windows ends `codewhale.exe`
+/// with it (#6827). Like `platform` and `shell`, this is stable for the life
+/// of the process and changes how commands must be written, so it belongs in
+/// the static block. It names no PID, so the prefix stays cacheable.
+const NPM_LAUNCHER_FACT: &str = "npm (node.exe is this session's parent; killing node.exe by name ends this and other npm-launched Codewhale sessions, so stop servers by PID or port)";
+
+fn launcher_fact(
+    is_windows: bool,
+    method: codewhale_release::InstallMethod,
+) -> Option<&'static str> {
+    (is_windows && method == codewhale_release::InstallMethod::Npm).then_some(NPM_LAUNCHER_FACT)
+}
+
+/// The launcher line for this process. Install detection reads the
+/// executable's path, so it runs once and only on Windows; recorded
+/// conformance environments never carry it.
+fn npm_launcher_fact() -> Option<&'static str> {
+    #[cfg(test)]
+    if RECORDED_ENVIRONMENT.with(|cell| cell.borrow().is_some()) {
+        return None;
+    }
+    if !cfg!(windows) {
+        return None;
+    }
+    static METHOD: std::sync::OnceLock<codewhale_release::InstallMethod> =
+        std::sync::OnceLock::new();
+    launcher_fact(
+        true,
+        *METHOD.get_or_init(codewhale_release::current_install_method),
     )
+}
+
+#[cfg(test)]
+mod npm_launcher_fact_tests {
+    use super::*;
+    use codewhale_release::InstallMethod;
+
+    #[test]
+    fn plain_environment_block_is_unchanged() {
+        assert_eq!(
+            format_environment_block("en", "windows", "powershell", None),
+            "## Environment\n\n- lang: en\n- platform: windows\n- shell: powershell"
+        );
+    }
+
+    #[test]
+    fn windows_npm_install_names_the_node_launcher() {
+        let block = format_environment_block(
+            "en",
+            "windows",
+            "powershell",
+            launcher_fact(true, InstallMethod::Npm),
+        );
+        assert!(
+            block.ends_with(&format!("\n- launcher: {NPM_LAUNCHER_FACT}")),
+            "{block}"
+        );
+        assert!(block.contains("stop servers by PID or port"), "{block}");
+    }
+
+    #[test]
+    fn launcher_fact_is_windows_npm_only() {
+        assert_eq!(launcher_fact(false, InstallMethod::Npm), None);
+        for method in [
+            InstallMethod::Binary,
+            InstallMethod::Cargo,
+            InstallMethod::Homebrew,
+            InstallMethod::Omarchy,
+        ] {
+            assert_eq!(launcher_fact(true, method), None);
+        }
+    }
 }
 
 /// The host facts the `## Environment` block names: this process's OS and
@@ -412,12 +517,7 @@ fn render_instructions_block(sources: &[InstructionSource]) -> Option<String> {
 /// system-prompt block. Returns `None` when the file is absent or empty so
 /// callers can keep the default-uncluttered prompt for fresh workspaces.
 fn load_handoff_block(workspace: &Path) -> Option<String> {
-    let primary = workspace.join(HANDOFF_RELATIVE_PATH);
-    let path = if primary.exists() {
-        primary
-    } else {
-        workspace.join(LEGACY_HANDOFF_RELATIVE_PATH)
-    };
+    let (path, shown) = resolve_handoff_path(workspace);
     // The relay is workspace-writable, so it gets the same per-file cap as
     // an instructions file rather than an unbounded read into the prompt.
     let (raw, full_len) = read_prompt_file_bounded(&path, INSTRUCTIONS_FILE_MAX_BYTES).ok()?;
@@ -437,7 +537,7 @@ fn load_handoff_block(workspace: &Path) -> Option<String> {
         "shorten the relay artifact",
     );
     Some(format!(
-        "## Previous Session Relay\n\nThe previous session in this workspace left a relay artifact at `{HANDOFF_RELATIVE_PATH}`. Consider it the first artifact to read on this turn — open blockers, in-flight changes, and recent decisions live there. Update or rewrite it before exiting if state changes materially.\n\n{relay}"
+        "## Previous Session Relay\n\nThe previous session in this workspace left a relay artifact at `{shown}`. Consider it the first artifact to read on this turn — open blockers, in-flight changes, and recent decisions live there. Update or rewrite it before exiting if state changes materially.\n\n{relay}"
     ))
 }
 
@@ -513,8 +613,6 @@ fn user_constitution_disabled_by_setup_state() -> bool {
 // prompt text in `text.rs` directly; the test suite below guards content
 // and ordering invariants (constitution structure and binding gates #4032,
 // byte-stable prefix ordering, prefix privacy #4632).
-#[cfg(test)]
-use text::CALM_PERSONALITY;
 pub use text::{
     BASE_PROMPT, COMPACT_TEMPLATE, CORE_EXECUTION_PROFILE_PROMPT, GOAL_CONTINUATION_PROMPT,
     LANGUAGE_PROMPT, MEMORY_GUIDANCE, OUTPUT_PROMPT,
@@ -543,7 +641,7 @@ static PROMPT_OVERRIDE_NOTICES: LazyLock<Mutex<Vec<String>>> =
 
 /// Context passed to an embedder-provided static prompt composer.
 ///
-/// This hook only replaces the byte-stable base/personality prompt segment.
+/// This hook only replaces the byte-stable base prompt segment.
 /// Approval policy, Core Execution, and action-specific relay formatting stay
 /// owned by Codewhale.
 #[non_exhaustive]
@@ -551,14 +649,12 @@ static PROMPT_OVERRIDE_NOTICES: LazyLock<Mutex<Vec<String>>> =
 pub struct StaticPromptCtx<'a> {
     /// Active model identifier after caller-side routing.
     pub model_id: &'a str,
-    /// Personality overlay requested for the base static prompt.
-    pub personality: Personality,
-    /// Default base/personality prompt layers that would be used without an
+    /// Default base prompt layers that would be used without an
     /// override.
     pub default_layers: &'a str,
 }
 
-/// Embedder hook for replacing Codewhale's byte-stable base/personality prompt
+/// Embedder hook for replacing Codewhale's byte-stable base prompt
 /// segment.
 pub type StaticPromptComposer = dyn Fn(&StaticPromptCtx<'_>) -> String + Send + Sync + 'static;
 
@@ -1001,17 +1097,6 @@ dự án có là tiếng Anh, quá trình suy nghĩ của bạn cũng không đ�
 tích lũy trong ngữ cảnh. Trừ khi người dùng yêu cầu rõ ràng việc chuyển đổi (ví dụ \"think in English\"), \
 hãy tiếp tục suy nghĩ và trả lời bằng tiếng Việt.";
 
-// ── Personality selection ─────────────────────────────────────────────
-
-/// Which personality overlay to apply. Tone is folded into the constitutional
-/// preamble, so this is a compile-time marker carried through the static-prompt
-/// composer context rather than a separate overlay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Personality {
-    /// Cool, spatial, reserved — the default and only shipped personality.
-    Calm,
-}
-
 // ── Composition ───────────────────────────────────────────────────────
 
 /// Substitute the model id for embedder-supplied prompt overrides that still
@@ -1037,20 +1122,16 @@ whole list: the user may override a fact, but no one may invent one. When
 guidance conflicts, consult ### Whose word wins — that is the only place
 precedence is stated.";
 
-pub(crate) fn compose_prompt_with_approval_model_and_shell(
-    personality: Personality,
-    model_id: &str,
-) -> String {
-    let default_layers = compose_default_static_layers(personality, model_id);
+pub(crate) fn compose_prompt_with_approval_model_and_shell(model_id: &str) -> String {
+    let default_layers = compose_default_static_layers(model_id);
     apply_static_prompt_composer(
         effective_static_prompt_composer(),
-        personality,
         model_id,
         &default_layers,
     )
 }
 
-pub(crate) fn compose_default_static_layers(_personality: Personality, model_id: &str) -> String {
+pub(crate) fn compose_default_static_layers(model_id: &str) -> String {
     compose_default_static_layers_with_context(model_id, None)
 }
 
@@ -1058,9 +1139,9 @@ fn compose_default_static_layers_with_context(
     model_id: &str,
     context_window_override: Option<u32>,
 ) -> String {
-    // Personality is folded into the constitutional preamble/articles — no
-    // separate overlay is appended. Language and output rules are split into
-    // their own static segments so the 0.9.0 constitution stays compact.
+    // Voice and tone live in the constitutional preamble. Language and output
+    // rules are split into their own static segments so the constitution
+    // stays compact.
     let layers = format!(
         "{}\n\n{}\n\n{}",
         effective_base_prompt().trim(),
@@ -1082,14 +1163,12 @@ pub(crate) enum PromptHost {
 
 fn apply_static_prompt_composer(
     composer: Option<&StaticPromptComposer>,
-    personality: Personality,
     model_id: &str,
     default_layers: &str,
 ) -> String {
     match composer {
         Some(composer) => composer(&StaticPromptCtx {
             model_id,
-            personality,
             default_layers,
         }),
         None => default_layers.to_string(),
@@ -1208,7 +1287,6 @@ pub(crate) fn system_prompt_for_mode_with_context_skills_session_and_approval_fo
     );
     let composed = apply_static_prompt_composer(
         effective_static_prompt_composer(),
-        Personality::Calm,
         session_context.model_id,
         &default_layers,
     );
@@ -1244,9 +1322,8 @@ pub(crate) fn system_prompt_for_mode_with_context_skills_session_and_approval_fo
         full_prompt = format!("{preamble}\n\n{full_prompt}");
     }
 
-    if let Some(user_constitution_block) = load_user_constitution_block() {
-        full_prompt = format!("{full_prompt}\n\n{user_constitution_block}");
-    }
+    // Personal preferences are captured once at turn admission and recorded in
+    // history, so live profile edits never mutate an in-flight prompt prefix.
 
     if session_context.project_context_pack_enabled
         && let Some(pack) = crate::project_context::generate_project_context_pack(workspace)
@@ -1499,8 +1576,10 @@ mod tests {
     use tempfile::tempdir;
 
     /// Discriminator unique to the injected relay block (not present in the
-    /// agent prompt's own discussion of the convention).
-    const HANDOFF_BLOCK_MARKER: &str = "left a relay artifact at `.codewhale/handoff.md`";
+    /// agent prompt's own discussion of the convention). It stops before the
+    /// path because the block names whichever file was read; the tests that
+    /// care about the path assert it themselves.
+    const HANDOFF_BLOCK_MARKER: &str = "left a relay artifact at `";
 
     // Config-directory prompt override resolution (#3638). These exercise the
     // pure file resolver only; the global install path is intentionally not
@@ -1600,26 +1679,19 @@ mod tests {
 
     #[test]
     fn static_prompt_composer_unset_keeps_default_layers_byte_identical() {
-        let default_layers = compose_default_static_layers(Personality::Calm, "deepseek-v4-flash");
-        let composed = apply_static_prompt_composer(
-            None,
-            Personality::Calm,
-            "deepseek-v4-flash",
-            &default_layers,
-        );
+        let default_layers = compose_default_static_layers("deepseek-v4-flash");
+        let composed = apply_static_prompt_composer(None, "deepseek-v4-flash", &default_layers);
 
         assert_byte_identical("unset static prompt composer", &default_layers, &composed);
     }
 
     #[test]
     fn static_prompt_composer_receives_context_and_replaces_layers() {
-        let default_layers = compose_default_static_layers(Personality::Calm, "deepseek-v4-pro");
+        let default_layers = compose_default_static_layers("deepseek-v4-pro");
         let composer: Box<StaticPromptComposer> = Box::new(|ctx| {
             assert_eq!(ctx.model_id, "deepseek-v4-pro");
-            assert_eq!(ctx.personality, Personality::Calm);
-            // The 0.9.0 core is model-agnostic ("You are Codewhale") and
-            // folds tone in — no per-model id line, no separate personality
-            // section in default_layers.
+            // The core is model-agnostic ("You are Codewhale") and carries
+            // tone in the preamble — no per-model id line.
             assert!(ctx.default_layers.contains("You are Codewhale"));
             assert!(
                 ctx.default_layers
@@ -1632,7 +1704,6 @@ mod tests {
 
         let composed = apply_static_prompt_composer(
             Some(composer.as_ref()),
-            Personality::Calm,
             "deepseek-v4-pro",
             &default_layers,
         );
@@ -1713,7 +1784,7 @@ mod tests {
 
     #[test]
     fn constitutional_kernel_keeps_first_turn_authority_safety_and_completion() {
-        let fresh_prefix = compose_default_static_layers(Personality::Calm, "deepseek-v4-pro");
+        let fresh_prefix = compose_default_static_layers("deepseek-v4-pro");
         for phrase in [
             "Do what the user's current request asks, no more.",
             "require express user authorization in",
@@ -1740,7 +1811,7 @@ mod tests {
 
     #[test]
     fn procedural_playbooks_are_not_eager_constitution() {
-        let fresh_prefix = compose_default_static_layers(Personality::Calm, "deepseek-v4-pro");
+        let fresh_prefix = compose_default_static_layers("deepseek-v4-pro");
         for heading in [
             "### Keep momentum",
             "### Think in causes",
@@ -1908,8 +1979,7 @@ mod tests {
 
     #[test]
     fn compose_prompt_for_v4_model_stays_model_fact_free() {
-        let prompt =
-            compose_prompt_with_approval_model_and_shell(Personality::Calm, "deepseek-v4-pro");
+        let prompt = compose_prompt_with_approval_model_and_shell("deepseek-v4-pro");
         assert!(prompt.contains("You are Codewhale"));
         assert!(!prompt.contains("Your V4 Characteristics"));
         assert!(!prompt.contains("one-million-token context window"));
@@ -1918,8 +1988,7 @@ mod tests {
 
     #[test]
     fn compose_prompt_for_kimi_stays_model_fact_free() {
-        let prompt =
-            compose_prompt_with_approval_model_and_shell(Personality::Calm, "moonshotai/kimi-k2.6");
+        let prompt = compose_prompt_with_approval_model_and_shell("moonshotai/kimi-k2.6");
         assert!(prompt.contains("You are Codewhale"));
         assert!(!prompt.contains("Your V4 Characteristics"));
         assert!(!prompt.contains("one-million"));
@@ -1931,7 +2000,7 @@ mod tests {
 
     #[test]
     fn compose_prompt_for_openai_api_gpt_55_stays_model_fact_free() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "gpt-5.5");
+        let prompt = compose_prompt_with_approval_model_and_shell("gpt-5.5");
         assert!(prompt.contains("You are Codewhale"));
         assert!(!prompt.contains("Your V4 Characteristics"));
         assert!(!prompt.contains("1050000-token context window"));
@@ -1942,8 +2011,7 @@ mod tests {
 
     #[test]
     fn compose_prompt_for_unknown_model_stays_model_fact_free() {
-        let prompt =
-            compose_prompt_with_approval_model_and_shell(Personality::Calm, "llama3.3:70b");
+        let prompt = compose_prompt_with_approval_model_and_shell("llama3.3:70b");
         assert!(prompt.contains("You are Codewhale"));
         assert!(!prompt.contains("Your V4 Characteristics"));
         assert!(!prompt.contains("one-million"));
@@ -1972,10 +2040,8 @@ mod tests {
     fn compose_prompt_is_model_agnostic_in_preamble() {
         // 0.9.0 keeps the preamble byte-for-byte the same regardless of
         // model id, and no {model_id} placeholder leaks.
-        let flash =
-            compose_prompt_with_approval_model_and_shell(Personality::Calm, "deepseek-v4-flash");
-        let kimi =
-            compose_prompt_with_approval_model_and_shell(Personality::Calm, "moonshotai/kimi-k2.6");
+        let flash = compose_prompt_with_approval_model_and_shell("deepseek-v4-flash");
+        let kimi = compose_prompt_with_approval_model_and_shell("moonshotai/kimi-k2.6");
         assert!(
             flash.contains("You are Codewhale"),
             "0.9.0 preamble must open with the model-agnostic Codewhale stance"
@@ -2049,7 +2115,7 @@ mod tests {
     fn tool_descriptions_carry_edit_and_shell_guidance() {
         let write = WriteFileTool.description();
         assert!(
-            write.contains("instead of heredocs")
+            write.contains("Unlike heredocs")
                 && write.contains("`Bash`")
                 && !write.contains("exec_shell"),
             "write guidance must name the live Bash tool and never the retired exec_shell name"
@@ -2060,7 +2126,8 @@ mod tests {
         // action. `read_file`/`write_file`/`apply_patch` are retired spellings
         // (crates/tui/src/tools/registry.rs:2066-2088).
         assert!(edit.contains("File `read`"));
-        assert!(edit.contains("File `patch` or `write`"));
+        assert!(edit.contains("File `patch` handles structural"));
+        assert!(!edit.contains("instead"), "{edit}");
         assert!(
             !edit.contains("read_file")
                 && !edit.contains("write_file")
@@ -2079,8 +2146,7 @@ mod tests {
 
     #[test]
     fn composed_prompt_does_not_claim_tool_availability() {
-        let prompt =
-            compose_prompt_with_approval_model_and_shell(Personality::Calm, "deepseek-v4-pro");
+        let prompt = compose_prompt_with_approval_model_and_shell("deepseek-v4-pro");
         assert!(!prompt.contains("## Core Tool Taxonomy"));
         assert!(!prompt.contains("## Toolbox"));
         assert!(prompt.contains("You are Codewhale"));
@@ -2180,15 +2246,9 @@ mod tests {
     }
 
     #[test]
-    fn constitution_has_no_separate_personality_tier() {
-        // 0.9.0 has no personality tier. Voice and tone live in the
-        // compact constitution rather than a separate section, so
-        // personality remains folded in by omission.
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
-        assert!(
-            !prompt.contains("Personality: Calm — Tier 8"),
-            "Personality tier should not appear as a separate section"
-        );
+    fn constitution_carries_tone_and_rejection_behavior() {
+        // Voice and tone live in the compact constitution's preamble.
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(
             prompt.contains("Take the work seriously. Don't take"),
             "Preamble should carry tone guidance (take the work, not yourself, seriously)"
@@ -2570,7 +2630,7 @@ mod tests {
     }
 
     #[test]
-    fn user_global_constitution_block_is_injected_separately() {
+    fn user_global_constitution_is_captured_outside_the_stable_prefix() {
         let _env_guard = crate::test_support::lock_test_env();
         let tmp = tempdir().expect("tempdir");
         let workspace = tmp.path().join("workspace");
@@ -2606,22 +2666,11 @@ mod tests {
                 },
             ));
 
-        let base_at = prompt.find("### Whose word wins").expect("base prompt");
-        let user_block_at = prompt
-            .find("<codewhale_user_constitution")
-            .expect("user constitution block");
-        let env_at = prompt.find("- lang:").expect("rendered environment block");
-        assert!(
-            base_at < user_block_at && user_block_at < env_at,
-            "user constitution should be its own layer after the base/project context and before volatile environment data"
-        );
-        assert!(prompt.contains("source=\"user-global\""));
-        assert!(prompt.contains("Maintains Codewhale release lanes."));
-        assert!(prompt.contains("Prefer live verification before claims."));
-        assert!(
-            !prompt.contains(&codewhale_home.display().to_string()),
-            "prompt should use the stable user-global source label, not a device-specific home path"
-        );
+        assert!(!prompt.contains("<codewhale_user_constitution"));
+        let block = load_user_constitution_block().expect("admission snapshot");
+        assert!(block.contains("Maintains Codewhale release lanes."));
+        assert!(block.contains("Prefer live verification before claims."));
+        assert!(!block.contains(&codewhale_home.display().to_string()));
     }
 
     #[test]
@@ -2884,7 +2933,6 @@ mod tests {
     fn only_the_constitution_states_precedence() {
         // Composed overlays must describe behavior, never their own rank.
         let overlays = [
-            ("CALM_PERSONALITY", CALM_PERSONALITY),
             ("COMPACT_TEMPLATE", COMPACT_TEMPLATE),
             ("MEMORY_GUIDANCE", MEMORY_GUIDANCE),
             ("LANGUAGE_PROMPT", LANGUAGE_PROMPT),
@@ -3007,6 +3055,30 @@ mod tests {
         assert!(prompt.contains(HANDOFF_BLOCK_MARKER));
         assert!(prompt.contains("Finish #32."));
         assert!(prompt.contains("write the basic version"));
+        // Only the legacy file exists, so the block must name it rather
+        // than send the model to a primary file that is not there.
+        assert!(prompt.contains("left a relay artifact at `.deepseek/handoff.md`"));
+        assert!(!prompt.contains("left a relay artifact at `.codewhale/handoff.md`"));
+    }
+
+    #[test]
+    fn primary_handoff_wins_over_legacy_and_is_named() {
+        let tmp = tempdir().expect("tempdir");
+        let workspace = tmp.path();
+        for (dir, body) in [
+            (".codewhale", "# Session relay\n\nprimary relay body\n"),
+            (".deepseek", "# Session relay\n\nlegacy relay body\n"),
+        ] {
+            std::fs::create_dir_all(workspace.join(dir)).unwrap();
+            std::fs::write(workspace.join(dir).join("handoff.md"), body).unwrap();
+        }
+
+        let prompt = system_prompt_flat_text(&system_prompt_for_mode_with_context(workspace, None));
+
+        assert!(prompt.contains("left a relay artifact at `.codewhale/handoff.md`"));
+        assert!(prompt.contains("primary relay body"));
+        assert!(!prompt.contains("legacy relay body"));
+        assert!(!prompt.contains("left a relay artifact at `.deepseek/handoff.md`"));
     }
 
     #[test]
@@ -3030,7 +3102,7 @@ mod tests {
 
     #[test]
     fn compose_prompt_includes_all_layers() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         // Base layer — balanced Constitution; procedural recipes stay out.
         assert!(prompt.contains("## Codewhale"));
         assert!(prompt.contains("### Whose word wins"));
@@ -3119,7 +3191,7 @@ mod tests {
 
     #[test]
     fn compose_prompt_deterministic_order() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         let base_pos = prompt.find("## Codewhale").unwrap();
         let article_pos = prompt.find("### Ground truth").unwrap();
 
@@ -3130,7 +3202,7 @@ mod tests {
     fn base_prompt_is_mode_agnostic() {
         // Mode and approval text are no longer inlined into compose_prompt —
         // they travel as request-time runtime metadata.
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(!prompt.contains("Mode: Agent"));
         assert!(!prompt.contains("Mode: YOLO"));
         assert!(!prompt.contains("Mode: Plan"));
@@ -3142,7 +3214,7 @@ mod tests {
 
     #[test]
     fn approval_policy_no_longer_inlined_in_base_prompt() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(!prompt.contains("Mode: Agent"));
         assert!(!prompt.contains("Approval Policy:"));
         // The compact Constitutional preamble is still present.
@@ -3161,16 +3233,6 @@ mod tests {
             CORE_EXECUTION_PROFILE_PROMPT.contains("present the change in your plan"),
             "Execution profile must name the correct behavior on rejection"
         );
-    }
-
-    #[test]
-    fn personality_is_folded_into_constitution() {
-        // v4 has no separate personality tier. Voice and tone live in
-        // the preamble, so composition appends no personality overlay.
-        let calm = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
-        assert!(!calm.contains("## Personality:"));
-        assert!(calm.contains("Take the work seriously. Don't take"));
-        assert!(calm.contains("You are Codewhale"));
     }
 
     #[test]
@@ -3300,7 +3362,7 @@ mod tests {
 
     #[test]
     fn universal_prompt_leaves_tool_selection_to_the_catalog() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(!prompt.contains("Tool Selection Guide"));
         for forbidden in [
             "`File`",
@@ -3322,7 +3384,7 @@ mod tests {
     /// reinforcement lives in its own static segment plus locale bookends.
     #[test]
     fn language_segment_present_outside_reduced_constitution() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(
             !BASE_PROMPT.contains("## Language"),
             "0.9.0 constitution.md should stay reduced; language belongs in its own segment"
@@ -3350,7 +3412,7 @@ mod tests {
 
     #[test]
     fn output_formatting_segment_present_outside_reduced_constitution() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(
             !BASE_PROMPT.contains("## Output Formatting"),
             "0.9.0 constitution.md should stay reduced; output formatting belongs in its own segment"
@@ -3412,7 +3474,7 @@ mod tests {
 
     #[test]
     fn english_base_prompt_avoids_native_script_language_priming() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(
             !contains_cjk(&prompt),
             "English base prompt should keep native-script reinforcement in locale bookends only"
@@ -3426,16 +3488,12 @@ mod tests {
     #[test]
     fn legacy_rlm_compatibility_descriptions_remain_available() {
         let descriptions = [
-            RlmTool::alias("rlm_open", "open", None)
+            RlmTool::alias("rlm_open", "open").description().to_string(),
+            RlmTool::alias("rlm_eval", "eval").description().to_string(),
+            RlmTool::alias("rlm_configure", "configure")
                 .description()
                 .to_string(),
-            RlmTool::alias("rlm_eval", "eval", None)
-                .description()
-                .to_string(),
-            RlmTool::alias("rlm_configure", "configure", None)
-                .description()
-                .to_string(),
-            RlmTool::alias("rlm_close", "close", None)
+            RlmTool::alias("rlm_close", "close")
                 .description()
                 .to_string(),
             HandleReadTool.description().to_string(),
@@ -3454,7 +3512,7 @@ mod tests {
     /// by project law/instructions sitting above memory/handoffs.
     #[test]
     fn project_instructions_outrank_memory_in_whose_word_wins() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         let project_at = prompt
             .find("3. Project law and instructions")
             .expect("Whose word wins must rank project instructions");
@@ -3470,7 +3528,7 @@ mod tests {
 
     #[test]
     fn workspace_orientation_guidance_present() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(prompt.contains("Project law and instructions"));
         assert!(
             prompt.contains("the nearest in\nscope winning over the broader")
@@ -3540,7 +3598,7 @@ mod tests {
 
     #[test]
     fn preamble_carries_tone_and_ownership_guidance() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
         assert!(prompt.contains("The A is already yours"));
         assert!(prompt.contains("Your competence is a settled fact"));
         assert!(prompt.contains("Take the work seriously. Don't take"));
@@ -3559,11 +3617,11 @@ mod tests {
     #[test]
     fn compose_prompt_is_byte_stable_across_calls() {
         // Suspect #4 from #263: stable prompt churn within a single session.
-        // Two calls with identical personality inputs must produce
+        // Two calls with identical inputs must produce
         // identical bytes — anything else is a cache buster.
-        let a = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
-        let b = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
-        assert_byte_identical("compose_prompt(Personality::Calm)", &a, &b);
+        let a = compose_prompt_with_approval_model_and_shell("codewhale");
+        let b = compose_prompt_with_approval_model_and_shell("codewhale");
+        assert_byte_identical("compose_prompt", &a, &b);
     }
 
     #[test]
@@ -3934,20 +3992,6 @@ mod tests {
         );
     }
 
-    /// #2953 — the Calm overlay (`CALM_PERSONALITY`) stays out of the default
-    /// model-prompt path to keep the static prefix slim. Voice and tone
-    /// guidance travels via the constitution preamble instead.
-    #[test]
-    fn default_prompt_does_not_include_calm_personality_overlay() {
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
-        let calm_text = CALM_PERSONALITY;
-        let first_calm_line = calm_text.lines().find(|l| !l.is_empty()).unwrap_or("");
-        assert!(
-            !prompt.contains(first_calm_line),
-            "default agent prompt must not include the calm personality overlay"
-        );
-    }
-
     #[test]
     fn live_prompt_path_returns_world_state_blocks_with_markers() {
         let tmp = tempdir().expect("tempdir");
@@ -4083,7 +4127,7 @@ mod tests {
     #[test]
     fn default_prompt_stays_under_2953_static_baseline() {
         const ISSUE_2953_BASELINE_CHARS: usize = 30_461;
-        let prompt = compose_prompt_with_approval_model_and_shell(Personality::Calm, "codewhale");
+        let prompt = compose_prompt_with_approval_model_and_shell("codewhale");
 
         assert!(
             prompt.chars().count() < ISSUE_2953_BASELINE_CHARS,

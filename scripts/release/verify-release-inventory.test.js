@@ -10,7 +10,7 @@ const test = require("node:test");
 const { allReleaseAssetNames, CHECKSUM_MANIFEST } = require("../../npm/codewhale/scripts/artifacts");
 const { run } = require("./verify-release-inventory");
 
-const REPO = "Hmbown/CodeWhale";
+const REPO = "codewhale-hq/CodeWhale";
 const TAG = "v0.10.1";
 
 function localAssets(t) {

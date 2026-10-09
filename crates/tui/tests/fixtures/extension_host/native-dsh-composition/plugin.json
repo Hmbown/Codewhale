@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/plugin.json",
+  "name": "native-dsh-composition-example",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "Detached closed composition fixture; global owner contributions, no preset parity claim.",
+  "extensions": {
+    "net.codewhale": {
+      "native": {
+        "path": "native/index.mjs"
+      }
+    }
+  }
+}

@@ -1364,9 +1364,9 @@ mod tests {
             OsString::from("seatbelt"),
         )]);
         assert!(
-            sandboxed
-                .iter()
-                .any(|(key, value)| normalize_key(key) == "CODEWHALE_SANDBOX" && value == "seatbelt"),
+            sandboxed.iter().any(
+                |(key, value)| normalize_key(key) == "CODEWHALE_SANDBOX" && value == "seatbelt"
+            ),
             "sandbox marker must survive"
         );
         assert!(

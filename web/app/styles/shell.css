@@ -10,7 +10,7 @@
   position: sticky;
   z-index: 30;
   top: 0;
-  background: var(--ground), var(--bg);
+  background: var(--ground, var(--bg));
   background-attachment: fixed;
   background-repeat: no-repeat;
   border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
@@ -246,21 +246,16 @@
 .mm-action.paper-install-cta { margin-top: 1.5rem; }
 
 /* ---------- footer — the sea below the horizon ---------- */
-/* Every page descends into the footer through one waterline band
-   (components/strata.tsx): the page's ground above, the logo's deep blue at
-   its floor. The band's floor is the footer's horizon, a straight line of
-   light, and below it the sea, bright at the waterline and deep within a few
-   rows, in both appearances. */
+/* Every page ends on one horizon: a straight line of light, and below it
+   the sea, settling into deep water within a few rows, in both appearances. */
 .site-footer {
   position: relative;
   color: var(--muted);
 }
-/* The band stands on the page's own ground (--page-ground is resolved on
-   :root, before the footer re-declares the stage roles). */
-.site-footer > .waterline { background: var(--page-ground); }
-/* A page whose main already ends in deep water (the home sea) keeps that
-   water behind the band instead of the page ground. */
-main:has(.sea-continues:last-child) + .site-footer > .waterline { background: var(--ocean-floor); }
+/* A page whose main already ends in the sea (home) runs straight on: no
+   second horizon, and the water continues from its floor colour. */
+main:has(.sea-continues:last-child) + .site-footer .site-footer-sea > .horizon { display: none; }
+main:has(.sea-continues:last-child) + .site-footer .site-footer-sea { background: var(--ocean-floor); }
 .site-footer-sea {
   position: relative;
   overflow: hidden;

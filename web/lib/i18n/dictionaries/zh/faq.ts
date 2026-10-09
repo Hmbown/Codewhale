@@ -4,12 +4,12 @@ import type { FaqDict } from "../types";
 export const faq: FaqDict = {
   metaTitle: "常见问题 · Codewhale",
   metaDescription:
-    "Codewhale 常见问题：安装、配置、提供商、模型、模式、安全与隐私。答案来自实际代码、文档和 GitHub 议题。",
+    "关于 Codewhale 安装与配置、提供商、模型、模式、安全与隐私的解答，每条都注明来自代码、文档或 GitHub 议题。",
   eyebrow: "常见问题",
   title: "常见问题",
   titleAside: "FAQ",
   titleAsideLang: "en",
-  lead: "答案来自实际代码、文档、发布说明和 GitHub 议题。每个回答下方标注了信息来源。如有未覆盖的问题，请在 GitHub 上提交 Issue。",
+  lead: "每个回答都注明来源：代码、文档、发布说明或 GitHub 议题。如果没有你的问题，请在 GitHub 上提交 Issue。",
   notCovered: "没找到你的问题？",
   openIssue: "提交 Issue",
   searchPlaceholder: "搜索常见问题",

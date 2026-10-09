@@ -13,7 +13,7 @@ upgrade before reproducing a report when possible.
 
 ## Report a vulnerability privately
 
-Use [GitHub's private vulnerability report form](https://github.com/Hmbown/Codewhale/security/advisories/new).
+Use [GitHub's private vulnerability report form](https://github.com/codewhale-hq/Codewhale/security/advisories/new).
 Private vulnerability reporting is enabled for this repository. GitHub sends
 the report to repository maintainers through a private security advisory.
 Do not open a public issue or pull request containing an unpatched

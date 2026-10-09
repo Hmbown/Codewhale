@@ -12,7 +12,7 @@ export const roadmap: RoadmapDict = {
   eyebrow: "Project roadmap",
   title: "Roadmap",
   introduction:
-    "This page separates completed repository work from work in progress, proposals still being evaluated, and directions intentionally kept out of scope. Roadmap Shipped can include work implemented in a source candidate; the install page and homepage separately identify the latest published package. Release records and GitHub issues refresh these categories when available.",
+    "This page separates published releases from work in progress, proposals still being evaluated, and directions intentionally kept out of scope. Shipped lists the latest GitHub releases, each linked to its release notes. Work in progress — including changes merged in the repository but not yet released — appears under Underway. When the live feed is unavailable, static summaries stand in; the install page and homepage identify the latest published version.",
   sectionTitle: "Work grouped by status",
   browseIssues: "Browse open issues",
   trackCount: "{count} items",

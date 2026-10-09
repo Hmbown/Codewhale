@@ -9,7 +9,7 @@ import { replaceMacBundle, verifyReleaseBundle } from "./install-macos.mjs";
 import { APP_VERSION, APP_NAME, newerVersion } from "../src/app-socket.mjs";
 import { stateDir } from "../src/registry.mjs";
 
-const repository="https://github.com/Hmbown/codewhale-cu-plugin";
+const repository="https://github.com/codewhale-hq/codewhale-cu-plugin";
 const limit=256*1024*1024;
 const updateResultPath=()=>path.join(stateDir(),"update-result.json");
 export function readUpdateResult() {
@@ -36,7 +36,7 @@ export function releaseUpdate(release,current=APP_VERSION) {
   return {available:true,version,url,sha256:asset.digest.slice(7),size:asset.size,message:`Computer Use ${version} is available. Install it to restart the helper; existing computer sessions will stop.`};
 }
 export async function checkForUpdate() {
-  const response=await fetch("https://api.github.com/repos/Hmbown/codewhale-cu-plugin/releases/latest",{redirect:"error",headers:{Accept:"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28"},signal:AbortSignal.timeout(10_000)});
+  const response=await fetch("https://api.github.com/repos/codewhale-hq/codewhale-cu-plugin/releases/latest",{redirect:"error",headers:{Accept:"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28"},signal:AbortSignal.timeout(10_000)});
   if(response.status===404) return {available:false,message:"No stable installer has been published yet. Your current app is unchanged."};
   if(!response.ok) throw new Error(`The update service is unavailable (${response.status}). Try again later.`);
   return releaseUpdate(JSON.parse((await responseBytes(response,1024*1024)).toString("utf8")));

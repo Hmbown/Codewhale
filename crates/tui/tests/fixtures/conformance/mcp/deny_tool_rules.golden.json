@@ -1,0 +1,161 @@
+{
+  "server_received": [
+    {
+      "arguments": {},
+      "method": "tools/call",
+      "name": "echo"
+    },
+    {
+      "method": "resources/read",
+      "uri": "fixture://readme"
+    }
+  ],
+  "steps": [
+    {
+      "op": "boot",
+      "outcome": "ok"
+    },
+    {
+      "op": "catalog",
+      "tools": [
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "List available MCP resources across servers (optionally filtered by server).",
+          "input_schema": {
+            "properties": {
+              "server": {
+                "description": "Optional MCP server name to filter by",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "name": "list_mcp_resources"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "mcp_conformance_echo"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Read a resource from an MCP server using its URI",
+          "input_schema": {
+            "properties": {
+              "server": {
+                "description": "The name of the MCP server",
+                "type": "string"
+              },
+              "uri": {
+                "description": "The URI of the resource to read",
+                "type": "string"
+              }
+            },
+            "required": [
+              "server",
+              "uri"
+            ],
+            "type": "object"
+          },
+          "name": "mcp_read_resource"
+        },
+        {
+          "allowed_callers": [
+            "direct"
+          ],
+          "defer_loading": false,
+          "description": "Alias for mcp_read_resource.",
+          "input_schema": {
+            "properties": {
+              "server": {
+                "description": "The name of the MCP server",
+                "type": "string"
+              },
+              "uri": {
+                "description": "The URI of the resource to read",
+                "type": "string"
+              }
+            },
+            "required": [
+              "server",
+              "uri"
+            ],
+            "type": "object"
+          },
+          "name": "read_mcp_resource"
+        }
+      ]
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": {
+            "content": [
+              {
+                "text": "echo",
+                "type": "text"
+              }
+            ]
+          },
+          "content_blocks": [],
+          "metadata": null,
+          "success": true
+        }
+      },
+      "tool": "mcp_conformance_echo"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "err": {
+          "detail": "Failed to locate tool: Unknown MCP tool name: mcp_conformance_fails",
+          "kind": "not_available"
+        }
+      },
+      "tool": "mcp_conformance_fails"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "err": {
+          "detail": "Failed to locate tool: Unknown MCP tool name: mcp_get_prompt",
+          "kind": "not_available"
+        }
+      },
+      "tool": "mcp_get_prompt"
+    },
+    {
+      "op": "call",
+      "outcome": {
+        "ok": {
+          "content": {
+            "contents": [
+              {
+                "mimeType": "text/plain",
+                "text": "readme\n",
+                "uri": "fixture://readme"
+              }
+            ]
+          },
+          "content_blocks": [],
+          "metadata": null,
+          "success": true
+        }
+      },
+      "tool": "mcp_read_resource"
+    }
+  ]
+}

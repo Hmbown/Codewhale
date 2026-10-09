@@ -1,6 +1,6 @@
 //! Typed model and resolved-route capability descriptors (#3365).
 //!
-//! This module bridges the additive [`crate::model_registry`] facts and the
+//! This module bridges the additive config catalog intrinsic facts and the
 //! provider+model capability matrix in [`crate::config::provider_capability`].
 //! It intentionally keeps intrinsic model facts separate from resolved route
 //! facts so future route resolution can combine catalog offerings, user
@@ -8,8 +8,8 @@
 //! string checks through prompt, tool, and Fleet code.
 #![allow(dead_code)]
 
-use crate::config::{ApiProvider, RequestPayloadMode, provider_capability};
-use crate::model_registry::{self, ModelProvider};
+use crate::config::{ProviderKind, RequestPayloadMode, provider_capability};
+pub use codewhale_config::catalog::reviewed::ModelFamily as ModelProvider;
 use codewhale_config::route::{RouteCapabilities, RouteLimits};
 
 /// Compatibility name for the canonical config-layer three-state fact.
@@ -81,7 +81,7 @@ pub struct CapabilityOverride {
 /// Capabilities after provider route facts and user overrides are applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityProfile {
-    pub provider: ApiProvider,
+    pub provider: ProviderKind,
     pub canonical_model: Option<String>,
     pub wire_model_id: String,
     pub request_payload_mode: RequestPayloadMode,
@@ -135,33 +135,28 @@ impl CapabilityProfile {
 pub fn model_profile(model: &str) -> ModelProfile {
     let trimmed = model.trim();
     let display_name = display_name(trimmed);
-    match model_registry::lookup(trimmed) {
+    match codewhale_config::catalog::reviewed::intrinsic_model(trimmed) {
         Some(meta) => {
-            let canonical_id = if meta.id.is_empty() {
-                trimmed.to_string()
-            } else {
-                meta.id.to_string()
-            };
-            let provenance = if meta.id.is_empty() {
-                FactProvenance::LegacyModelHeuristics
-            } else {
-                FactProvenance::SeededModelRegistry
-            };
+            let canonical_id = meta
+                .canonical_id
+                .clone()
+                .unwrap_or_else(|| trimmed.to_string());
+            let provenance = FactProvenance::SeededModelRegistry;
             ModelProfile {
                 canonical_id,
-                display_name,
-                aliases: Vec::new(),
-                family: Some(meta.provider),
+                display_name: meta.display_name.clone().unwrap_or(display_name),
+                aliases: meta.aliases,
+                family: meta.family,
                 capabilities: IntrinsicCapabilityProfile {
                     context_window: meta.context_window,
-                    max_output: meta.max_output,
-                    reasoning: bool_state(meta.supports_reasoning),
-                    native_tool_calls: SupportState::Unknown,
-                    parallel_tool_calls: SupportState::Unknown,
-                    structured_output: SupportState::Unknown,
-                    streaming: SupportState::Supported,
-                    prompt_caching: SupportState::Unknown,
-                    image_input: SupportState::Unknown,
+                    max_output: meta.generation_default.or(meta.max_output),
+                    reasoning: SupportState::from_optional_bool(meta.reasoning),
+                    native_tool_calls: meta.capabilities.native_tool_calls,
+                    parallel_tool_calls: meta.capabilities.parallel_tool_calls,
+                    structured_output: meta.capabilities.structured_output,
+                    streaming: meta.capabilities.streaming,
+                    prompt_caching: meta.capabilities.prompt_caching,
+                    image_input: meta.capabilities.image_input,
                     tool_surface_budget: tool_surface_for_window(meta.context_window),
                 },
                 provenance,
@@ -196,7 +191,7 @@ pub fn model_profile(model: &str) -> ModelProfile {
 /// [`resolved_capability_profile_for_route`], where exact offering facts win.
 #[must_use]
 pub fn resolved_capability_profile(
-    provider: ApiProvider,
+    provider: ProviderKind,
     wire_model_id: &str,
 ) -> CapabilityProfile {
     resolved_capability_profile_with_overrides(
@@ -209,7 +204,7 @@ pub fn resolved_capability_profile(
 /// Resolve legacy fallback capabilities and apply explicit overrides last.
 #[must_use]
 pub fn resolved_capability_profile_with_overrides(
-    provider: ApiProvider,
+    provider: ProviderKind,
     wire_model_id: &str,
     overrides: CapabilityOverride,
 ) -> CapabilityProfile {
@@ -277,7 +272,7 @@ pub fn resolved_capability_profile_with_overrides(
 /// remains visible in provenance.
 #[must_use]
 pub fn resolved_capability_profile_for_route(
-    provider: ApiProvider,
+    provider: ProviderKind,
     wire_model_id: &str,
     route_capabilities: RouteCapabilities,
     route_limits: RouteLimits,
@@ -319,7 +314,7 @@ pub fn resolved_capability_profile_for_route(
 /// Resolve an exact route profile, then apply explicit user/config overrides.
 #[must_use]
 pub fn resolved_capability_profile_for_route_with_overrides(
-    provider: ApiProvider,
+    provider: ProviderKind,
     wire_model_id: &str,
     route_capabilities: RouteCapabilities,
     route_limits: RouteLimits,
@@ -453,7 +448,7 @@ mod tests {
     #[test]
     fn resolved_capability_profile_merges_provider_facts_and_overrides() {
         let profile = resolved_capability_profile_with_overrides(
-            ApiProvider::OpenaiCodex,
+            ProviderKind::OpenaiCodex,
             "gpt-5-codex",
             CapabilityOverride {
                 context_window: Some(123_456),
@@ -463,7 +458,7 @@ mod tests {
             },
         );
 
-        assert_eq!(profile.provider, ApiProvider::OpenaiCodex);
+        assert_eq!(profile.provider, ProviderKind::OpenaiCodex);
         assert_eq!(profile.request_payload_mode, RequestPayloadMode::Responses);
         assert_eq!(profile.context_window, Some(123_456));
         assert_eq!(profile.reasoning, SupportState::Unsupported);
@@ -474,9 +469,9 @@ mod tests {
 
     #[test]
     fn capability_predicates_are_not_provider_string_checks() {
-        let broad = resolved_capability_profile(ApiProvider::Deepseek, "deepseek-v4-pro");
+        let broad = resolved_capability_profile(ProviderKind::Deepseek, "deepseek-v4-pro");
         let compact = resolved_capability_profile_with_overrides(
-            ApiProvider::Openrouter,
+            ProviderKind::Openrouter,
             "unknown-small-model",
             CapabilityOverride {
                 context_window: Some(32_000),
@@ -497,7 +492,7 @@ mod tests {
     #[test]
     fn exact_route_facts_override_legacy_provider_heuristics() {
         let profile = resolved_capability_profile_for_route(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "gpt-5.4",
             RouteCapabilities {
                 reasoning: SupportState::Unsupported,
@@ -533,7 +528,7 @@ mod tests {
     #[test]
     fn explicit_override_wins_after_exact_route_fact() {
         let profile = resolved_capability_profile_for_route_with_overrides(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "gpt-5.4",
             RouteCapabilities {
                 reasoning: SupportState::Unsupported,
@@ -556,7 +551,7 @@ mod tests {
     #[test]
     fn image_input_route_fact_and_override_are_explicit() {
         let sourced = resolved_capability_profile_for_route(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "vision-fixture",
             RouteCapabilities {
                 image_input: SupportState::Supported,
@@ -567,7 +562,7 @@ mod tests {
         assert!(sourced.supports_image_input());
 
         let overridden = resolved_capability_profile_for_route_with_overrides(
-            ApiProvider::Openai,
+            ProviderKind::Openai,
             "vision-fixture",
             RouteCapabilities::default(),
             RouteLimits::default(),

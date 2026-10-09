@@ -11,8 +11,8 @@ export const docsShell: DocsShellDict = {
   metaDescription:
     "安装 Codewhale，连接模型提供商，然后把事情做完：模式与审批、查看改动、工作流、子智能体、MCP 工具、钩子、Runtime API 以及问题排查。",
   portalMark: "Codewhale 文档",
-  heroTitle: "用 Codewhale 把事情做完。",
-  heroLead: "从你想做的事开始。每一页都会说明你需要准备什么，给出今天就能运行的命令，并指向下一步。",
+  heroTitle: "安装与使用 Codewhale",
+  heroLead: "查找安装步骤、模型连接、工具配置和问题排查指南。每份指南都包含可以运行的命令和示例。",
   installCta: "安装 Codewhale",
 
   releaseLabel: "版本",
@@ -43,8 +43,8 @@ export const docsShell: DocsShellDict = {
   breadcrumbHome: "首页",
   breadcrumbDocs: "文档",
 
-  helpTitle: "这一页还不够？",
-  helpLead: "每份指南都对照仓库中的一份文档核实过。如果它写错了或缺了什么，请在维护者能看到的地方告诉我们。",
+  helpTitle: "获取帮助",
+  helpLead: "在 Discord 提问，或在 GitHub 报告文档问题。",
   helpSource: "来源：{name}",
   helpTroubleshooting: "排查问题",
   helpFaq: "常见问题",

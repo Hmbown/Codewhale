@@ -42,6 +42,113 @@ fn every_surface_is_named_by_the_subcommand_not_the_executable() {
 }
 
 #[test]
+fn an_embedder_may_name_the_server_it_started() {
+    // The one surface a third party legitimately starts, and the one they may
+    // therefore declare. The editor extension's case.
+    assert_eq!(
+        embedded_surface_override_from(Some("vscode-extension".to_string())),
+        Some(Surface::VscodeExtension)
+    );
+    assert_eq!(
+        embedded_surface_override_from(Some("desktop".to_string())),
+        Some(Surface::Desktop)
+    );
+    // Surrounding whitespace is a shell artifact, not a different name.
+    assert_eq!(
+        embedded_surface_override_from(Some(" vscode-extension\n".to_string())),
+        Some(Surface::VscodeExtension)
+    );
+    assert_eq!(
+        embedded_surface_override_from(None),
+        None,
+        "an unset variable declares nothing"
+    );
+}
+
+#[test]
+fn the_interactive_surface_can_never_be_declared_by_an_embedder() {
+    // Nothing starts the terminal UI on a user's behalf: a server reporting
+    // itself as `tui` would land in the one surface whose numbers are the
+    // terminal's.
+    assert_eq!(
+        embedded_surface_override_from(Some("tui".to_string())),
+        None
+    );
+    assert_eq!(
+        embedded_surface_override_from(Some(" tui ".to_string())),
+        None
+    );
+}
+
+#[test]
+fn an_unknown_surface_name_is_dropped_rather_than_guessed_at() {
+    // Not an error and not a repair: a name outside the closed set falls back
+    // to the caller's default. `vscode` and `ide` are the likely typos and are
+    // deliberately not aliases of anything.
+    for name in [
+        "",
+        "  ",
+        "vscode",
+        "ide",
+        "TUI",
+        "VSCODE-EXTENSION",
+        "unknown",
+    ] {
+        assert_eq!(
+            embedded_surface_override_from(Some(name.to_string())),
+            None,
+            "{name:?} must not resolve to a surface"
+        );
+    }
+}
+
+#[test]
+fn the_declared_surface_is_consulted_for_the_server_and_nowhere_else() {
+    // The variable is inherited by descendants, and an agent's shell command
+    // runs codewhale descendants with this environment. Only the branch that
+    // *is* an embedder's server may consult it, so a nested `exec` cannot
+    // report itself as the embedder.
+    let declared = Some(Surface::VscodeExtension);
+
+    assert_eq!(telemetry_surface_with(None, declared), Surface::Tui);
+    assert_eq!(
+        telemetry_surface_with(
+            command_of(&["codewhale-tui", "exec", "hello"]).as_ref(),
+            declared
+        ),
+        Surface::Exec
+    );
+    assert_eq!(
+        telemetry_surface_with(command_of(&["codewhale-tui", "doctor"]).as_ref(), declared),
+        Surface::Cli
+    );
+    // An MCP server still says so; it is decided before the declaration.
+    assert_eq!(
+        telemetry_surface_with(
+            command_of(&["codewhale-tui", "serve", "--mcp"]).as_ref(),
+            declared
+        ),
+        Surface::McpServer
+    );
+    // Only the plain server picks the declared name up…
+    assert_eq!(
+        telemetry_surface_with(
+            command_of(&["codewhale-tui", "serve", "--http"]).as_ref(),
+            declared
+        ),
+        Surface::VscodeExtension
+    );
+    // …and with nothing declared it is an anonymous server, exactly as before.
+    assert_eq!(
+        telemetry_surface_with(
+            command_of(&["codewhale-tui", "serve", "--http"]).as_ref(),
+            None
+        ),
+        Surface::Serve
+    );
+}
+
+#[test]
 fn read_only_commands_never_arm_usage_counting() {
     for args in [
         vec!["codewhale-tui", "doctor"],

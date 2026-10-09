@@ -1,0 +1,35 @@
+{
+  "description": "A server advertising one tool more than McpCatalogBudget allows (MAX_MCP_CATALOG_ITEMS = 4096). Pins Rust McpCatalogBudget::observe_page: discovery fails, the server advertises nothing, and a call to one of its tools never reaches it. The negative control puts the same server exactly on the cap and must see it connect.",
+  "server_name": "conformance",
+  "expect_boot": "error",
+  "server": {
+    "initialize": {
+      "result": {
+        "protocolVersion": "2025-06-18",
+        "serverInfo": {
+          "name": "catalog-fixture",
+          "version": "1.0.0"
+        },
+        "capabilities": {
+          "tools": {}
+        }
+      }
+    },
+    "tools/list": {
+      "generate_tools": {
+        "count": 4097,
+        "prefix": "bulk"
+      }
+    }
+  },
+  "steps": [
+    {
+      "op": "catalog"
+    },
+    {
+      "op": "call",
+      "tool": "mcp_conformance_bulk-00000",
+      "input": {}
+    }
+  ]
+}

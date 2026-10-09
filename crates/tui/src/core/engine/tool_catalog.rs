@@ -14,7 +14,9 @@ use serde_json::{Value, json};
 #[cfg(test)]
 use crate::mcp::McpPool;
 use crate::model_profile::ToolSurfaceBudget;
-use crate::tools::spec::{ToolError, ToolResult, optional_str, optional_u64, required_str};
+use crate::tools::spec::{
+    ToolContext, ToolError, ToolResult, optional_str, optional_u64, required_str,
+};
 use codewhale_config::AppMode;
 use codewhale_models::Tool;
 
@@ -27,14 +29,14 @@ pub(crate) const MULTI_TOOL_PARALLEL_NAME: &str = "multi_tool_use.parallel";
 pub(crate) const REQUEST_USER_INPUT_NAME: &str = "request_user_input";
 pub(crate) const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
 const CODE_EXECUTION_TOOL_TYPE: &str = "code_execution_20250825";
-const CODE_EXECUTION_DESCRIPTION: &str = "Execute Python code with the local Python interpreter in the workspace and return stdout/stderr/return_code as JSON.";
+const CODE_EXECUTION_DESCRIPTION: &str = "Execute Python code with the local Python interpreter using this call's execution policy and return stdout/stderr/return_code as JSON.";
 pub(super) use crate::tools::codemode::EXECUTE_TOOLS_TOOL_NAME;
 pub(super) use crate::tools::js_execution::JS_EXECUTION_TOOL_NAME;
 pub(crate) const TOOL_SEARCH_NAME: &str = "tool_search";
 const TOOL_RESULT_RETRIEVAL_NAME: &str = "retrieve_tool_result";
 const TOOL_SEARCH_TYPE: &str = "tool_search_20251119";
-const LEGACY_TOOL_SEARCH_REGEX_NAME: &str = "tool_search_tool_regex";
-const LEGACY_TOOL_SEARCH_BM25_NAME: &str = "tool_search_tool_bm25";
+pub(super) const LEGACY_TOOL_SEARCH_REGEX_NAME: &str = "tool_search_tool_regex";
+pub(super) const LEGACY_TOOL_SEARCH_BM25_NAME: &str = "tool_search_tool_bm25";
 const TOOL_SEARCH_DEFAULT_MAX_RESULTS: usize = 8;
 const TOOL_SEARCH_MAX_RESULTS_LIMIT: usize = 8;
 
@@ -49,7 +51,7 @@ pub(crate) fn is_tool_search_tool(name: &str) -> bool {
 #[rustfmt::skip]
 pub(crate) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
     // Core work controls are eager; specialized tools stay searchable.
-    "read", "write", "edit", "bash", "agent", "workflow", "todo_write",
+    "read", "write", "edit", "file_search", "bash", "agent", "workflow", "todo_write",
     // Continuation instructions require these controls. Hiding them behind
     // discovery leaves a model unable to stop the work it was asked to run.
     "create_goal", "get_goal", "update_goal",
@@ -75,12 +77,12 @@ const CORE_ACTION_TOOL_FALLBACKS: &[CoreActionToolFallback] = &[
     CoreActionToolFallback {
         name: "write",
         description: "Create or replace workspace files.",
-        unavailable_reason: "Not present in the current model-visible catalog. Plan mode has no file-mutation authority; switch to Work mode before writing.",
+        unavailable_reason: "Not present in the current model-visible catalog. Plan mode has no file-writing authority; the user can change modes with /mode.",
     },
     CoreActionToolFallback {
         name: "edit",
         description: "Apply exact replacements to workspace files.",
-        unavailable_reason: "Not present in the current model-visible catalog. Plan mode has no file-mutation authority; switch to Work mode before editing.",
+        unavailable_reason: "Not present in the current model-visible catalog. Plan mode has no file-writing authority; the user can change modes with /mode.",
     },
 ];
 
@@ -321,7 +323,16 @@ pub(crate) fn ensure_advanced_tooling(
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "code": { "type": "string", "description": "Python source code to execute." }
+                    "code": { "type": "string", "description": "Python source code to execute." },
+                    "sandbox_permissions": {
+                        "type": "string",
+                        "enum": ["workspace-write", "danger-full-access"],
+                        "description": "Request a wider policy for this exact execution after a sandbox denial; requires justification and explicit user approval."
+                    },
+                    "justification": {
+                        "type": "string",
+                        "description": "Required with sandbox_permissions: why this exact code needs wider access."
+                    }
                 },
                 "required": ["code"]
             }),
@@ -602,6 +613,21 @@ impl ToolSurfacePolicy {
 
     pub(super) fn passes_allow_list(&self, name: &str) -> bool {
         tool_allowed(self.allowed_tools.as_deref(), name)
+    }
+
+    /// A configured-server handshake may only serve this captured turn's
+    /// MCP namespace. Do not replace the command-scoped ceiling with config.
+    pub(super) fn permits_mcp_discovery(&self, server: &str) -> bool {
+        !crate::mcp::McpPool::server_denied_by(
+            self.disallowed_tools.as_deref().unwrap_or_default(),
+            server,
+        ) && self.allowed_tools.as_ref().is_none_or(|rules| {
+            let normalized = rules
+                .iter()
+                .map(|rule| rule.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            crate::mcp::tool_selection_covers_server(&normalized, server)
+        })
     }
 
     pub(super) fn denies_tool(&self, name: &str) -> bool {
@@ -1606,50 +1632,33 @@ pub(super) fn describe_tools_for_program(
         .map_err(|error| ToolError::execution_failed(error.to_string()))
 }
 
+/// Runs under the effective per-call policy, including an explicitly approved
+/// elevation. Shared-launcher platform limits still apply; this is not a
+/// persistent REPL. Code arrives on stdin so sandbox-private /tmp is harmless.
 pub(super) async fn execute_code_execution_tool(
     input: &serde_json::Value,
     workspace: &Path,
+    context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
     let code = required_str(input, "code")?;
-
-    // Resolve the locally-installed Python interpreter we cached at
-    // catalog-build time. If it's absent now (somehow registered but
-    // disappeared between startup and this call — concurrent uninstall,
-    // PATH change, etc.) the ExternalTool::tokio_command() will return
-    // None and we fail fast with a clear message.
-    //
-    // Write the code to a temp file and execute it as a script rather
-    // than passing it via `-c "<code>"`. Reasons:
-    //   * `-c` has length limits (argv) on Windows.
-    //   * Multiline code with quote nesting is brittle through `-c`.
-    //   * Tracebacks reference a real filename instead of `<string>`,
-    //     so the model can interpret line numbers correctly.
-    // Tempfile lives only for the duration of this execution; Drop
-    // removes it. We use `.py` so any shebang / encoding-sniffer
-    // logic in the interpreter behaves normally.
-    let temp_dir = tempfile::tempdir()
-        .map_err(|e| ToolError::execution_failed(format!("tempdir failed: {e}")))?;
-    let script_path = temp_dir.path().join("code_execution.py");
-    tokio::fs::write(&script_path, code)
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
-
-    let mut cmd = crate::dependencies::Python::tokio_command().ok_or_else(|| {
-        ToolError::execution_failed(
-            "code_execution: Python interpreter became unavailable".to_string(),
-        )
+    let interpreter = crate::dependencies::Python::resolve().ok_or_else(|| {
+        ToolError::execution_failed("code_execution: Python interpreter became unavailable")
     })?;
-    cmd.arg(&script_path).current_dir(workspace);
-
-    // Contained: at the timeout (or a cancelled turn) the interpreter and
-    // anything the script started die together; a bare `output()` left both
-    // running.
+    let (program, mut args) = crate::dependencies::split_interpreter_spec(&interpreter);
+    args.push("-".to_string());
+    let budget = Duration::from_secs(120);
+    let mut cmd =
+        crate::tools::shell::sandboxed_runner_command(context, &program, args, workspace, budget)?;
+    // Match the UTF-8 decoder below, including Windows Python's piped output.
+    cmd.env("PYTHONIOENCODING", "utf-8");
     let output = tokio::time::timeout(
-        Duration::from_secs(120),
-        crate::process_tree::contained_output(&mut cmd),
+        budget,
+        crate::process_tree::contained_output_with_input(&mut cmd, code.as_bytes().to_vec()),
     )
     .await
-    .map_err(|_| ToolError::Timeout { seconds: 120 })
+    .map_err(|_| ToolError::Timeout {
+        seconds: budget.as_secs(),
+    })
     .and_then(|res| res.map_err(|e| ToolError::execution_failed(e.to_string())))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();

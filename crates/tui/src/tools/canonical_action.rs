@@ -218,7 +218,7 @@ pub(crate) mod tests {
     /// offers. `retired_names_are_not_model_visible` pins that invariant.
     ///
     /// `list_dir`, `file_search`, and `grep_files` are deliberately absent:
-    /// they are live, model-visible (deferred) tools, not retired names
+    /// they are live, model-visible tools, not retired names
     /// (#6747).
     const RETIRED_TOOL_NAMES: &[&str] = &[
         "read_file",
@@ -254,7 +254,7 @@ pub(crate) mod tests {
             .with_web_tools()
             .with_patch_tools()
             .with_handle_tools()
-            .with_rlm_tool(None, String::new())
+            .with_rlm_tool()
             .build(ToolContext::new(root.to_path_buf()))
     }
 

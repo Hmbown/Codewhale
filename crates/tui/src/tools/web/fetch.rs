@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures_util::StreamExt;
 use serde::Serialize;
 
+use super::adapter::AdapterResult;
 use super::cache::{self, CachedFetch};
 use super::extract::is_js_shell_error;
 use super::guard::{
@@ -26,7 +27,7 @@ const MAX_REDIRECTS: usize = 5;
 const USER_AGENT: &str = concat!(
     "Mozilla/5.0 (compatible; codewhale/",
     env!("CARGO_PKG_VERSION"),
-    "; +https://github.com/Hmbown/CodeWhale)"
+    "; +https://github.com/codewhale-hq/CodeWhale)"
 );
 
 #[derive(Debug, Clone)]
@@ -184,7 +185,7 @@ fn cache_state_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, S
 /// and a higher-ranked borrow of the payload would force the returned future
 /// to outlive the tool context it reads.
 pub(crate) type ExtractFuture<'a, T> =
-    std::pin::Pin<Box<dyn Future<Output = Result<T, ToolError>> + Send + 'a>>;
+    std::pin::Pin<Box<dyn Future<Output = AdapterResult<T>> + Send + 'a>>;
 
 /// A fetch that produced a readable document, plus the attempts it took.
 #[derive(Debug)]
@@ -301,7 +302,8 @@ where
             // second request can fix: the first response may have been a
             // cached client-side shell.
             Err(error)
-                if is_js_shell_error(&error)
+                if error.content()
+                    && is_js_shell_error(&error.error)
                     && (200..300).contains(&payload.status)
                     && mode == CacheMode::Default =>
             {
@@ -309,10 +311,10 @@ where
             }
             Err(error) => {
                 attempts.push(record);
-                return Err(if is_js_shell_error(&error) {
+                return Err(if error.content() && is_js_shell_error(&error.error) {
                     js_shell_failure(&final_url, &attempts, context)
                 } else {
-                    error
+                    error.error
                 });
             }
         }

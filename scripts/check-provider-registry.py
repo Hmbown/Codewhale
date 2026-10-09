@@ -6,7 +6,7 @@ the stable identifiers and default strings that are easy for docs to drift from:
 
 - canonical ProviderKind IDs
 - provider TOML tables
-- live TUI ApiProvider IDs
+- descriptor-owned released presentation identities
 - shipped-provider table rows
 - static ModelRegistry provider rows
 - default provider model/base URL constants
@@ -14,6 +14,7 @@ the stable identifiers and default strings that are easy for docs to drift from:
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -27,7 +28,7 @@ PROVIDER_RS = ROOT / "crates" / "config" / "src" / "provider.rs"
 TUI_CONFIG_RS = ROOT / "crates" / "tui" / "src" / "config.rs"
 # Default provider model/base-URL constants were split out of config.rs into
 # this leaf module (#3311); read them from there for the default-string check.
-TUI_CONFIG_MODELS_RS = ROOT / "crates" / "tui" / "src" / "config" / "models.rs"
+PROVIDER_DATA = ROOT / "crates" / "config" / "assets" / "provider_descriptors.json"
 AGENT_RS = ROOT / "crates" / "agent" / "src" / "lib.rs"
 PROVIDERS_MD = ROOT / "docs" / "PROVIDERS.md"
 CONFIGURATION_MD = ROOT / "docs" / "CONFIGURATION.md"
@@ -40,7 +41,6 @@ TUI_PROVIDER_READINESS_RS = ROOT / "crates" / "tui" / "src" / "provider_readines
 TUI_LIB_RS = ROOT / "crates" / "tui" / "src" / "lib.rs"
 
 
-API_PROVIDER_ONLY_IDS = {"deepseek-cn"}
 LEGACY_PROVIDER_TOMBSTONE_IDS = {"antigravity"}
 LEGACY_PROVIDER_TOMBSTONE_TABLES = {"antigravity"}
 LEGACY_PROVIDER_SELECTION_IDS = {"antigravity", "agy"}
@@ -112,125 +112,49 @@ def extract_match_block(
     raise ValueError(f"could not parse match block after {signature!r}")
 
 
+def provider_data() -> dict:
+    data = json.loads(read(PROVIDER_DATA))
+    if data.get("schema_version") != 3 or len(data.get("providers", [])) != 52:
+        raise ValueError("unsupported or incomplete provider metadata")
+    rows = [*data["providers"], data.get("legacy_tui", {})]
+    fields = ("id", "kind", "tui_wire_tag", "config_key", "catalog_id", "catalog_source_id")
+    if len(rows) != 53 or any(any(not isinstance(row.get(field), str) or not row[field] for field in fields) for row in rows):
+        raise ValueError("incomplete released presentation metadata")
+    for field in ("id", "tui_wire_tag", "tui_order"):
+        if len({row.get(field) for row in rows}) != len(rows):
+            raise ValueError(f"duplicate presentation {field}")
+    if {row["tui_order"] for row in rows} != set(range(len(rows))):
+        raise ValueError("noncontiguous released presentation order")
+    if data["legacy_tui"]["kind"] not in {row["kind"] for row in data["providers"]}:
+        raise ValueError("legacy presentation has no intrinsic provider")
+    return data
+
+
 def parse_aliases_for_variant(source: str, enum_name: str, variant: str, context: str) -> set[str]:
-    # `ProviderKind`'s enum + identity impl (incl. `parse`) live in
-    # provider_kind.rs after the config module split; read the impl from there
-    # regardless of the file the caller passed for other lookups.
-    if enum_name == "ProviderKind":
-        source = read(PROVIDER_KIND_RS)
-        context = "crates/config/src/provider_kind.rs"
-    impl_start = require_index(source, f"impl {enum_name}", context)
-    block = extract_match_block(
-        source,
-        "pub fn parse(value: &str) -> Option<Self>",
-        context,
-        impl_start,
-    )
-    match_arm = re.search(
-        rf'((?:"[^"]+"\s*\|\s*)*"[^"]+")\s*=>\s*Some\(Self::{variant}\)',
-        block,
-    )
-    if match_arm:
-        return set(re.findall(r'"([^"]+)"', match_arm.group(1)))
-    if enum_name in {"ProviderKind", "ApiProvider"}:
-        provider_rs = read(PROVIDER_RS)
-        provider_macro = re.search(
-            rf'provider!\(\s*\n\s*\w+,\s*\n\s*{variant},\s*\n\s*"([^"]+)".*?'
-            r"aliases:\s*\[(.*?)\]\s*\);",
-            provider_rs,
-            re.DOTALL,
-        )
-        if provider_macro:
-            return {provider_macro.group(1)} | set(
-                re.findall(r'"([^"]+)"', provider_macro.group(2))
-            )
-    raise ValueError(f"{context}: missing parse arm for {variant}")
+    # Both selectors delegate aliases to the same descriptor-backed facade.
+    for row in provider_data()["providers"]:
+        if row["kind"] == variant:
+            return {row["id"], *row["aliases"]}
+    raise ValueError(f"{context}: missing descriptor for {variant}")
 
 
 def provider_kind_ids(config_rs: str) -> dict[str, str]:
-    provider_rs = read(PROVIDER_RS)
-    pairs = re.findall(
-        r"provider!\(\s*\n\s*\w+,\s*\n\s*(\w+),\s*\n\s*\"([^\"]+)\"",
-        provider_rs,
-    )
-    ids: dict[str, str] = {variant: provider_id for variant, provider_id in pairs}
-    # Providers with non-fixed wire policy or custom auth behavior use manual
-    # impls rather than the provider!() macro. Discover them by shape rather
-    # than by name: a hand-maintained roster here goes stale the first time
-    # someone adds a provider, which is exactly how this guard first failed
-    # (it had never heard of `concentrate`).
-    for variant_name, id_literal in re.findall(
-        r'impl\s+Provider\s+for\s+(\w+)\s*\{.*?fn\s+id\s*\([^)]*\)[^{]*\{\s*"([^"]+)"',
-        provider_rs,
-        flags=re.DOTALL,
-    ):
-        # `Custom` is a meta provider, not a shipped vendor row: it is
-        # handled by META_PROVIDER_TABLES and must stay out of the canonical
-        # id set, or the shipped-row and TOML-table checks contradict.
-        if variant_name == "Custom":
-            continue
-        ids.setdefault(variant_name, id_literal)
-    # Kept as an explicit floor: if the shape scan ever stops matching one of
-    # these, the guard should fail loudly rather than silently cover less.
-    for variant_name, id_literal in [
-        ("Deepseek", "deepseek"),
-        ("DeepseekAnthropic", "deepseek-anthropic"),
-        ("OpenaiCodex", "openai-codex"),
-        ("Anthropic", "anthropic"),
-        ("Openmodel", "openmodel"),
-        ("MinimaxAnthropic", "minimax-anthropic"),
-        ("OpencodeZen", "opencode-zen"),
-        # Alibaba Model Studio ships four plan/dialect identities, each with a
-        # hand-written impl Provider for the same reason as the rows above:
-        # the wire policy is not fixed, so provider!() cannot express them.
-        ("ModelstudioTokenPlan", "modelstudio-token-plan"),
-        ("ModelstudioTokenPlanAnthropic", "modelstudio-token-plan-anthropic"),
-        ("ModelstudioCodingPlan", "modelstudio-coding-plan"),
-        ("ModelstudioCodingPlanAnthropic", "modelstudio-coding-plan-anthropic"),
-    ]:
-        match = re.search(
-            rf'impl\s+Provider\s+for\s+{variant_name}.*?fn\s+id.*?\"({id_literal})\"',
-            provider_rs, re.DOTALL,
-        )
-        if match:
-            ids[variant_name] = match.group(1)
-        elif variant_name not in ids:
-            raise ValueError(
-                f"expected a hand-written `impl Provider for {variant_name}` "
-                f"with id {id_literal!r}; the guard's floor is stale"
-            )
-    if not ids:
-        raise ValueError("provider!() invocations returned no providers")
+    rows = provider_data()["providers"]
+    ids = {row["kind"]: row["id"] for row in rows if row["kind"] != "Custom"}
+    if len({row["kind"] for row in rows}) != len(rows) or len({row["id"] for row in rows}) != len(rows):
+        raise ValueError("duplicate built-in descriptor identity")
     return ids
 
 
-def provider_kind_catalog_ids(
-    provider_kind_rs: str, variant_to_id: dict[str, str]
-) -> set[str]:
-    catalog = re.search(
-        r"pub const ALL:\s*\[Self;\s*\d+\]\s*=\s*\[(.*?)\];",
-        provider_kind_rs,
-        flags=re.DOTALL,
-    )
-    if catalog is None:
-        raise ValueError("crates/config/src/provider_kind.rs: missing ProviderKind::ALL")
-    variants = set(re.findall(r"Self::(\w+)", catalog.group(1)))
-    catalog_variant_to_id = {**variant_to_id, "Custom": "custom"}
-    missing = variants - set(catalog_variant_to_id)
-    if missing:
-        raise ValueError(f"ProviderKind::ALL uses unknown variants: {sorted(missing)}")
-    return {catalog_variant_to_id[variant] for variant in variants}
+def provider_kind_catalog_ids(provider_kind_rs: str, variant_to_id: dict[str, str]) -> set[str]:
+    if not re.search(r"pub const ALL:.*?=\s*crate::descriptors::SELECTABLE_PROVIDER_KINDS;", provider_kind_rs):
+        raise ValueError("ProviderKind::ALL must use generated descriptor selection")
+    return {row["id"] for row in provider_data()["providers"] if row["selectable"]}
 
 
-def api_provider_ids(tui_config_rs: str) -> dict[str, str]:
-    # ApiProvider ids derive from ProviderKind ids (via delegation to .kind().as_str())
-    # plus the legacy "deepseek-cn" variant that exists only in ApiProvider.
-    variant_to_id = provider_kind_ids("")
-    # ApiProvider::SiliconflowCn maps to ProviderKind::SiliconflowCN
-    if "SiliconflowCN" in variant_to_id:
-        variant_to_id["SiliconflowCn"] = variant_to_id["SiliconflowCN"]
-    variant_to_id["DeepseekCN"] = "deepseek-cn"
-    return variant_to_id
+def presentation_provider_ids() -> set[str]:
+    data = provider_data()
+    return {row["id"] for row in [*data["providers"], data["legacy_tui"]] if row["kind"] != "Custom"}
 
 
 def provider_tables(config_rs: str) -> set[str]:
@@ -283,41 +207,26 @@ def report_provider_kind_selector_contract(provider_kind_rs: str) -> list[str]:
 
 
 def report_tui_catalog_contract(tui_config_rs: str) -> list[str]:
-    start = require_index(
-        tui_config_rs, "pub fn catalog() -> &'static [Self]", "ApiProvider::catalog"
-    )
-    end = require_index(
-        tui_config_rs, "pub fn catalog_identity", "ApiProvider::catalog", start
-    )
-    catalog = tui_config_rs[start:end]
-    errors: list[str] = []
-    if (
-        "codewhale_config::ProviderKind::ALL" not in catalog
-        or "Antigravity" in catalog
-    ):
-        errors.append(
-            "ApiProvider::catalog must derive from ProviderKind::ALL without "
-            "legacy Antigravity"
-        )
-
-    impl_start = require_index(tui_config_rs, "impl ApiProvider", "ApiProvider impl")
-    parse_start = require_index(
-        tui_config_rs,
-        "pub fn parse(value: &str) -> Option<Self>",
-        "ApiProvider::parse",
-        impl_start,
-    )
-    parse_end = require_index(
-        tui_config_rs, "pub fn as_str", "ApiProvider::parse", parse_start
-    )
-    selector = tui_config_rs[parse_start:parse_end]
-    if (
-        "is_legacy_antigravity_identity(trimmed)" not in selector
-        or "return None" not in selector
-    ):
-        errors.append(
-            "ApiProvider::parse must reject both retired Antigravity config identities"
-        )
+    errors = []
+    if re.search(r"(?:enum|impl|type)\s+ApiProvider\b|KIND_LOOKUP|FROM_KIND_LOOKUP", tui_config_rs):
+        errors.append("TUI must not define a duplicate provider enum or ordinal bridge")
+    # The exact private historical enum in config/tests.rs is the serde
+    # counterpart, not a production owner. Check every other Rust consumer.
+    counterpart = ROOT / "crates/tui/src/config/tests.rs"
+    for path in (ROOT / "crates").rglob("*.rs"):
+        source = read(path)
+        if path != counterpart and re.search(r"\bApiProvider\b", source):
+            errors.append(f"retired provider enum consumer: {path.relative_to(ROOT)}")
+        if re.search(r"KIND_LOOKUP|FROM_KIND_LOOKUP|ProviderKind::from_kind\(", source):
+            errors.append(f"retired provider ordinal bridge: {path.relative_to(ROOT)}")
+    for signature in ("pub(crate) fn active_provider_identity", "pub(crate) fn provider_identities", "pub(crate) fn resolve_provider_selection_identity", "pub(crate) fn verify_provider_identity"):
+        if signature not in tui_config_rs:
+            errors.append(f"missing canonical config identity boundary: {signature}")
+    descriptor_source = read(ROOT / "crates/config/src/descriptors.rs")
+    if "PROVIDER_COMPATIBILITY" not in descriptor_source or "pub fn compatibility_for_selector" not in descriptor_source:
+        errors.append("released presentation identities must use the existing generated descriptor owner")
+    if "is_legacy_antigravity_identity(requested)" not in tui_config_rs:
+        errors.append("explicit provider selection must refuse retired Antigravity aliases")
     return errors
 
 
@@ -344,16 +253,16 @@ def report_tombstone_runtime_contract(
         )
 
     if (
-        "provider == ApiProvider::Antigravity || provider.kind().is_none()"
+        "provider == ProviderKind::Antigravity"
         not in tui_provider_readiness_rs
     ):
         errors.append(
             "provider_readiness::credential_state_for_provider must classify "
-            "ApiProvider::Antigravity as CredentialState::Legacy"
+            "ProviderKind::Antigravity as CredentialState::Legacy"
         )
 
     if "for provider in doctor_api_key_providers()" not in tui_lib_rs or (
-        "*provider != crate::config::ApiProvider::Antigravity" not in tui_lib_rs
+        "*provider != crate::config::ProviderKind::Antigravity" not in tui_lib_rs
     ):
         errors.append(
             "`codewhale doctor` API Keys rows must iterate doctor_api_key_providers() "
@@ -486,26 +395,12 @@ def report_antigravity_public_contract(
             if marker.lower() in source.lower():
                 errors.append(f"{context} contains forbidden {description}")
 
-    for context, source, exclusion_name, exclusion_filter in [
-        (
-            "web/scripts/facts-lib.mjs",
-            web_facts_lib,
-            "EXCLUDED_PROVIDERS",
-            ".filter((v) => !EXCLUDED_PROVIDERS.has(v))",
-        ),
-        (
-            "web/lib/facts-drift.ts",
-            web_facts_drift,
-            "EXCLUDED",
-            ".filter((v) => !EXCLUDED.has(v))",
-        ),
-    ]:
-        exclusion_decl = re.search(
-            rf"const\s+{exclusion_name}\s*=\s*new Set\(\[[^\]]*\"Antigravity\"",
-            source,
-        )
-        if exclusion_decl is None or exclusion_filter not in source:
-            errors.append(f"{context} does not explicitly exclude legacy Antigravity")
+    projection = read(ROOT / "web/lib/provider-descriptors.mjs")
+    if 'row.retired || row.kind === "Antigravity" || row.kind === "Custom"' not in projection:
+        errors.append("shared website descriptor projection must exclude retired/Antigravity/custom rows")
+    for context, source in [("web/scripts/facts-lib.mjs", web_facts_lib), ("web/lib/facts-drift.ts", web_facts_drift)]:
+        if "parseProviderDescriptors" not in source:
+            errors.append(f"{context} must use the shared validated descriptor projection")
         if re.search(r"^\s*Antigravity\s*:", source, flags=re.MULTILINE):
             errors.append(f"{context} maps legacy Antigravity to public provider facts")
         if re.search(r"\bagy\b", source, flags=re.IGNORECASE):
@@ -525,29 +420,36 @@ def static_registry_provider_rows(providers_md: str) -> set[str]:
 
 
 def model_registry_providers(agent_rs: str, variant_to_id: dict[str, str]) -> set[str]:
-    variants = set(re.findall(r"provider:\s*ProviderKind::(\w+)", agent_rs))
-    missing = variants - set(variant_to_id)
-    if missing:
-        raise ValueError(f"ModelRegistry uses unknown provider variants: {sorted(missing)}")
-    return {variant_to_id[variant] for variant in variants}
+    # ModelRegistry is now a compatibility projection of the reviewed catalog.
+    # Reading tests or caller literals cannot reconstruct its shipping roster.
+    data = json.loads(read(ROOT / "crates/config/assets/catalog_corrections.json"))
+    reviewed = data.get("reviewed")
+    if not isinstance(reviewed, dict) or not reviewed.get("revision"):
+        raise ValueError("reviewed catalog metadata missing")
+    rows = reviewed.get("selections")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("reviewed catalog selections missing")
+    ids = {row.get("provider") for row in rows if isinstance(row, dict)}
+    if None in ids or ids - set(variant_to_id.values()):
+        raise ValueError("reviewed catalog uses missing/unknown provider identity")
+    if not re.search(r"bundled_reviewed\(\)\s*\.selections", agent_rs):
+        raise ValueError("ModelRegistry must project the shared reviewed selection rows")
+    return ids
 
 
 def default_strings(tui_config_rs: str) -> set[str]:
-    # Model/base-URL constants now live in config/models.rs (#3311); scan it
-    # alongside config.rs so the check follows the leaf split.
-    sources = tui_config_rs + "\n" + read(TUI_CONFIG_MODELS_RS)
-    defaults = set()
-    for name, value in re.findall(
-        r'const\s+(DEFAULT_[A-Z0-9_]+(?:MODEL|BASE_URL)):\s*&str\s*=\s*"([^"]+)"',
-        sources,
-    ):
-        if name == "DEFAULT_DEEPSEEKCN_BASE_URL" or name.startswith(
-            "DEFAULT_ANTIGRAVITY_"
-        ):
-            continue
-        defaults.add(value)
+    data = provider_data()
+    rows = {row["id"]: row for row in data["providers"]}
+    values = dict(data["compatibility_constants"])
+    for name, ref in data["constant_refs"].items():
+        row = rows[ref["provider"]]
+        values[name] = (row["credential_help"] if ref["field"] == "credential_url" else row)[ref["field"]]
+    defaults = {value for name, value in values.items()
+                if re.fullmatch(r"DEFAULT_[A-Z0-9_]+(?:MODEL|BASE_URL)", name)
+                and name != "DEFAULT_DEEPSEEKCN_BASE_URL"
+                and not name.startswith("DEFAULT_ANTIGRAVITY_")}
     if not defaults:
-        raise ValueError("no default provider model/base URL constants found")
+        raise ValueError("no default provider metadata found")
     return defaults
 
 
@@ -570,32 +472,9 @@ def report_set(label: str, expected: set[str], actual: set[str]) -> list[str]:
     return errors
 
 
-def report_provider_enum_drift(
-    provider_kind_ids: set[str], api_provider_ids: set[str]
-) -> list[str]:
-    errors = []
-    missing_from_api_provider = sorted(provider_kind_ids - api_provider_ids)
-    unexpected_api_provider_ids = sorted(
-        api_provider_ids - provider_kind_ids - API_PROVIDER_ONLY_IDS
-    )
-    missing_allowlisted_ids = sorted(API_PROVIDER_ONLY_IDS - api_provider_ids)
-
-    if missing_from_api_provider:
-        errors.append(
-            "ApiProvider missing ProviderKind IDs: "
-            + ", ".join(missing_from_api_provider)
-        )
-    if unexpected_api_provider_ids:
-        errors.append(
-            "ApiProvider has non-whitelisted IDs absent from ProviderKind: "
-            + ", ".join(unexpected_api_provider_ids)
-        )
-    if missing_allowlisted_ids:
-        errors.append(
-            "ApiProvider-only whitelist entries are absent from ApiProvider: "
-            + ", ".join(missing_allowlisted_ids)
-        )
-    return errors
+def report_presentation_identity_drift(canonical_ids: set[str], presentation_ids: set[str]) -> list[str]:
+    legacy = provider_data()["legacy_tui"]["id"]
+    return report_set("released presentation identities", canonical_ids | {legacy}, presentation_ids)
 
 
 def report_huggingface_coverage(
@@ -607,7 +486,7 @@ def report_huggingface_coverage(
         config_rs, "ProviderKind", "Huggingface", "crates/config/src/lib.rs"
     )
     tui_aliases = parse_aliases_for_variant(
-        tui_config_rs, "ApiProvider", "Huggingface", "crates/tui/src/config.rs"
+        tui_config_rs, "ProviderIdentity", "Huggingface", "crates/tui/src/config.rs"
     )
     errors += report_set(
         "ProviderKind Hugging Face aliases",
@@ -615,7 +494,7 @@ def report_huggingface_coverage(
         config_aliases & HUGGINGFACE_ALIASES,
     )
     errors += report_set(
-        "ApiProvider Hugging Face aliases",
+        "descriptor presentation Hugging Face aliases",
         HUGGINGFACE_ALIASES,
         tui_aliases & HUGGINGFACE_ALIASES,
     )
@@ -628,17 +507,12 @@ def report_huggingface_coverage(
         code_spans & HUGGINGFACE_ALIASES,
     )
 
-    # crates/config resolves provider API keys from the descriptor's env list
-    # (`Provider::env_vars`), so the auth order lives in provider.rs.
+    # API-key lookup order is descriptor-owned; actual TUI environment
+    # resolution remains independently checked below.
     auth_label = "Hugging Face auth env precedence"
-    errors += report_string_order(
-        auth_label,
-        provider_rs,
-        [
-            "[" + ", ".join(f'"{name}"' for name in HUGGINGFACE_API_KEY_ENV_ORDER) + "]"
-        ],
-        "crates/config/src/provider.rs",
-    )
+    row = next(row for row in provider_data()["providers"] if row["kind"] == "Huggingface")
+    if row["env_vars"] != HUGGINGFACE_API_KEY_ENV_ORDER:
+        errors.append("Hugging Face descriptor auth env precedence differs")
     for label, env_order in [
         (auth_label, HUGGINGFACE_API_KEY_ENV_ORDER),
         ("Hugging Face base URL env precedence", HUGGINGFACE_BASE_URL_ENV_ORDER),
@@ -712,7 +586,7 @@ def main() -> int:
         selectable_provider_ids = provider_kind_catalog_ids(
             provider_kind_rs, variant_to_id
         )
-        live_api_provider_ids = set(api_provider_ids(tui_config_rs).values())
+        presentation_ids = presentation_provider_ids()
         public_provider_ids = canonical_ids - LEGACY_PROVIDER_TOMBSTONE_IDS
         expected_tables = {
             provider_table_name(provider_id) for provider_id in public_provider_ids
@@ -720,7 +594,7 @@ def main() -> int:
         runtime_tables = expected_tables | LEGACY_PROVIDER_TOMBSTONE_TABLES
 
         errors: list[str] = []
-        errors += report_provider_enum_drift(canonical_ids, live_api_provider_ids)
+        errors += report_presentation_identity_drift(canonical_ids, presentation_ids)
         errors += report_provider_kind_selector_contract(provider_kind_rs)
         errors += report_tui_catalog_contract(tui_config_rs)
         errors += report_tombstone_runtime_contract(

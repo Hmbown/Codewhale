@@ -34,6 +34,8 @@ function refuse(what: string): never {
 const LIMIT_REQUEST = 'CODEWHALE_HOST_MEMORY_LIMIT_MIB'
 /** Set only by the re-exec below, never by the core. */
 const LIMIT_APPLIED = 'CODEWHALE_HOST_MEMORY_LIMIT_APPLIED'
+/** Compile-time image mode; never an environment-controlled launch decision. */
+declare const CODEWHALE_COMPILED_HOST: boolean | undefined
 
 const POSIX_SPAWN_SETEXEC = 0x0040
 const POSIX_SPAWN_JETSAM_MEMLIMIT_ACTIVE_FATAL = 0x04
@@ -132,7 +134,11 @@ function execUnderJetsamLimit(mib: number): string {
       mib,
     )
     if (code !== 0) return `posix_spawnattr_setjetsam_ext failed (${code})`
-    const argv = [process.execPath, ...process.execArgv, ...process.argv.slice(1)]
+    // A compiled image embeds its entry and its runtime flags. Repassing the
+    // virtual script path or execArgv would turn them into application args.
+    const argv = typeof CODEWHALE_COMPILED_HOST === 'boolean' && CODEWHALE_COMPILED_HOST
+      ? [process.execPath, ...process.argv.slice(2)]
+      : [process.execPath, ...process.execArgv, ...process.argv.slice(1)]
     const env = { ...process.env, [LIMIT_REQUEST]: String(mib), [LIMIT_APPLIED]: String(mib) }
     const envp = Object.entries(env)
       .filter((entry): entry is [string, string] => typeof entry[1] === 'string')

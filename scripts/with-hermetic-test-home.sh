@@ -1,6 +1,6 @@
 #!/bin/sh
 # Shared test-home boundary for local and CI workspace tests.
-# Rust toolchain homes stay real.
+# Rust toolchain homes and build cache stay real.
 set -eu
 
 if [ "$#" -eq 0 ]; then
@@ -10,11 +10,15 @@ fi
 
 real_cargo_home=${CARGO_HOME:-${HOME}/.cargo}
 real_rustup_home=${RUSTUP_HOME:-${HOME}/.rustup}
+real_build_cache=${CODEWHALE_CACHE_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/codewhale}
+real_build_lock=${CODEWHALE_BUILD_LOCK_FILE:-${real_build_cache}/build.lock}
 # Git Bash hands MSYS paths to native Windows processes, which cannot
 # resolve them. `-m` keeps forward slashes, so MSYS tools still work.
 if command -v cygpath >/dev/null 2>&1; then
   real_cargo_home=$(cygpath -m "$real_cargo_home")
   real_rustup_home=$(cygpath -m "$real_rustup_home")
+  real_build_cache=$(cygpath -m "$real_build_cache")
+  real_build_lock=$(cygpath -m "$real_build_lock")
 fi
 
 rustc_bin=$(RUSTUP_HOME="$real_rustup_home" rustup which rustc)
@@ -52,6 +56,8 @@ mkdir -p "$test_home_root/kimi-share" "$test_home_root/claude"
 unset CODEWHALE_HOME CODEWHALE_CONFIG_PATH DEEPSEEK_CONFIG_PATH DEEPSEEK_HOME
 
 env \
+  CODEWHALE_CACHE_ROOT="$real_build_cache" \
+  CODEWHALE_BUILD_LOCK_FILE="$real_build_lock" \
   HOME="$test_home_root/home" \
   USERPROFILE="$test_home_root/home" \
   APPDATA="$test_home_root/home/AppData/Roaming" \

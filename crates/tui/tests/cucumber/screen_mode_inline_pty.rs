@@ -42,7 +42,7 @@ fn offline_queue_late_unbracketed_submit_keeps_composer_and_commands_responsive(
             let trust_dir = workspace.workspace().join(".deepseek");
             std::fs::create_dir_all(&trust_dir).expect("workspace trust dir");
             std::fs::write(trust_dir.join("trusted"), "").expect("workspace trust marker");
-            let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+            let mut tui = Harness::builder(Harness::codewhale_binary())
                 .cwd(workspace.workspace())
                 .clear_env()
                 .seal_home(workspace.home())
@@ -137,7 +137,7 @@ fn inline_start_never_takes_the_alternate_screen_and_screen_commands_switch_it()
         std::fs::write(&path, config).expect("seed inline screen mode");
     }
 
-    let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+    let mut tui = Harness::builder(Harness::codewhale_binary())
         .cwd(workspace.workspace())
         .clear_env()
         .seal_home(workspace.home())

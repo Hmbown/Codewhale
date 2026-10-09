@@ -41,6 +41,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use codewhale_localization::{Locale, MessageId, tr};
 
 /// Runtime accumulators behind the strip. Lives on [`crate::tui::app::App`],
@@ -153,291 +154,28 @@ impl SessionMetrics {
     }
 }
 
-/// Everything the strip needs, decoupled from `App` so rendering can be
-/// unit-tested without a full app.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct MetricsSnapshot {
-    pub turns: u64,
-    pub steps: u64,
-    pub llm_time: Duration,
-    pub tool_time: Duration,
-    pub ttft_avg: Option<Duration>,
-    pub tokens_per_second: Option<f64>,
-    /// `None` when no provider reported prompt-cache classes this session.
-    pub cache_hit_percent: Option<u8>,
-    pub input_tokens: u64,
-}
+pub use codewhale_command_contract::config_policy::StatusMetrics as MetricsSnapshot;
+#[cfg(test)]
+use codewhale_command_contract::metrics::{MetricGroupCells, RenderedStrip, Separators};
+pub use codewhale_command_contract::metrics::{format_duration, format_rate, format_tokens};
 
-impl MetricsSnapshot {
-    /// True when there is nothing to say yet (fresh session).
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.turns == 0 && self.steps == 0 && self.input_tokens == 0
-    }
-}
-
-/// One rendered cell: a value with its localized short label.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetricCell {
-    pub label: String,
-    pub value: String,
-    /// `label` first (`4 turns`) or value first (`LLM 11m46s`).
-    pub value_first: bool,
-}
-/// Group priority, highest kept first. When the row is too narrow, groups
-/// are dropped from the end of this list; inside a group the second cell
-/// (steps, tools, tok/s) is dropped before the group itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MetricGroup {
-    Input,
-    Cache,
-    Llm,
-    Turns,
-    Latency,
-}
-
-/// The DSH-style layout order, left to right.
-const GROUP_ORDER: [MetricGroup; 5] = [
-    MetricGroup::Turns,
-    MetricGroup::Llm,
-    MetricGroup::Latency,
-    MetricGroup::Cache,
-    MetricGroup::Input,
-];
-
-/// A group of one or two cells separated by ` · `.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetricGroupCells {
-    pub group: MetricGroup,
-    pub cells: Vec<MetricCell>,
-}
-
-/// Separators used between cells and between groups.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Separators {
-    pub cell: &'static str,
-    pub group: &'static str,
-}
-
-impl Separators {
-    /// Unicode: ` · ` inside a group, ` │ ` between groups.
-    pub const UNICODE: Self = Self {
-        cell: " · ",
-        group: " │ ",
-    };
-    /// ASCII-safe: ` . ` and ` | `.
-    pub const ASCII: Self = Self {
-        cell: " . ",
-        group: " | ",
-    };
-
-    #[must_use]
-    pub fn for_ascii(ascii_safe: bool) -> Self {
-        if ascii_safe {
-            Self::ASCII
-        } else {
-            Self::UNICODE
-        }
-    }
-}
-
-/// Format a duration the way the strip does: `11m46s`, `1h02m`, `1.5s`, `320ms`.
-#[must_use]
-pub fn format_duration(duration: Duration) -> String {
-    let ms = duration.as_millis();
-    if ms == 0 {
-        return "0s".to_string();
-    }
-    if ms < 1_000 {
-        return format!("{ms}ms");
-    }
-    let secs = duration.as_secs();
-    if secs < 60 {
-        let tenths = (ms + 50) / 100;
-        return format!("{}.{}s", tenths / 10, tenths % 10);
-    }
-    if secs < 3_600 {
-        return format!("{}m{:02}s", secs / 60, secs % 60);
-    }
-    format!("{}h{:02}m", secs / 3_600, (secs % 3_600) / 60)
-}
-
-/// Format a token count: `842`, `12.3K`, `9.3M`, `1.2B`.
-#[must_use]
-pub fn format_tokens(tokens: u64) -> String {
-    const UNITS: [(u64, &str); 3] = [(1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")];
-    for (scale, suffix) in UNITS {
-        if tokens >= scale {
-            let scaled = tokens as f64 / scale as f64;
-            return if scaled >= 100.0 {
-                format!("{scaled:.0}{suffix}")
-            } else {
-                format!("{scaled:.1}{suffix}")
-            };
-        }
-    }
-    tokens.to_string()
-}
-
-/// Format an output rate: `120` or `7.5` (the label carries `tok/s`).
-#[must_use]
-pub fn format_rate(rate: f64) -> String {
-    if rate < 10.0 {
-        format!("{rate:.1}")
-    } else {
-        format!("{rate:.0}")
-    }
-}
-
-/// Build the cells for every group that has something truthful to show.
-///
-/// A cell whose evidence has not arrived is omitted — never a placeholder:
-/// `TTFT avg` / `tok/s` appear only once a model call reported them, `Cache
-/// hit` only when a provider reported cache classes, `Input` only after the
-/// first usage receipt. Turn cells are present once the session has started
-/// (zero turns is a real count). Step cells wait for the first completed
-/// model or tool call so `0 steps` cannot look like a stalled scoreboard.
-#[must_use]
-pub fn build_groups(snapshot: MetricsSnapshot, locale: Locale) -> Vec<MetricGroupCells> {
-    let label = |id: MessageId| tr(locale, id).into_owned();
-    let mut groups = Vec::new();
-    for group in GROUP_ORDER {
-        let cells = match group {
-            MetricGroup::Turns => {
-                if snapshot.turns == 0 && snapshot.steps == 0 {
-                    continue;
-                }
-                let mut cells = Vec::new();
-                if snapshot.turns > 0 {
-                    cells.push(MetricCell {
-                        label: label(if snapshot.turns == 1 {
-                            MessageId::SessionMetricsTurn
-                        } else {
-                            MessageId::SessionMetricsTurns
-                        }),
-                        value: snapshot.turns.to_string(),
-                        value_first: true,
-                    });
-                }
-                if snapshot.steps > 0 {
-                    cells.push(MetricCell {
-                        label: label(if snapshot.steps == 1 {
-                            MessageId::SessionMetricsStep
-                        } else {
-                            MessageId::SessionMetricsSteps
-                        }),
-                        value: snapshot.steps.to_string(),
-                        value_first: true,
-                    });
-                }
-                if cells.is_empty() {
-                    continue;
-                }
-                cells
-            }
-            MetricGroup::Llm => {
-                let mut cells = Vec::new();
-                if !snapshot.llm_time.is_zero() {
-                    cells.push(MetricCell {
-                        label: label(MessageId::SessionMetricsLlm),
-                        value: format_duration(snapshot.llm_time),
-                        value_first: false,
-                    });
-                }
-                if !snapshot.tool_time.is_zero() {
-                    cells.push(MetricCell {
-                        label: label(MessageId::SessionMetricsTools),
-                        value: format_duration(snapshot.tool_time),
-                        value_first: false,
-                    });
-                }
-                if cells.is_empty() {
-                    continue;
-                }
-                cells
-            }
-            MetricGroup::Latency => {
-                let mut cells = Vec::new();
-                if let Some(ttft) = snapshot.ttft_avg {
-                    cells.push(MetricCell {
-                        label: label(MessageId::SessionMetricsTtft),
-                        value: format_duration(ttft),
-                        value_first: false,
-                    });
-                }
-                if let Some(rate) = snapshot.tokens_per_second {
-                    cells.push(MetricCell {
-                        label: label(MessageId::SessionMetricsTokensPerSecond),
-                        value: format_rate(rate),
-                        value_first: true,
-                    });
-                }
-                if cells.is_empty() {
-                    continue;
-                }
-                cells
-            }
-            MetricGroup::Cache => {
-                let Some(pct) = snapshot.cache_hit_percent else {
-                    continue;
-                };
-                vec![MetricCell {
-                    label: label(MessageId::SessionMetricsCache),
-                    value: format!("{pct}%"),
-                    value_first: false,
-                }]
-            }
-            MetricGroup::Input => {
-                if snapshot.input_tokens == 0 {
-                    continue;
-                }
-                vec![MetricCell {
-                    label: label(MessageId::SessionMetricsInput),
-                    value: format_tokens(snapshot.input_tokens),
-                    value_first: false,
-                }]
-            }
-        };
-        groups.push(MetricGroupCells { group, cells });
-    }
-    groups
-}
-
-/// A rendered strip: the plain text (for tests, `/status`, and width math)
-/// plus the cells that survived the budget, so the painter can style labels
-/// and values differently.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RenderedStrip {
-    pub groups: Vec<MetricGroupCells>,
-    pub separators: Separators,
-}
-
-impl RenderedStrip {
-    /// Plain-text form: `4 turns · 108 steps │ LLM 11m46s · tools 1m52s │ …`.
-    #[must_use]
-    pub fn text(&self) -> String {
-        let mut out = String::new();
-        for (index, group) in self.groups.iter().enumerate() {
-            if index > 0 {
-                out.push_str(self.separators.group);
-            }
-            for (cell_index, cell) in group.cells.iter().enumerate() {
-                if cell_index > 0 {
-                    out.push_str(self.separators.cell);
-                }
-                if cell.value_first {
-                    out.push_str(&cell.value);
-                    out.push(' ');
-                    out.push_str(&cell.label);
-                } else {
-                    out.push_str(&cell.label);
-                    out.push(' ');
-                    out.push_str(&cell.value);
-                }
-            }
-        }
-        out
-    }
+#[cfg(test)]
+fn build_groups(snapshot: MetricsSnapshot, locale: Locale) -> Vec<MetricGroupCells> {
+    codewhale_command_contract::metrics::build_groups(
+        snapshot,
+        &codewhale_command_contract::metrics::MetricLabels {
+            cache: tr(locale, MessageId::SessionMetricsCache).into_owned(),
+            input: tr(locale, MessageId::SessionMetricsInput).into_owned(),
+            llm: tr(locale, MessageId::SessionMetricsLlm).into_owned(),
+            step: tr(locale, MessageId::SessionMetricsStep).into_owned(),
+            steps: tr(locale, MessageId::SessionMetricsSteps).into_owned(),
+            tokens_per_second: tr(locale, MessageId::SessionMetricsTokensPerSecond).into_owned(),
+            tools: tr(locale, MessageId::SessionMetricsTools).into_owned(),
+            ttft: tr(locale, MessageId::SessionMetricsTtft).into_owned(),
+            turn: tr(locale, MessageId::SessionMetricsTurn).into_owned(),
+            turns: tr(locale, MessageId::SessionMetricsTurns).into_owned(),
+        },
+    )
 }
 
 pub use codewhale_command_contract::facets::DebugCacheRates as CacheRates;
@@ -490,7 +228,8 @@ pub fn snapshot_from_app(app: &crate::tui::app::App) -> MetricsSnapshot {
 
 /// The complete, untrimmed strip text — what `/status` prints.
 #[must_use]
-pub fn full_text(snapshot: MetricsSnapshot, locale: Locale, ascii_safe: bool) -> String {
+#[cfg(test)]
+pub(crate) fn full_text(snapshot: MetricsSnapshot, locale: Locale, ascii_safe: bool) -> String {
     RenderedStrip {
         groups: build_groups(snapshot, locale),
         separators: Separators::for_ascii(ascii_safe),

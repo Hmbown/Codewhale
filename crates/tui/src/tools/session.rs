@@ -116,7 +116,11 @@ impl ToolSpec for SessionSearchTool {
             .unwrap_or(8)
             .clamp(1, MAX_SEARCH_RESULTS) as usize;
         let workspace = context.workspace.clone();
+        #[cfg(test)]
+        let env_ticket = crate::test_support::env_scope_ticket();
         let found = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(env_ticket);
             let manager = SessionManager::default_location()?;
             let mut sessions = manager.list_sessions()?;
             sessions.retain(|session| {
@@ -197,7 +201,11 @@ impl ToolSpec for SessionGetTool {
             .ok_or_else(|| ToolError::invalid_input("session_get requires a non-empty session_id"))?
             .to_string();
         let workspace = context.workspace.clone();
+        #[cfg(test)]
+        let env_ticket = crate::test_support::env_scope_ticket();
         let rendered = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(env_ticket);
             let manager = SessionManager::default_location()?;
             let session = manager.load_session_by_prefix(&session_id)?;
             // One workspace's sessions are never surfaced inside another:

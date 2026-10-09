@@ -267,6 +267,7 @@ jobs:
           sh scripts/with-hermetic-test-home.test.sh
           bash .github/scripts/update-homebrew-tap.test.sh
           node .github/scripts/release-workflows.test.js
+          node --test .github/scripts/d8-executable.test.js
           node --test scripts/release/assemble-release-assets.test.js
           node --test scripts/release/ensure-release-assets-absent.test.js
           node --test scripts/release/verify-release-inventory.test.js
@@ -339,14 +340,14 @@ jobs:
 
       - name: Run extension host suites and check the committed bundle
         # The TypeScript extension host (experimental, [features]
-        # extension_host). Its tests import the committed dist/ only, so
-        # `npm test` needs no install; the rebuild then fails if dist/ drifted
-        # from src/ or the lockfile. Node 22 matches the host's engines floor.
+        # extension_host). Tests exercise both the committed bundle and
+        # source services backed by locked Cordis dependencies. Install before
+        # testing; then reject any bundle drift. Node 22 matches the host floor.
         run: |
           set -euo pipefail
           cd crates/tui/extension-host
-          npm test
           npm ci --ignore-scripts
+          npm test
           npm run typecheck
           npm run build
           git diff --exit-code -- dist
@@ -363,6 +364,46 @@ jobs:
           set -euo pipefail
           cd crates/tui/extension-host
           npm run test:bun
+
+  extension-host-runtimes:
+    name: Extension host runtimes (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: crates/tui/extension-host
+        shell: bash
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2
+        with:
+          bun-version: 1.4.0
+      - run: npm ci
+      - run: npm run typecheck && npm run build
+      - name: Required Node and Bun source-host receipts
+        run: npm test && npm run test:bun
+      - name: Compile the same entry with the installed runtime and test it
+        run: |
+          bun_binary="$(bun -p 'process.execPath')"
+          host_binary="$(node -p "require('path').join(process.env.RUNNER_TEMP, 'codewhale-extension-host' + (process.platform === 'win32' ? '.exe' : ''))")"
+          node compile-host.mjs --bun "$bun_binary" --output "$host_binary"
+          CODEWHALE_COMPILED_HOST_TEST_BINARY="$host_binary" CODEWHALE_BUN_TEST_BINARY="$bun_binary" node --test test/compiled-host.test.mjs
+      - name: Keep runtime receipts on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: extension-host-runtime-${{ matrix.os }}
+          path: crates/tui/extension-host/dist/builtin-modules.json
+          if-no-files-found: error
 
   vscode-extension:
     name: VS Code extension
@@ -388,6 +429,11 @@ jobs:
         # `tsc` ever running in CI. `npm test` compiles first (tsc -p ./), so
         # this is the type-check gate for the extension too.
         run: npm test
+      # @vscode/vsce 4 is a build-only packager that requires Node >=22. The
+      # extension itself still compiles and tests on Node 20 above.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
       - name: Package VS Code extension
         run: npm run package
 
@@ -395,7 +441,7 @@ jobs:
     name: Safety gate
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
-    timeout-minutes: 15
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -418,20 +464,23 @@ jobs:
           echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "${GITHUB_ENV}"
       - name: Install Linux system dependencies
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config bubblewrap apparmor-profiles
+          sh scripts/prepare-linux-test-sandbox.sh
+      - name: Ubuntu build headroom
+        shell: bash
+        run: bash scripts/prepare-ubuntu-build-headroom.sh
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
       - name: Hermetic safety and authorization tests
         env:
           RUST_MIN_STACK: "8388608"
+          CODEWHALE_EXT_HOST_TESTS: '1'
         # nextest fails when the filter selects no test (`--no-tests=fail`),
         # so moving these modules to another crate cannot turn this step into
         # a silent 0-test pass. It does not catch a step that merely shrinks,
@@ -445,7 +494,10 @@ jobs:
   lint:
     name: Lint
     needs: changes
-    timeout-minutes: 45
+    # Measured on 89ee629e with runner headroom: clippy 10 min, runtime-contract
+    # budget 16 min, and persistence-backlog still running at the old 45-minute
+    # cancellation. Commands, filters and budgets are unchanged.
+    timeout-minutes: 75
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -473,12 +525,11 @@ jobs:
       - name: Install Linux system dependencies
         if: needs.changes.outputs.heavy == 'true'
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
+      - name: Ubuntu build headroom
+        if: needs.changes.outputs.heavy == 'true'
+        shell: bash
+        run: bash scripts/prepare-ubuntu-build-headroom.sh
       - uses: Swatinem/rust-cache@v2
         if: needs.changes.outputs.heavy == 'true'
         with:
@@ -693,12 +744,7 @@ jobs:
           toolchain: "1.89"
       - name: Install Linux system dependencies
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -747,7 +793,11 @@ jobs:
     # runs-on can never evaluate to empty.
     # A cold GitHub-hosted Mac spent 77-80 minutes in Test on 2026-09-23
     # (fork PRs #6431, #6417), too close to the old 90-minute limit.
-    timeout-minutes: 120
+    # On 2026-10-04 a PR leg spent 111 minutes compiling with no cache and
+    # was cancelled at 120 with 12,356 tests passed and none failed. The
+    # limit stays a literal (release-workflows.test.js, #5496); 165 bounds
+    # hangs for every leg until the CI speed redesign lands.
+    timeout-minutes: 165
     # macOS legs go to the self-hosted Mac ONLY when all three hold: the
     # change is heavy, the event is trusted (not a fork PR), and the
     # CW_SELF_HOSTED_MAC repo variable is 'true'. That variable is the kill
@@ -817,6 +867,12 @@ jobs:
         run: ./scripts/installer/installer-path-regression.tests.ps1 -AllowUserPathMutation
       - uses: dtolnay/rust-toolchain@stable
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+      - name: Omit macOS test debug metadata
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'macos-latest'
+        shell: bash
+        # Match the existing full-workspace CNB gate. Keep debug assertions and
+        # every test; only disposable test debug tables change on this lane.
+        run: echo "CARGO_PROFILE_TEST_DEBUG=0" >> "$GITHUB_ENV"
       - uses: mozilla-actions/sccache-action@v0.0.11
         id: sccache
         continue-on-error: true
@@ -832,31 +888,14 @@ jobs:
       - name: Install Linux system dependencies
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config bubblewrap apparmor-profiles
+          sh scripts/prepare-linux-test-sandbox.sh
       - name: Ubuntu build headroom
-        # The combined wave/0.10.1-next workspace build was terminated
-        # mid-compile on every PR run ("runner has received a shutdown
-        # signal", exit 143, no newer push to cancel it) while single-fix PRs
-        # finished the same build in ~10 minutes. Drop preinstalled SDKs this
-        # job never uses and add swap so the full --all-features test build
-        # has disk and memory headroom; the Run tests step logs both.
+        # Reuse the same fixed hosted-runner provisioning as Safety and Lint.
+        # Exit 143 is a shutdown observation, not proof of OOM or timeout.
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         shell: bash
-        run: |
-          df -h / /mnt; free -m
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          if sudo fallocate -l 8G /mnt/cw-swapfile && sudo chmod 600 /mnt/cw-swapfile \
-            && sudo mkswap /mnt/cw-swapfile >/dev/null && sudo swapon /mnt/cw-swapfile; then
-            echo "Added 8 GiB swap at /mnt/cw-swapfile"
-          else
-            echo "::warning::Could not add swap; continuing with the runner default"
-          fi
-          df -h / /mnt; free -m
+        run: bash scripts/prepare-ubuntu-build-headroom.sh
       - uses: Swatinem/rust-cache@v2
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         with:
@@ -864,6 +903,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+      - name: Check portable config policy boundary
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        shell: bash
+        run: |
+          python3 -B scripts/test_check_command_config_policy_proof.py
+          sh scripts/check-portable-config-policy.sh
       - uses: actions/setup-node@v7
         # The extension-host integration tests spawn the real bundle under
         # Node >= 22.19; CODEWHALE_EXT_HOST_TESTS below makes a missing Node a
@@ -871,6 +916,35 @@ jobs:
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         with:
           node-version: 22
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        with:
+          bun-version: 1.4.0
+      - name: Build matching compiled-host input for required Native containment receipts
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun_binary="$(bun -p 'process.execPath')"
+          host_binary="$(node -p "require('path').join(process.env.RUNNER_TEMP, 'codewhale-extension-host' + (process.platform === 'win32' ? '.exe' : ''))")"
+          compiled_info="$(node crates/tui/extension-host/compile-host.mjs --bun "$bun_binary" --output "$host_binary")"
+          printf 'CODEWHALE_COMPILED_HOST_TEST_BINARY=%s\n' "$host_binary" >> "$GITHUB_ENV"
+          node - "$host_binary" "$bun_binary" "$compiled_info" >> "$GITHUB_ENV" <<'JS'
+          const fs = require('node:fs'), crypto = require('node:crypto');
+          const digest = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+          const info = JSON.parse(process.argv[4]);
+          if (!info.platform || !info.arch || info.platform !== info.compiler?.platform || info.arch !== info.compiler?.arch) throw new Error('image/compiler identity mismatch');
+          console.log('CODEWHALE_COMPILED_HOST_TEST_PLATFORM=' + info.platform);
+          console.log('CODEWHALE_COMPILED_HOST_TEST_ARCH=' + info.arch);
+          console.log('CODEWHALE_COMPILED_HOST_TEST_SHA256=' + digest(process.argv[2]));
+          console.log('CODEWHALE_COMPILED_HOST_TEST_BUN=' + process.argv[3]);
+          console.log('CODEWHALE_COMPILED_HOST_TEST_RUNTIME_SHA256=' + digest(process.argv[3]));
+          console.log('CODEWHALE_COMPILED_HOST_TEST_BUNDLE_SHA256=' + digest('crates/tui/extension-host/dist/codewhale-extension-host.mjs'));
+          JS
+          # The required hermetic full invocation executes the shared actual
+          # compiled Native secret/history/write scenario on each OS; Windows
+          # additionally requires Node/Bun/compiled LPAC owner/reparse probes.
+          # Missing requested compiled input or a failed sandbox is red.
       - name: Hold this machine's build lock (self-hosted)
         # The self-hosted Mac is also a developer machine: local agents build
         # through scripts/dev-cargo.sh, which holds this lock, and two Cargo
@@ -905,6 +979,25 @@ jobs:
           cat "$log"
           # Scripts inside this job already run under the lock.
           echo "CODEWHALE_BUILD_LOCK_HELD=1" >> "$GITHUB_ENV"
+      - name: Build canonical executable for acceptance tests
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        shell: bash
+        run: cargo build -p codewhale-cli --bin codewhale --all-features --locked
+        env:
+          RUSTC_WRAPPER: ${{ matrix.os != 'windows-latest' && env.RUSTC_WRAPPER || '' }}
+      - name: Windows Terminal clipboard acceptance
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'windows-latest'
+        timeout-minutes: 5
+        shell: pwsh
+        run: node scripts/release/windows-terminal-clipboard.mjs target/debug/codewhale.exe "${{ runner.temp }}/windows-clipboard"
+      - name: Retain Windows Terminal clipboard evidence
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' && needs.changes.outputs.heavy == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-clipboard-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-clipboard/
+          if-no-files-found: error
+          retention-days: 7
       - name: Run tests
         # Same test binaries as `cargo test`, run by cargo-nextest: one
         # process per test, all runner cores busy, slow tests named instead
@@ -929,7 +1022,9 @@ jobs:
           if [ -n "$monitor" ]; then kill "$monitor" 2>/dev/null || true; fi
           exit "$status"
         env:
+          QA_PTY_DIAGNOSTICS_DIR: ${{ runner.temp }}/pty-failures
           CODEWHALE_EXT_HOST_TESTS: '1'
+          CODEWHALE_EXT_HOST_BUN_TESTS: '1'
           # sccache 0.17 panics resolving its config directory under the
           # isolated Windows home before Cargo can compile or run any test.
           # Bypass only that optional cache; keep the full suite and isolation.
@@ -951,12 +1046,22 @@ jobs:
           # forced 32 MiB lives in spawned binaries, which size their own
           # stacks explicitly and never read this variable.
           RUST_MIN_STACK: '16777216'
+      - name: Retain sealed terminal failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: terminal-failures-${{ runner.os }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pty-failures/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Shared-process workspace qualification
         if: github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice' && matrix.os == 'ubuntu-latest'
         shell: bash
         env:
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           CODEWHALE_EXT_HOST_TESTS: '1'
+          CODEWHALE_EXT_HOST_BUN_TESTS: '1'
           RUST_MIN_STACK: '16777216'
           RUSTFLAGS: ''
           CARGO_ENCODED_RUSTFLAGS: ''
@@ -1059,6 +1164,35 @@ jobs:
           path: ${{ runner.temp }}/shared-process-workspace/
           if-no-files-found: error
           retention-days: 30
+      - name: Export exact compiled-image Native containment receipt
+        # JUnit is from the same full invocation: no second compile/test run.
+        # The official entire CI run must be green before release can consume
+        # this artifact. Missing/changed inputs or silent test skips are red.
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && !(github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice')
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+          python3 scripts/compiled-host-native-receipt.py \
+            --junit target/nextest/ci/junit.xml \
+            --compiled-image "$CODEWHALE_COMPILED_HOST_TEST_BINARY" \
+            --bundle crates/tui/extension-host/dist/codewhale-extension-host.mjs \
+            --bun "$CODEWHALE_COMPILED_HOST_TEST_BUN" --source-sha "$GITHUB_SHA" \
+            --image-platform "$CODEWHALE_COMPILED_HOST_TEST_PLATFORM" --image-arch "$CODEWHALE_COMPILED_HOST_TEST_ARCH" \
+            --host-sha256 "$CODEWHALE_COMPILED_HOST_TEST_SHA256" \
+            --runtime-sha256 "$CODEWHALE_COMPILED_HOST_TEST_RUNTIME_SHA256" \
+            --bundle-sha256 "$CODEWHALE_COMPILED_HOST_TEST_BUNDLE_SHA256" \
+            --output "$RUNNER_TEMP/native-compiled-host"
+      - name: Retain exact compiled image and Native receipt
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && !(github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: native-compiled-host-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ runner.temp }}/native-compiled-host/
+          if-no-files-found: error
+          retention-days: 30
       - name: Run doctests
         # The shared-process command already includes every workspace doctest.
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && !(github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice')
@@ -1087,7 +1221,7 @@ jobs:
         # ~2min off the Windows critical path. Self-hosted Mac only; hosted
         # Mac legs run it in `macos-budget` (see the RSS step above).
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'macos-latest' && needs.changes.outputs.trusted == 'true' && vars.CW_SELF_HOSTED_MAC == 'true'
-        run: cargo run -p codewhale-tui --all-features -- eval
+        run: cargo run -p codewhale-cli --bin codewhale --all-features -- eval
       - name: sccache stats
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && steps.sccache.outcome == 'success'
         continue-on-error: true
@@ -1120,7 +1254,9 @@ jobs:
     # The explicit Ubuntu-only qualification has no warm Test macOS leg, so
     # retain these gates on the hosted fallback even when self-hosting is on.
     if: needs.changes.outputs.heavy == 'true' && github.event_name != 'pull_request' && ((github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice') || !(needs.changes.outputs.trusted == 'true' && vars.CW_SELF_HOSTED_MAC == 'true'))
-    timeout-minutes: 75
+    # Cold hosted builds consumed 73 minutes before eval could start (F run
+    # 37497498829). Match Test's compile allowance; RSS/eval limits stay intact.
+    timeout-minutes: 165
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -1134,7 +1270,7 @@ jobs:
       - name: Check persistence-backlog RSS budget
         run: python3 scripts/check-persistence-backlog-budget.py
       - name: Run Offline Eval Harness
-        run: cargo run -p codewhale-tui --all-features -- eval
+        run: cargo run -p codewhale-cli --bin codewhale --all-features -- eval
 
   npm-wrapper-smoke:
     name: npm wrapper smoke
@@ -1149,9 +1285,9 @@ jobs:
     # leg was a ~28-minute hosted-Mac build on every main push while hosted
     # macOS is capped at 5 concurrent jobs; it stays in the manual
     # workflow_dispatch (full CI) matrix and in the release pipeline.
-    # A cold Windows build can take 29 minutes before the smoke even starts.
-    # Leave room for installation; bound the smoke itself independently below.
-    timeout-minutes: 45
+    # A cold Windows compile can take 42 minutes; leave room for cache save
+    # after the separately bounded five-minute install/entrypoint smoke test.
+    timeout-minutes: 60
     runs-on: ${{ needs.changes.outputs.heavy == 'true' && matrix.os || 'ubuntu-latest' }}
     strategy:
       matrix:
@@ -1183,12 +1319,7 @@ jobs:
       - name: Install Linux system dependencies
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
       - uses: Swatinem/rust-cache@v2
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         with:
@@ -1203,7 +1334,7 @@ jobs:
         env:
           CARGO_PROFILE_RELEASE_LTO: 'off'
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
-        run: cargo build --release --locked -p codewhale-cli -p codewhale-tui
+        run: cargo build --release --locked -p codewhale-cli --bin codewhale
       - name: Smoke wrapper install and delegated entrypoints
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         timeout-minutes: 5
@@ -1246,12 +1377,7 @@ jobs:
           echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "${GITHUB_ENV}"
       - name: Install Linux system dependencies
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -1299,12 +1425,7 @@ jobs:
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get update && break
-            echo "apt-get update failed (attempt $i); retrying in 15s"
-            sleep 15
-          done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false

@@ -1,52 +1,29 @@
-//! Shared animation frames for running-state UI chrome.
+//! Working and verification indicators from the shared terminal component kit.
 //!
-//! Keep the braille spinner in one place so transcript tool cards, sidebars,
-//! and any future running-job surfaces advance with the same cadence.
-//!
-//! Motion *policy* (whether to animate at all) lives in
-//! [`crate::tui::motion::MotionPolicy`]. Callers that already have a policy
-//! should prefer [`crate::tui::motion::MotionPolicy::spinner_glyph`]; the
-//! helpers here remain the shared frame table + elapsed-time index.
+//! This replaces the Engine's duplicate frame tables, earned-marker delay and
+//! frame indexing. The Engine still supplies clocks and motion policy, and its
+//! existing backend performs ASCII/color adaptation. Quiet indicators use the
+//! kit's semantic current-work mark rather than a frozen animation frame.
 
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// A small swell for running tools and background jobs. Rise and recede
-/// through adjacent dot counts, including across the loop boundary. The
-/// marker stays visible and never flashes from a full block to empty.
-/// Like Ratatui Spinner's pulse studies, the return path is part of the motion;
-/// our quieter six-dot peak and existing clock keep it subordinate to the text.
-pub(crate) const BRAILLE_SPINNER_FRAMES: [&str; 8] = ["⣀", "⣄", "⣤", "⣦", "⣶", "⣦", "⣤", "⣄"];
-pub(crate) const VERIFY_TICK_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+use codewhale_ratatui::{MotionMode, VerificationSpinner, spin};
 
-/// A motion marker is earned only after work survives the eye's quick-event
-/// window. Faster work should simply land as a receipt.
-pub(crate) const LIVE_MARKER_DELAY_MS: u64 = 400;
-pub(crate) const LIVE_STATIC_MARKER: &str = "›";
-pub(crate) const BRAILLE_SPINNER_STILL_FRAME: &str = "⣤";
-
-/// Five stepped states per second. This is deliberately slower than the
-/// underwater field's ~8fps caustic cadence: the marker communicates active
-/// work, while the field stays subordinate atmosphere. Calmed from 8 Hz
-/// (125 ms) for v0.9.4 — at 5 Hz the fill still reads as continuous motion
-/// without the restless flicker the faster table produced.
-pub(crate) const BRAILLE_SPINNER_FRAME_MS: u64 = 200;
+#[cfg(test)]
+pub(crate) const BRAILLE_SPINNER_FRAMES: [&str; 8] = spin::FRAMES;
+#[cfg(test)]
+const VERIFY_TICK_FRAMES: [&str; 8] = VerificationSpinner::FRAMES;
+pub(crate) const LIVE_MARKER_DELAY_MS: u64 = spin::EARN_DELAY.as_millis() as u64;
+pub(crate) const LIVE_STATIC_MARKER: &str = spin::PENDING_FRAME;
+pub(crate) const BRAILLE_SPINNER_STILL_FRAME: &str = spin::STILL_FRAME;
+pub(crate) const BRAILLE_SPINNER_FRAME_MS: u64 = spin::FRAME_INTERVAL.as_millis() as u64;
 
 #[must_use]
 pub(crate) fn braille_spinner_frame_for_elapsed_ms(
     elapsed_ms: u128,
     low_motion: bool,
 ) -> &'static str {
-    if low_motion {
-        return BRAILLE_SPINNER_STILL_FRAME;
-    }
-    if elapsed_ms < u128::from(LIVE_MARKER_DELAY_MS) {
-        return LIVE_STATIC_MARKER;
-    }
-    let idx = elapsed_ms
-        .saturating_sub(u128::from(LIVE_MARKER_DELAY_MS))
-        .checked_div(u128::from(BRAILLE_SPINNER_FRAME_MS))
-        .map_or(0, |frame| frame % BRAILLE_SPINNER_FRAMES.len() as u128);
-    BRAILLE_SPINNER_FRAMES[usize::try_from(idx).unwrap_or_default()]
+    spin::frame(elapsed(elapsed_ms), motion(low_motion), false)
 }
 
 #[must_use]
@@ -59,18 +36,23 @@ pub(crate) fn verification_tick_frame(
     started_at: Option<Instant>,
     low_motion: bool,
 ) -> &'static str {
+    VerificationSpinner::frame(
+        elapsed(marker_elapsed_ms(started_at)),
+        motion(low_motion),
+        false,
+    )
+}
+
+fn motion(low_motion: bool) -> MotionMode {
     if low_motion {
-        return VERIFY_TICK_FRAMES[4];
+        MotionMode::Reduced
+    } else {
+        MotionMode::Full
     }
-    let elapsed_ms = marker_elapsed_ms(started_at);
-    if elapsed_ms < u128::from(LIVE_MARKER_DELAY_MS) {
-        return LIVE_STATIC_MARKER;
-    }
-    let idx = elapsed_ms
-        .saturating_sub(u128::from(LIVE_MARKER_DELAY_MS))
-        .checked_div(u128::from(BRAILLE_SPINNER_FRAME_MS))
-        .map_or(0, |frame| frame % VERIFY_TICK_FRAMES.len() as u128);
-    VERIFY_TICK_FRAMES[usize::try_from(idx).unwrap_or_default()]
+}
+
+fn elapsed(milliseconds: u128) -> Duration {
+    Duration::from_millis(u64::try_from(milliseconds).unwrap_or(u64::MAX))
 }
 
 fn marker_elapsed_ms(started_at: Option<Instant>) -> u128 {
@@ -162,7 +144,7 @@ mod tests {
         );
         assert_eq!(
             verification_tick_frame(Some(start), true),
-            VERIFY_TICK_FRAMES[4]
+            BRAILLE_SPINNER_STILL_FRAME
         );
         assert_ne!(VERIFY_TICK_FRAMES[0], BRAILLE_SPINNER_FRAMES[0]);
     }

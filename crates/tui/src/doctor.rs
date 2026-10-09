@@ -563,7 +563,9 @@ pub(crate) fn is_keyless_ds4_route(config: &crate::config::Config) -> bool {
         && crate::config::base_url_uses_local_host(&config.active_route_base_url())
         && crate::config::auth_mode_disables_api_key(
             config
-                .auth_mode_for_provider(config.api_provider())
+                .active_provider_identity()
+                .ok()
+                .and_then(|identity| config.auth_mode_for_provider(&identity))
                 .as_deref(),
         )
 }

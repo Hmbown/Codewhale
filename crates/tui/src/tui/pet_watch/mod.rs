@@ -23,8 +23,11 @@ use std::{
 mod appearance;
 mod audio;
 mod audio_cursor;
+mod avatars;
+mod full;
 mod graphics;
 mod habitat;
+pub use full::{render_full, render_main};
 mod live;
 pub(crate) mod owner;
 mod persistence;
@@ -38,9 +41,13 @@ pub enum Control {
     Window,
     Select,
     Scroll(i16),
+    FocusAgents,
+    ScrollEnd(bool),
+    Mouse(crossterm::event::MouseEvent),
 }
 #[derive(Default)]
 pub struct PetWatch {
+    avatars: avatars::Avatars,
     worker: Option<Worker>,
     session: Option<String>,
     active_turn_id: Option<String>,
@@ -51,6 +58,8 @@ pub struct PetWatch {
     exporting: bool,
     sound_requested: bool,
     pub(crate) area: Option<Rect>,
+    pub(crate) inspect_area: Option<Rect>,
+    copy_area: Arc<Mutex<Option<Rect>>>,
     raster: Option<Presentation>,
     controls: Arc<Mutex<Vec<Control>>>,
     desired: Option<Rect>,
@@ -61,14 +70,26 @@ pub struct PetWatch {
     bytes: u64,
     render_ms: f64,
     output_ms: f64,
-    /// `/pet on`: accepted turns enter the full habitat automatically.
+    /// `/pet on`: the native pet replaces the ordinary shell backdrop.
     pub(crate) enabled: bool,
-    work_enter_pending: bool,
-    work_complete: bool,
     work_history_start: usize,
-    result_scroll: u16,
+    full: codewhale_ratatui::PetModeState,
+    full_next: Option<Instant>,
+    full_response: Option<crate::tui::transcript::TranscriptViewCache>,
+    full_response_key: Option<(u64, usize, bool)>,
+    full_inputs: Option<codewhale_ratatui::whale_motion::Inputs>,
+    selection: Arc<Mutex<Option<String>>>,
 }
 impl PetWatch {
+    pub fn avatar_choices(&self) -> String {
+        self.avatars.choices()
+    }
+    pub fn select_avatar(&mut self, key: &str) -> bool {
+        self.avatars.select(key)
+    }
+    pub fn preview_avatar(&mut self, name: &str, view: bool) -> bool {
+        self.avatars.preview(name, view)
+    }
     pub fn set_sound(&mut self, enabled: bool) {
         self.sound_requested = enabled;
     }
@@ -91,9 +112,17 @@ impl PetWatch {
         self.failed = false;
         self.unavailable = false;
         self.last_tick = None;
-        self.work_enter_pending = false;
-        self.work_complete = false;
-        self.result_scroll = 0;
+        self.work_history_start = 0;
+        self.full = codewhale_ratatui::PetModeState::default();
+        self.full_next = None;
+        self.full_response = None;
+        self.full_response_key = None;
+        self.full_inputs = None;
+        if let Ok(mut selection) = self.selection.lock() {
+            *selection = None;
+        }
+        self.avatars.view = None;
+        self.avatars.action = None;
     }
     fn ensure(&mut self, session: Option<String>) {
         if self.session != session {
@@ -155,7 +184,17 @@ impl PetWatch {
             self.failed = true;
         }
     }
+    /// Wake the existing terminal loop for the native stage, even at idle.
+    /// Hidden and reduced/still stages clear this deadline in `full::tick`.
+    pub fn next_frame_in(&self, now: Instant) -> Option<Duration> {
+        self.full_next
+            .map(|deadline| deadline.saturating_duration_since(now))
+    }
     pub fn prepare_frame(&mut self) {
+        self.inspect_area = None;
+        if let Ok(mut area) = self.copy_area.lock() {
+            *area = None;
+        }
         self.desired = None;
     }
     pub fn present(&mut self, output: &mut impl Write) -> io::Result<()> {
@@ -220,7 +259,7 @@ impl PetWatch {
 /// Existing protocol projection defines the variant names. This allowlist
 /// removes payloads before the bounded worker queue; no model text escapes.
 fn metadata(event: &Event, turn_id: Option<&str>) -> Option<String> {
-    let value = match event {
+    let mut value = match event {
         Event::TurnStarted { turn_id, .. } => json!({"event":"turn_started","turn_id":turn_id}),
         Event::TurnComplete { status, .. } => {
             let mut value = json!({
@@ -251,18 +290,22 @@ fn metadata(event: &Event, turn_id: Option<&str>) -> Option<String> {
         Event::OperationActivityStarted {
             span_id,
             activity_kind,
+            action_id,
         } => json!({
             "event":"operation_activity_started",
             "span_id":span_id,
+            "action_id":action_id,
             "activity_kind":activity_kind
         }),
         Event::OperationActivityCompleted {
             span_id,
             activity_kind,
+            action_id,
             outcome,
         } => json!({
             "event":"operation_activity_completed",
             "span_id":span_id,
+            "action_id":action_id,
             "activity_kind":activity_kind,
             "outcome":outcome
         }),
@@ -299,55 +342,90 @@ fn metadata(event: &Event, turn_id: Option<&str>) -> Option<String> {
         }),
         _ => return None,
     };
+    if value
+        .get("action_id")
+        .is_some_and(serde_json::Value::is_null)
+    {
+        value.as_object_mut()?.remove("action_id");
+    }
     let json = serde_json::to_string(&value).ok()?;
     (json.len() <= 16_384).then_some(json)
 }
 
 pub fn command(app: &mut App, control: Control) {
     app.pet_watch.ensure(app.current_session_id.clone());
-    apply(&mut app.pet_watch, control);
+    let agents = full::agents(app);
+    apply(&mut app.pet_watch, control, &agents);
     app.needs_redraw = true;
 }
-fn apply(state: &mut PetWatch, control: Control) {
+fn apply(state: &mut PetWatch, control: Control, agents: &[codewhale_ratatui::Subagent<'_>]) {
     match control {
         Control::Browser => state.send(Command::Browser),
         Control::Window => state.send(Command::Window),
         Control::Select => state.send(Command::Select),
         Control::Sound => state.sound_requested = !state.sound_requested,
-        Control::Scroll(delta) => {
-            state.result_scroll = state.result_scroll.saturating_add_signed(delta)
+        Control::Scroll(delta) => state.full.scroll(agents, delta),
+        Control::FocusAgents => state.full.toggle_agents(agents),
+        Control::ScrollEnd(end) => state.full.scroll_end(agents, end),
+        Control::Mouse(mouse) => {
+            state.full.handle_mouse(agents, mouse);
         }
     }
 }
 pub fn open_habitat(app: &mut App) {
     app.pet_watch.ensure(app.current_session_id.clone());
     if app.view_stack.top_kind() != Some(ModalKind::PetHabitat) {
-        app.view_stack
-            .push(habitat::Habitat::new(app.pet_watch.controls.clone()));
+        app.view_stack.push(habitat::Habitat::new(
+            app.pet_watch.controls.clone(),
+            app.pet_watch.selection.clone(),
+            app.pet_watch.copy_area.clone(),
+        ));
     }
     app.needs_redraw = true;
+}
+/// Explicit tools and focused workers remain available on demand.
+pub fn main_view(app: &App) -> bool {
+    app.pet_watch.enabled
+        && app.agent_focus.is_none()
+        && !app.work_surface.focused
+        && app.file_tree.is_none()
 }
 pub fn is_open(app: &App) -> bool {
     app.view_stack.top_kind() == Some(ModalKind::PetHabitat)
+        || (main_view(app) && app.view_stack.is_empty())
 }
-/// `/pet on|off`. Enabling enters the habitat now and lets every accepted
-/// turn re-enter it; disabling closes the view and stops automatic entry.
-/// The durable pet keeps living in its companion either way, and the
-/// composer draft, transcript and active Engine turn are never touched.
+/// `/pet on|off` selects the shell backdrop without taking composer focus.
+/// Drafts, history, selection and the active Engine turn retain their owners.
 pub fn set_enabled(app: &mut App, enabled: bool) {
     app.pet_watch.enabled = enabled;
-    if enabled {
-        open_habitat(app);
-        return;
-    }
-    app.pet_watch.work_enter_pending = false;
-    app.pet_watch.work_complete = false;
-    if is_open(app) {
+    if app.view_stack.top_kind() == Some(ModalKind::PetHabitat) {
         app.view_stack.pop();
     }
-    let session = app.pet_watch.session.clone();
-    app.pet_watch.reset(session);
+    if enabled {
+        crate::tui::work_surface::release_focus(app);
+        app.launch.visible = false;
+        crate::tui::agent_focus::exit_focus(app);
+        app.file_tree = None;
+        app.file_tree_visible = false;
+        app.pet_watch.ensure(app.current_session_id.clone());
+    } else {
+        let session = app.pet_watch.session.clone();
+        app.pet_watch.reset(session);
+    }
     app.needs_redraw = true;
+}
+/// F5 and `/pet inspect` enter the same existing modal stack. Printable keys,
+/// paste, submit and editing remain with the normal composer on the main view.
+pub fn handle_inspect_key(app: &mut App, key: &crossterm::event::KeyEvent) -> bool {
+    use crate::tui::shell_key_routing::{self, ShellBindingId};
+    if app.pet_watch.enabled
+        && shell_key_routing::route(app.focus(), key) == Some(ShellBindingId::PetInspect)
+    {
+        open_habitat(app);
+        true
+    } else {
+        false
+    }
 }
 /// The existing Engine determines work boundaries. Only the shell reads the
 /// answer; no conversation text enters the pet owner or recording.
@@ -356,35 +434,21 @@ pub fn observe(app: &mut App, event: &Event, now: Instant) {
         .observe(event, app.current_session_id.as_deref(), now);
     if matches!(event, Event::TurnStarted { .. }) {
         app.pet_watch.work_history_start = app.history.len();
-        app.pet_watch.work_complete = false;
-        app.pet_watch.result_scroll = 0;
-        app.pet_watch.work_enter_pending = app.pet_watch.enabled;
-    } else if let Event::TurnComplete { status, .. } = event {
-        app.pet_watch.work_enter_pending = false;
-        app.pet_watch.work_complete = *status == TurnOutcomeStatus::Completed
-            && app.view_stack.top_kind() == Some(ModalKind::PetHabitat);
+        app.pet_watch.full.reset_output();
+    } else if matches!(event, Event::TurnComplete { .. }) {
         app.needs_redraw = true;
     }
 }
 pub fn tick(app: &mut App, now: Instant) {
-    if app.pet_watch.work_enter_pending
-        && app.view_stack.is_empty()
-        && !app.redaction_gate
-        && app.onboarding == crate::tui::app::OnboardingState::None
-    {
-        app.pet_watch.work_enter_pending = false;
-        // Pet mode never hides a running turn behind a companion that is
-        // not there; the transcript stays in view until it answers again.
-        if !app.pet_watch.unavailable {
-            open_habitat(app);
-        }
-    }
-    // The habitat is the pet's only terminal view: it owns the whole content
-    // viewport or nothing. Reduced motion follows the shell's motion setting.
+    // Only the visible native backdrop or its inspector advances the stage.
+    // Other modal owners pause it; the existing composer never becomes a modal.
     let visible = !app.redaction_gate
         && app.onboarding == crate::tui::app::OnboardingState::None
         && is_open(app);
-    let motion = visible && crate::tui::underwater::decorative_shell_motion_enabled(app);
+    let motion = visible && full::motion(app).animates();
+    if visible && app.pet_watch.avatars.refresh(&app.workspace, now) {
+        app.needs_redraw = true;
+    }
     let waiting = matches!(
         ShellPhase::from_app(app),
         ShellPhase::Waiting | ShellPhase::Approval
@@ -399,6 +463,11 @@ pub fn tick(app: &mut App, now: Instant) {
         .lock()
         .map(|mut c| std::mem::take(&mut *c))
         .unwrap_or_default();
+    let agents = if controls.is_empty() {
+        Vec::new()
+    } else {
+        full::agents(app)
+    };
     let state = &mut app.pet_watch;
     if state.session != app.current_session_id {
         state.reset(app.current_session_id.clone());
@@ -407,7 +476,8 @@ pub fn tick(app: &mut App, now: Instant) {
         state.ensure(app.current_session_id.clone());
     }
     for control in controls {
-        apply(state, control)
+        apply(state, control, &agents);
+        app.needs_redraw = true;
     }
     if let Some(update) = state
         .worker
@@ -419,7 +489,7 @@ pub fn tick(app: &mut App, now: Instant) {
         }
         state.raster = Some(update);
         state.unavailable = false;
-        if visible {
+        if visible && !full::canonical(state) {
             app.needs_redraw = true;
         }
     }
@@ -451,8 +521,10 @@ pub fn tick(app: &mut App, now: Instant) {
             height: a.height.saturating_sub(1).clamp(1, 256),
             cell_width: cell.0,
             cell_height: cell.1,
-            motion,
-            pixels: crate::tui::mark::kitty_graphics_supported()
+            motion: motion && !full::canonical(state),
+            pixels: !full::canonical(state)
+                && matches!(state.avatars.key.as_str(), "" | "whale")
+                && crate::tui::mark::kitty_graphics_supported()
                 && app.synchronized_output_enabled
                 && std::env::var("CODEWHALE_PET_GRAPHICS").as_deref() != Ok("braille"),
             visible,
@@ -490,7 +562,10 @@ pub fn tick(app: &mut App, now: Instant) {
             ),
             Notice::Unreachable(message) => {
                 app.pet_watch.unavailable = true;
-                if app.is_loading && is_open(app) {
+                if app.is_loading
+                    && app.view_stack.top_kind() == Some(ModalKind::PetHabitat)
+                    && !full::canonical(&app.pet_watch)
+                {
                     app.view_stack.pop();
                 }
                 (
@@ -508,6 +583,7 @@ pub fn tick(app: &mut App, now: Instant) {
         app.push_status_toast(text, level, Some(12000));
         app.needs_redraw = true;
     }
+    full::tick(app, visible, now);
 }
 fn render_tank(frame: &mut Frame, area: Rect, app: &mut App) {
     app.pet_watch.area = Some(area);
@@ -524,7 +600,9 @@ fn render_tank(frame: &mut Frame, area: Rect, app: &mut App) {
                 && activity.freshness == codewhale_protocol::engine_owner::OwnerFreshness::Fresh
                 && r.frame_changed.elapsed().as_millis() < 800
             {
-                if let Some(kind) = activity.activity_kind {
+                if let Some(action) = activity.action_id.as_deref() {
+                    text = format!("{action} · {text}");
+                } else if let Some(kind) = activity.activity_kind {
                     text = format!("{} · {}", kind.as_str(), text);
                 }
                 if activity.parallel_agent_count > 0 {
@@ -574,6 +652,33 @@ fn render_tank(frame: &mut Frame, area: Rect, app: &mut App) {
         Block::default().style(Style::default().bg(Color::Rgb(bg[0], bg[1], bg[2]))),
         area,
     );
+    let (act, clock) = avatars::act(raster, app.is_loading);
+    let reduced = !full::motion(app).animates();
+    let tank = Rect {
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    if app
+        .pet_watch
+        .avatars
+        .paint(tank, frame.buffer_mut(), act, clock, reduced)
+    {
+        let preview = app.pet_watch.avatars.action.as_deref().or(app
+            .pet_watch
+            .avatars
+            .view
+            .as_deref());
+        let label = preview.map_or(label.clone(), |p| format!("/pet action {p} · {label}"));
+        frame.render_widget(
+            Paragraph::new(label).style(chrome_style(&app.ui_theme, ChromeInk::Metadata)),
+            Rect {
+                y: area.bottom().saturating_sub(1),
+                height: 1,
+                ..area
+            },
+        );
+        return;
+    }
     if image {
         let tank = Rect {
             height: area.height.saturating_sub(1),
@@ -598,6 +703,23 @@ fn render_tank(frame: &mut Frame, area: Rect, app: &mut App) {
             &label,
             Style::default().fg(ink),
         );
+        if let Some(raster) = raster.filter(|r| r.width == area.width && r.height == tank.height)
+            && area.height >= 4
+            && unicode_width::UnicodeWidthStr::width(label.as_str()) <= usize::from(area.width)
+        {
+            for y in tank.y..tank.bottom() {
+                for x in tank.x..tank.right() {
+                    let index =
+                        usize::from(y - tank.y) * usize::from(tank.width) + usize::from(x - tank.x);
+                    if raster.cells.get(index).is_some_and(|bits| *bits != 0)
+                        && let Some(rgb) = raster.colors.get(index)
+                        && let Some(cell) = frame.buffer_mut().cell_mut((x, y))
+                    {
+                        cell.set_fg(Color::Rgb(rgb[0], rgb[1], rgb[2]));
+                    }
+                }
+            }
+        }
         if raster.is_none() {
             paint_resting_whale(frame, area, Style::default().fg(ink));
         }
@@ -634,86 +756,6 @@ fn paint_resting_whale(frame: &mut Frame, area: Rect, style: Style) {
         }
     }
 }
-pub fn render_full(frame: &mut Frame, app: &mut App) {
-    let area = frame.area();
-    frame.render_widget(
-        Block::default().style(Style::default().bg(app.ui_theme.surface_bg)),
-        area,
-    );
-    frame.render_widget(
-        Paragraph::new(tr(app.ui_locale, MessageId::PetHabitatTitle))
-            .style(chrome_style(&app.ui_theme, ChromeInk::Active)),
-        Rect { height: 1, ..area },
-    );
-    let tank = Rect {
-        x: area.x,
-        y: area.y + 2,
-        width: area.width,
-        height: if app.pet_watch.work_complete {
-            area.height.saturating_sub(5) / 3
-        } else {
-            area.height.saturating_sub(5)
-        },
-    };
-    render_tank(frame, tank, app);
-    if app.pet_watch.work_complete {
-        let result_area = Rect {
-            x: area.x.saturating_add(3),
-            y: tank.bottom().saturating_add(1),
-            width: area.width.saturating_sub(6),
-            height: area
-                .bottom()
-                .saturating_sub(tank.bottom())
-                .saturating_sub(4),
-        };
-        let result = app
-            .history
-            .iter()
-            .skip(app.pet_watch.work_history_start)
-            .rfind(|cell| {
-                matches!(
-                    cell,
-                    crate::tui::history::HistoryCell::Assistant { .. }
-                        | crate::tui::history::HistoryCell::Error { .. }
-                )
-            });
-        let lines = result
-            .map(|cell| cell.transcript_lines(result_area.width))
-            .unwrap_or_else(|| {
-                vec![ratatui::text::Line::from(
-                    tr(app.ui_locale, MessageId::NotificationTurnComplete).into_owned(),
-                )]
-            });
-        app.pet_watch.result_scroll = app.pet_watch.result_scroll.min(
-            lines
-                .len()
-                .saturating_sub(usize::from(result_area.height))
-                .min(usize::from(u16::MAX)) as u16,
-        );
-        frame.render_widget(
-            Paragraph::new(lines).scroll((app.pet_watch.result_scroll, 0)),
-            result_area,
-        );
-    }
-    let hints = if app.pet_watch.work_complete {
-        format!(
-            "↑↓ / PgUp/PgDn {} · {}",
-            tr(app.ui_locale, MessageId::SetupActionScrollBody),
-            habitat::hints(app.ui_locale)
-        )
-    } else {
-        habitat::hints(app.ui_locale)
-    };
-    frame.render_widget(
-        Paragraph::new(hints).style(chrome_style(&app.ui_theme, ChromeInk::Metadata)),
-        Rect {
-            x: area.x,
-            y: area.bottom().saturating_sub(2),
-            width: area.width,
-            height: 2,
-        },
-    );
-}
 pub(crate) fn clear_images(output: &mut impl Write) -> io::Result<()> {
     graphics::clear(output)
 }
@@ -746,7 +788,11 @@ mod tests {
             Instant::now(),
         );
         tick(&mut app, Instant::now());
-        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::PetHabitat));
+        assert!(
+            app.view_stack.is_empty(),
+            "accepted work keeps the composer focused"
+        );
+        assert!(main_view(&app));
         app.add_message(crate::tui::history::HistoryCell::Assistant {
             content: "Prepared result stays in the transcript".into(),
             streaming: false,
@@ -764,7 +810,6 @@ mod tests {
             },
             Instant::now(),
         );
-        assert!(app.pet_watch.work_complete);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
         terminal.draw(|frame| render_full(frame, &mut app)).unwrap();
@@ -781,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_companion_paints_the_resting_whale_and_keeps_the_turn_visible() {
+    fn unavailable_companion_keeps_legacy_fallback_and_native_response_available() {
         let mut app =
             crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
         app.onboarding = crate::tui::app::OnboardingState::None;
@@ -812,6 +857,7 @@ mod tests {
         assert!(!text.contains(" · offline"), "no orphan separator: {text}");
 
         app.pet_watch.enabled = true;
+        app.is_loading = true;
         observe(
             &mut app,
             &Event::TurnStarted {
@@ -822,11 +868,25 @@ mod tests {
             },
             Instant::now(),
         );
+        app.add_message(crate::tui::history::HistoryCell::Assistant {
+            content: "Fixture response while telemetry reconnects".into(),
+            streaming: true,
+        });
         tick(&mut app, Instant::now());
         assert!(
-            app.view_stack.is_empty(),
-            "pet mode must not cover a turn while the companion is unavailable"
+            is_open(&app),
+            "native pet mode keeps the actual turn available without a companion raster"
         );
+        terminal.draw(|frame| render_full(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Fixture response while telemetry reconnects"));
+        assert!(app.pet_watch.worker.is_none());
     }
 
     #[test]
@@ -866,13 +926,13 @@ mod tests {
         tick(&mut app, Instant::now());
         assert!(app.pet_watch.unavailable);
         assert!(
-            !is_open(&app),
-            "an unreachable companion hands the running turn back"
+            is_open(&app),
+            "the canonical whale and Engine response remain available while telemetry reconnects"
         );
     }
 
     #[test]
-    fn pet_off_stops_automatic_entry_and_keeps_the_draft() {
+    fn pet_off_restores_the_shell_and_keeps_the_draft() {
         let mut app =
             crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
         app.onboarding = crate::tui::app::OnboardingState::None;
@@ -891,65 +951,13 @@ mod tests {
             },
             Instant::now(),
         );
-        assert!(app.pet_watch.work_enter_pending);
+        assert!(main_view(&app));
+        assert!(app.view_stack.is_empty());
         set_enabled(&mut app, false);
         tick(&mut app, Instant::now());
         assert!(!app.pet_watch.enabled);
-        assert!(!app.pet_watch.work_enter_pending);
         assert!(app.view_stack.is_empty());
         assert_eq!(app.input, "kept draft");
-        assert!(app.pet_watch.worker.is_none());
-    }
-
-    #[test]
-    fn only_completed_turns_set_the_pet_done_state() {
-        let mut app =
-            crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
-        app.onboarding = crate::tui::app::OnboardingState::None;
-        app.redaction_gate = false;
-        app.pet_watch.detach_for_test();
-        open_habitat(&mut app);
-
-        let finish = |status| Event::TurnComplete {
-            usage: Default::default(),
-            parent_route_usage: Default::default(),
-            routed_usage_dropped_records: 0,
-            status,
-            error: None,
-            tool_catalog: None,
-            base_url: None,
-        };
-        for status in [TurnOutcomeStatus::Interrupted, TurnOutcomeStatus::Failed] {
-            observe(
-                &mut app,
-                &Event::TurnStarted {
-                    turn_id: format!("turn-{:?}", status),
-                    created_at: chrono::Utc::now(),
-                    route: None,
-                    submission_id: None,
-                },
-                Instant::now(),
-            );
-            observe(&mut app, &finish(status), Instant::now());
-            assert!(!app.pet_watch.work_complete, "{status:?} cannot mark Done");
-        }
-
-        observe(
-            &mut app,
-            &Event::TurnStarted {
-                turn_id: "turn-completed".into(),
-                created_at: chrono::Utc::now(),
-                route: None,
-                submission_id: None,
-            },
-            Instant::now(),
-        );
-        observe(
-            &mut app,
-            &finish(TurnOutcomeStatus::Completed),
-            Instant::now(),
-        );
-        assert!(app.pet_watch.work_complete);
         assert!(app.pet_watch.worker.is_none());
     }
 
@@ -959,7 +967,8 @@ mod tests {
         watch.detach_for_test();
         watch.session = Some("session-a".into());
         watch.active_turn_id = Some("turn-a".into());
-        watch.work_complete = true;
+        watch.full.output_scroll = 100;
+        watch.work_history_start = 50;
 
         watch.observe(
             &Event::TurnStarted {
@@ -975,7 +984,8 @@ mod tests {
         // The event that switched sessions is not dropped: its turn is the
         // one a later `turn_complete` must carry to claim Done.
         assert_eq!(watch.active_turn_id.as_deref(), Some("turn-b"));
-        assert!(!watch.work_complete, "Done never survives a session switch");
+        assert_eq!(watch.full.output_scroll, 0);
+        assert_eq!(watch.work_history_start, 0);
         assert!(!watch.failed, "a switch clears a prior failure");
         assert!(
             watch.worker.is_none(),
@@ -1042,6 +1052,7 @@ mod tests {
             &Event::OperationActivityStarted {
                 span_id: "private-internal-span".into(),
                 activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind::Computer,
+                action_id: Some("mcp_computer_use_click".into()),
             },
             None,
         )
@@ -1051,13 +1062,15 @@ mod tests {
             json!({
                 "event":"operation_activity_started",
                 "span_id":"private-internal-span",
-                "activity_kind":"computer"
+                "activity_kind":"computer",
+                "action_id":"mcp_computer_use_click"
             })
         );
         let completed = metadata(
             &Event::OperationActivityCompleted {
                 span_id: "private-internal-span".into(),
                 activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind::Editing,
+                action_id: Some("edit_file".into()),
                 outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome::Denied,
             },
             None,
@@ -1069,6 +1082,7 @@ mod tests {
                 "event":"operation_activity_completed",
                 "span_id":"private-internal-span",
                 "activity_kind":"editing",
+                "action_id":"edit_file",
                 "outcome":"denied"
             })
         );

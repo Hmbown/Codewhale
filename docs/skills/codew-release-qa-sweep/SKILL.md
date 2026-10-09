@@ -40,13 +40,13 @@ cargo test -p codewhale-config -p codewhale-protocol -p codewhale-cli \
   -p codewhale-workflow -p codewhale-state --locked
 
 # 3. TUI test binaries, locked
-cargo test -p codewhale-tui --bins --locked
+cargo test -p codewhale-tui --lib --locked
 
 # 4. TUI debug build, locked
-cargo build -p codewhale-tui --locked
+cargo build -p codewhale-cli --bin codewhale --locked
 
 # 5. Release build for the shipped binaries, locked
-cargo build --release --locked -p codewhale-cli -p codewhale-tui
+cargo build --release --locked -p codewhale-cli --bin codewhale
 
 # 6. Version-drift gate (workspace ↔ npm ↔ Cargo.lock ↔ changelog ↔ README)
 ./scripts/release/check-versions.sh

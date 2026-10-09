@@ -118,7 +118,7 @@ docker run --rm -it \\
   -e DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \\
   -v codewhale-home:/home/codewhale/.codewhale \\
   -v "$PWD:/workspace" -w /workspace \\
-  ghcr.io/hmbown/codewhale:latest`,
+  ghcr.io/codewhale-hq/codewhale:latest`,
           lang: "Terminal",
         },
         {

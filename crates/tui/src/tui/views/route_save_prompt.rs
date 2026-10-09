@@ -1,25 +1,22 @@
 //! Route-save decisions.
 //!
-//! A `/model` or `/provider` change is temporary by default. The explicit
-//! persistence choices are offered as a NON-BLOCKING band in the status area
-//! (u = update this Fleet, n = save as a new Fleet, d = remember as my
-//! default, k = keep for this session only). Nothing is written until the
-//! user presses one of those keys — a scripted or automated terminal is never
-//! interrupted by a modal.
+//! A `/model` or `/provider` change is temporary by default. Nothing is
+//! written until the user runs one of the explicit commands: `/fleet save`
+//! updates the selected Fleet, `/fleet save-as` saves the route as a new
+//! Fleet, and `/model save-default` remembers it as the startup default. No
+//! key is intercepted, so a scripted or automated terminal is never
+//! interrupted.
 
 /// The explicit persistence choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteSaveChoice {
-    /// Rewrite the selected Fleet's operator route to the session route.
+    /// Rewrite the selected Fleet's operator route to the session route
+    /// (`/fleet save`).
     UpdateFleet,
-    /// Save the session route as a brand-new Fleet (user-global) and select it.
+    /// Save the session route as a brand-new Fleet (user-global) and select it
+    /// (`/fleet save-as`).
     SaveAsNewFleet,
-    /// Remember the session route as the startup default (settings; only
-    /// offered when no Fleet is selected).
+    /// Remember the session route as the startup default
+    /// (`/model save-default`).
     SaveAsDefault,
-    /// Write nothing; the change lives for this session only. (Implemented
-    /// directly by the key loop's `k`/Esc handling; kept as the named choice
-    /// so receipts and tests speak the same vocabulary.)
-    #[expect(dead_code)]
-    SessionOnly,
 }

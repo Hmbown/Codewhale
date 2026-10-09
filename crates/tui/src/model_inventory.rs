@@ -8,8 +8,8 @@ use serde::Serialize;
 
 use crate::client::system_one::DecisionRouterRoute;
 use crate::config::{
-    ApiProvider, AutoRouterKind, Config, has_api_key_for, normalize_model_name_for_provider,
-    provider_capability,
+    AutoRouterKind, Config, ProviderIdentity, ProviderKind, has_api_key_for,
+    normalize_model_name_for_provider, provider_capability,
 };
 use crate::provider_lake::models_for_provider;
 
@@ -26,9 +26,14 @@ pub(crate) enum ModelAuthSource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ModelRouteCandidate {
-    pub(crate) provider: ApiProvider,
-    pub(crate) provider_name: &'static str,
-    pub(crate) provider_display_name: &'static str,
+    #[serde(rename = "provider")]
+    pub(crate) provider_tag: String,
+    #[serde(skip)]
+    pub(crate) provider: ProviderKind,
+    #[serde(skip)]
+    pub(crate) identity: ProviderIdentity,
+    pub(crate) provider_name: String,
+    pub(crate) provider_display_name: String,
     pub(crate) model: String,
     /// Explicit declarations keep case-sensitive wire identity; bundled aliases
     /// retain the existing case-insensitive convenience lookup.
@@ -102,10 +107,12 @@ pub(crate) fn probability_bp(value: f64) -> u16 {
     (value.clamp(0.0, 1.0) * 10_000.0).round() as u16
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModelInventory {
-    pub(crate) active_provider: ApiProvider,
-    pub(crate) router_provider: ApiProvider,
+    pub(crate) active_provider: ProviderKind,
+    pub(crate) active_identity: ProviderIdentity,
+    pub(crate) router_provider: ProviderKind,
+    pub(crate) router_identity: Option<ProviderIdentity>,
     pub(crate) router_model: String,
     /// Thinking tier for the classifier call (None = off) (#auto.router).
     pub(crate) router_thinking: Option<String>,
@@ -138,8 +145,53 @@ pub(crate) struct ModelInventory {
     pub(crate) candidates: Vec<ModelRouteCandidate>,
 }
 
+impl Serialize for ModelInventory {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let active = codewhale_config::descriptors::tui_wire_tag_for_route(
+            self.active_provider,
+            self.active_identity.key.as_str(),
+        )
+        .ok_or_else(|| serde::ser::Error::custom("contradictory active inventory identity"))?;
+        let router = self
+            .router_identity
+            .as_ref()
+            .map_or_else(
+                || {
+                    Some(
+                        codewhale_config::descriptors::compatibility_for_kind(self.router_provider)
+                            .tui_wire_tag,
+                    )
+                },
+                |identity| {
+                    codewhale_config::descriptors::tui_wire_tag_for_route(
+                        self.router_provider,
+                        identity.key.as_str(),
+                    )
+                },
+            )
+            .ok_or_else(|| serde::ser::Error::custom("contradictory router inventory identity"))?;
+        let mut state = serializer.serialize_struct("ModelInventory", 14)?;
+        state.serialize_field("active_provider", active)?;
+        state.serialize_field("router_provider", router)?;
+        state.serialize_field("router_model", &self.router_model)?;
+        state.serialize_field("router_thinking", &self.router_thinking)?;
+        state.serialize_field("router_timeout_secs", &self.router_timeout_secs)?;
+        state.serialize_field("router_configured", &self.router_configured)?;
+        state.serialize_field("router_available", &self.router_available)?;
+        state.serialize_field("router_kind", &self.router_kind)?;
+        state.serialize_field("router_decision_route", &self.router_decision_route)?;
+        state.serialize_field("router_base_url", &self.router_base_url)?;
+        state.serialize_field("router_min_confidence_bp", &self.router_min_confidence_bp)?;
+        state.serialize_field("router_setup_issue", &self.router_setup_issue)?;
+        state.serialize_field("cross_provider_auto", &self.cross_provider_auto)?;
+        state.serialize_field("candidates", &self.candidates)?;
+        state.end()
+    }
+}
+
 impl ModelInventory {
-    pub(crate) fn from_config(config: &Config) -> Self {
+    pub(crate) fn from_config(config: &Config) -> Result<Self, String> {
         Self::from_config_with_health(
             config,
             &crate::provider_readiness::ProviderReadinessSnapshot::default(),
@@ -149,34 +201,36 @@ impl ModelInventory {
     pub(crate) fn from_config_with_health(
         config: &Config,
         health: &crate::provider_readiness::ProviderReadinessSnapshot,
-    ) -> Self {
-        let active_provider = config.api_provider();
+    ) -> Result<Self, String> {
+        let active_identity = config.active_provider_identity()?;
+        let active_provider = active_identity.provider;
         let mut candidates = Vec::new();
 
-        for provider in ApiProvider::all().iter().copied() {
-            let Some(auth_source) = auth_source_for_provider(config, provider) else {
+        for identity in config.provider_identities() {
+            let provider = identity.provider;
+            let Some(auth_source) = auth_source_for_provider(config, &identity) else {
                 continue;
             };
-            let default_model = provider_default_model(config, provider);
+            let default_model = provider_default_model(config, &identity);
             let mut models = Vec::<String>::new();
-            if let Some(model) = configured_model_for_provider(config, provider) {
+            if let Some(model) = configured_model_for_provider(config, &identity) {
                 push_model(&mut models, provider, &model);
             }
-            if provider == active_provider {
+            if active_identity == identity {
                 let active_model = config.default_model();
                 if !active_model.trim().eq_ignore_ascii_case("auto") {
                     push_model(&mut models, provider, &active_model);
                 }
             }
-            for model in models_for_provider(config, active_provider, provider) {
+            for model in models_for_provider(config, &identity) {
                 push_model(&mut models, provider, &model);
             }
             for declaration in config.custom_models.as_deref().unwrap_or_default() {
                 if crate::provider_lake::configured_model_for_route(
                     config,
                     provider,
-                    &config.provider_identity_for(provider),
-                    &config.base_url_for_route(provider),
+                    identity.key.as_str(),
+                    &config.base_url_for_route(&identity),
                     &declaration.id,
                 )
                 .is_some()
@@ -191,7 +245,7 @@ impl ModelInventory {
 
             for model in models {
                 let readiness =
-                    crate::provider_readiness::resolve_for_model(config, provider, &model, health);
+                    crate::provider_readiness::resolve_for_model(config, &identity, &model, health);
                 let mut capability = provider_capability(provider, &model);
                 let mut user_declared = false;
                 // #5239/#5441: a candidate whose window came from the legacy
@@ -200,10 +254,14 @@ impl ModelInventory {
                 // that nobody verified it — the auto-router must not read a
                 // guessed window as a route capability.
                 let mut context_window_unverified =
-                    codewhale_models::model_catalog::resolved_context_window(&model).is_none();
-                if let Ok(route) =
-                    crate::route_runtime::resolve_runtime_route(config, provider, Some(&model))
-                {
+                    codewhale_config::catalog::reviewed::intrinsic_model(&model)
+                        .and_then(|row| row.context_window)
+                        .is_none();
+                if let Ok(route) = crate::route_runtime::resolve_runtime_route_for_identity(
+                    config,
+                    &identity,
+                    Some(&model),
+                ) {
                     if let Some(context_window) = route.candidate.limits().context_tokens {
                         capability.context_window = context_window.min(u64::from(u32::MAX)) as u32;
                         context_window_unverified = !route.context_window.source.is_verified();
@@ -261,7 +319,7 @@ impl ModelInventory {
                 }
                 if matches!(
                     provider,
-                    ApiProvider::Ollama | ApiProvider::Sglang | ApiProvider::Vllm
+                    ProviderKind::Ollama | ProviderKind::Sglang | ProviderKind::Vllm
                 ) {
                     tags.push("local");
                 }
@@ -279,8 +337,18 @@ impl ModelInventory {
 
                 candidates.push(ModelRouteCandidate {
                     provider,
-                    provider_name: provider.as_str(),
-                    provider_display_name: provider.display_name(),
+                    provider_tag: codewhale_config::descriptors::tui_wire_tag_for_route(
+                        provider,
+                        identity.key.as_str(),
+                    )
+                    .expect("admitted identity has a wire projection")
+                    .to_string(),
+                    identity: identity.clone(),
+                    provider_name: identity.key.to_string(),
+                    provider_display_name: identity.compatibility().map_or_else(
+                        || format!("{} (custom)", identity.key),
+                        |row| row.label.to_string(),
+                    ),
                     default_for_provider,
                     model,
                     user_declared,
@@ -348,19 +416,24 @@ impl ModelInventory {
                     None
                 } else {
                     let route = router_provider_setting
-                        .and_then(ApiProvider::parse)
+                        .and_then(|name| config.resolve_provider_pin_identity(name).ok())
                         .zip(router_model_setting);
                     // Same check a session route gets: a model the provider
                     // cannot serve would 404 every classifier call and fall
                     // back to local routing on every turn.
-                    if route.is_some_and(|(provider, model)| {
-                        crate::config::validate_route(provider, model).is_err()
+                    if route.as_ref().is_some_and(|(identity, model)| {
+                        crate::config::validate_route(identity.provider, model).is_err()
                     }) {
                         router_setup_issue = Some(AutoRouterSetupIssue::InvalidModel);
                         None
                     } else {
-                        route.map(|(provider, model)| {
-                            (provider, model.to_string(), thinking.map(str::to_string))
+                        route.map(|(identity, model)| {
+                            (
+                                identity.provider,
+                                Some(identity),
+                                model.to_string(),
+                                thinking.map(str::to_string),
+                            )
                         })
                     }
                 }
@@ -378,21 +451,37 @@ impl ModelInventory {
                         // configured `thinking` is ignored. TypeSafe is not a
                         // chat provider; `router_provider` is only a label
                         // there, and `router_decision_route` is authoritative.
-                        (ApiProvider::Openrouter, model.to_string(), None)
+                        (
+                            ProviderKind::Openrouter,
+                            config
+                                .builtin_provider_identity(ProviderKind::Openrouter)
+                                .ok(),
+                            model.to_string(),
+                            None,
+                        )
                     }),
                     None => None,
                 }
             }
         };
         let router_configured = explicit_router.is_some();
-        let (router_provider, router_model, router_thinking) = explicit_router
+        let (router_provider, router_identity, router_model, router_thinking) = explicit_router
             // Kept only as an inert display/default label for the router fields;
             // `router_available` below is what gates any classifier call.
-            .unwrap_or_else(|| (ApiProvider::Deepseek, "deepseek-v4-flash".to_string(), None));
+            .unwrap_or_else(|| {
+                (
+                    ProviderKind::Deepseek,
+                    None,
+                    "deepseek-v4-flash".to_string(),
+                    None,
+                )
+            });
         let router_available = router_configured
             && match router_decision_route {
                 Some(route) => route.has_key(config),
-                None => has_api_key_for(config, router_provider),
+                None => router_identity
+                    .as_ref()
+                    .is_some_and(|identity| has_api_key_for(config, identity)),
             };
         if router_declared && router_setup_issue.is_none() && !router_available {
             router_setup_issue = Some(if router_configured {
@@ -406,9 +495,11 @@ impl ModelInventory {
         let router_timeout_secs = config.auto_router_timeout_secs();
         let router_min_confidence_bp = probability_bp(config.auto_router_min_confidence());
 
-        Self {
+        Ok(Self {
             active_provider,
+            active_identity,
             router_provider,
+            router_identity,
             router_configured,
             router_available,
             router_model,
@@ -425,26 +516,24 @@ impl ModelInventory {
             router_setup_issue,
             cross_provider_auto,
             candidates,
-        }
+        })
     }
 
     /// Whether Auto routing may select `provider` (#4411).
-    pub(crate) fn auto_scope_allows(&self, provider: ApiProvider) -> bool {
-        self.cross_provider_auto || provider == self.active_provider
+    pub(crate) fn auto_scope_allows(&self, provider_id: &str) -> bool {
+        self.cross_provider_auto || self.active_identity.key.as_str() == provider_id
     }
 
-    pub(crate) fn candidate(
-        &self,
-        provider: ApiProvider,
-        model: &str,
-    ) -> Option<&ModelRouteCandidate> {
+    pub(crate) fn candidate(&self, provider_id: &str, model: &str) -> Option<&ModelRouteCandidate> {
         let model = model.trim();
         self.candidates
             .iter()
-            .find(|candidate| candidate.provider == provider && candidate.model == model)
+            .find(|candidate| {
+                candidate.identity.key.as_str() == provider_id && candidate.model == model
+            })
             .or_else(|| {
                 self.candidates.iter().find(|candidate| {
-                    candidate.provider == provider
+                    candidate.identity.key.as_str() == provider_id
                         && !candidate.user_declared
                         && candidate.model.eq_ignore_ascii_case(model)
                 })
@@ -455,11 +544,11 @@ impl ModelInventory {
         self.candidates
             .iter()
             .find(|candidate| {
-                candidate.provider == self.active_provider && candidate.default_for_provider
+                self.active_identity == candidate.identity && candidate.default_for_provider
             })
             .or_else(|| {
                 self.candidates.iter().find(|candidate| {
-                    candidate.provider == self.active_provider && candidate.readiness.can_attempt()
+                    self.active_identity == candidate.identity && candidate.readiness.can_attempt()
                 })
             })
             .or_else(|| {
@@ -481,13 +570,13 @@ impl ModelInventory {
     pub(crate) fn router_context_json(&self) -> String {
         #[derive(Serialize)]
         struct RouterInventoryContext<'a> {
-            active_provider: ApiProvider,
+            active_provider: &'a str,
             candidates: Vec<RouterCandidateContext<'a>>,
         }
 
         #[derive(Serialize)]
         struct RouterCandidateContext<'a> {
-            provider: ApiProvider,
+            provider: &'a str,
             provider_name: &'a str,
             provider_display_name: &'a str,
             model: &'a str,
@@ -514,12 +603,13 @@ impl ModelInventory {
             .candidates
             .iter()
             .filter(|candidate| {
-                candidate.readiness.can_attempt() && self.auto_scope_allows(candidate.provider)
+                candidate.readiness.can_attempt()
+                    && self.auto_scope_allows(candidate.identity.key.as_str())
             })
             .map(|candidate| RouterCandidateContext {
-                provider: candidate.provider,
-                provider_name: candidate.provider_name,
-                provider_display_name: candidate.provider_display_name,
+                provider: &candidate.provider_tag,
+                provider_name: &candidate.provider_name,
+                provider_display_name: &candidate.provider_display_name,
                 model: &candidate.model,
                 context_window: candidate.context_window,
                 context_window_unverified: candidate.context_window_unverified,
@@ -531,15 +621,15 @@ impl ModelInventory {
             })
             .collect();
         serde_json::to_string(&RouterInventoryContext {
-            active_provider: self.active_provider,
+            active_provider: self.active_identity.key.as_str(),
             candidates,
         })
         .unwrap_or_else(|_| "{}".to_string())
     }
 }
 
-fn push_model(models: &mut Vec<String>, provider: ApiProvider, model: &str) {
-    if provider == ApiProvider::Ollama && crate::config::is_unresolved_local_ollama_model(model) {
+fn push_model(models: &mut Vec<String>, provider: ProviderKind, model: &str) {
+    if provider == ProviderKind::Ollama && crate::config::is_unresolved_local_ollama_model(model) {
         return;
     }
     let Some(model) = normalize_model_name_for_provider(provider, model)
@@ -555,42 +645,47 @@ fn push_model(models: &mut Vec<String>, provider: ApiProvider, model: &str) {
     }
 }
 
-fn configured_model_for_provider(config: &Config, provider: ApiProvider) -> Option<String> {
+fn configured_model_for_provider(config: &Config, identity: &ProviderIdentity) -> Option<String> {
     config
-        .provider_config_for(provider)
+        .provider_config_for(identity)
         .and_then(|entry| entry.model.clone())
         .map(|model| model.trim().to_string())
         .filter(|model| !model.is_empty())
 }
 
-pub(crate) fn provider_default_model(config: &Config, provider: ApiProvider) -> String {
-    let configured = configured_model_for_provider(config, provider).or_else(|| {
-        (provider == config.api_provider() && config.default_text_model.is_some())
-            .then(|| config.default_model())
+pub(crate) fn provider_default_model(config: &Config, identity: &ProviderIdentity) -> String {
+    let provider = identity.provider;
+    let configured = configured_model_for_provider(config, identity).or_else(|| {
+        (config.active_provider_identity().ok().as_ref() == Some(identity)
+            && config.default_text_model.is_some())
+        .then(|| config.default_model())
     });
     let selector = configured.as_deref().filter(|model| {
         !model.trim().eq_ignore_ascii_case("auto")
-            && !(provider == ApiProvider::Ollama
+            && !(provider == ProviderKind::Ollama
                 && crate::config::is_unresolved_local_ollama_model(model))
     });
     // Inventory labels must use the executable route's exact endpoint default,
     // not whichever provider-wide snapshot happened to refresh most recently.
-    crate::route_runtime::resolve_runtime_route(config, provider, selector)
+    crate::route_runtime::resolve_runtime_route_for_identity(config, identity, selector)
         .map(|route| route.model)
         .unwrap_or_else(|_| {
             configured.unwrap_or_else(|| {
-                provider
-                    .kind()
-                    .map(|kind| kind.provider().default_model())
-                    .unwrap_or(crate::config::DEFAULT_TEXT_MODEL)
+                identity
+                    .compatibility()
+                    .map_or("", |row| row.default_model)
                     .to_string()
             })
         })
 }
 
-fn auth_source_for_provider(config: &Config, provider: ApiProvider) -> Option<ModelAuthSource> {
+fn auth_source_for_provider(
+    config: &Config,
+    identity: &ProviderIdentity,
+) -> Option<ModelAuthSource> {
+    let provider = identity.provider;
     let credential_state =
-        crate::provider_readiness::credential_state_for_provider(config, provider);
+        crate::provider_readiness::credential_state_for_provider(config, identity);
     match credential_state {
         crate::provider_readiness::CredentialState::NoAuth => {
             return Some(ModelAuthSource::NoAuth);
@@ -608,8 +703,8 @@ fn auth_source_for_provider(config: &Config, provider: ApiProvider) -> Option<Mo
         crate::provider_readiness::CredentialState::Saved => {}
     }
 
-    if provider == ApiProvider::Custom {
-        let configured = config.provider_config_for(provider)?;
+    if provider == ProviderKind::Custom {
+        let configured = config.provider_config_for(identity)?;
         if configured
             .api_key_env
             .as_deref()
@@ -625,11 +720,11 @@ fn auth_source_for_provider(config: &Config, provider: ApiProvider) -> Option<Mo
         }) || crate::config::explicit_cli_api_key_override().is_some())
         .then_some(ModelAuthSource::Config);
     }
-    if provider_uses_oauth_cli(config, provider) {
+    if provider_uses_oauth_cli(config, identity) {
         return Some(ModelAuthSource::OAuthCli);
     }
     if config
-        .provider_config_for(provider)
+        .provider_config_for(identity)
         .and_then(|entry| entry.api_key_env.as_deref())
         .map(str::trim)
         .filter(|name| !name.is_empty())
@@ -637,34 +732,35 @@ fn auth_source_for_provider(config: &Config, provider: ApiProvider) -> Option<Mo
     {
         return Some(ModelAuthSource::Env);
     }
-    if !config.should_skip_secret_store_for_provider(provider) && env_has_key_for(provider) {
+    if !config.should_skip_secret_store_for_provider(identity) && env_has_key_for(provider) {
         return Some(ModelAuthSource::Env);
     }
     Some(ModelAuthSource::Config)
 }
 
-fn provider_uses_oauth_cli(config: &Config, provider: ApiProvider) -> bool {
-    if config.provider_uses_custom_endpoint(provider) {
+fn provider_uses_oauth_cli(config: &Config, identity: &ProviderIdentity) -> bool {
+    let provider = identity.provider;
+    if config.provider_uses_custom_endpoint(identity) {
         return false;
     }
     match provider {
-        ApiProvider::OpenaiCodex => true,
-        ApiProvider::Xai => config
-            .provider_config_for(provider)
+        ProviderKind::OpenaiCodex => true,
+        ProviderKind::Xai => config
+            .provider_config_for(identity)
             .and_then(|entry| entry.auth_mode.as_deref())
             .is_some_and(crate::oauth::auth_mode_uses_xai_oauth),
         _ => false,
     }
 }
 
-fn env_has_key_for(provider: ApiProvider) -> bool {
+fn env_has_key_for(provider: ProviderKind) -> bool {
     env_keys_for_provider(provider)
         .iter()
         .any(|key| std::env::var(key).is_ok_and(|value| !value.trim().is_empty()))
 }
 
-fn env_keys_for_provider(provider: ApiProvider) -> &'static [&'static str] {
-    provider.env_vars()
+fn env_keys_for_provider(provider: ProviderKind) -> &'static [&'static str] {
+    provider.provider().env_vars()
 }
 
 #[cfg(test)]
@@ -673,8 +769,11 @@ mod tests {
 
     #[test]
     fn inventory_env_keys_follow_provider_metadata() {
-        for provider in ApiProvider::all() {
-            assert_eq!(env_keys_for_provider(*provider), provider.env_vars());
+        for provider in ProviderKind::all() {
+            assert_eq!(
+                env_keys_for_provider(*provider),
+                provider.provider().env_vars()
+            );
         }
     }
 
@@ -690,7 +789,7 @@ mod tests {
             ..Default::default()
         };
 
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
 
         // A DeepSeek key alone no longer elects a network classifier: with no
         // explicit `[auto.router]`, legacy Auto stays local/free.
@@ -698,14 +797,14 @@ mod tests {
         assert!(!inventory.router_available);
         assert!(
             inventory
-                .candidate(ApiProvider::Zai, crate::config::ZAI_GLM_5_2_MODEL)
+                .candidate(ProviderKind::Zai.as_str(), crate::config::ZAI_GLM_5_2_MODEL)
                 .is_some()
         );
         assert!(
             inventory
                 .candidates
                 .iter()
-                .all(|candidate| candidate.provider != ApiProvider::Minimax)
+                .all(|candidate| candidate.provider != ProviderKind::Minimax)
         );
     }
 
@@ -714,15 +813,20 @@ mod tests {
         let _env_lock = crate::test_support::lock_test_env();
         let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
         let mut config = Config::default();
-        config.set_provider_model_override(ApiProvider::Ollama, Some("local-tag:latest".into()));
+        config
+            .set_provider_model_override(
+                &config.test_identity_for_kind(ProviderKind::Ollama),
+                Some("local-tag:latest".into()),
+            )
+            .unwrap();
 
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
 
         assert!(
             inventory
                 .candidates
                 .iter()
-                .any(|candidate| candidate.provider == ApiProvider::Ollama
+                .any(|candidate| candidate.provider == ProviderKind::Ollama
                     && candidate.auth_source == ModelAuthSource::KeylessLocal)
         );
     }
@@ -744,10 +848,10 @@ mod tests {
             ..Default::default()
         };
 
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
         let candidate = inventory
             .candidate(
-                ApiProvider::OllamaCloud,
+                ProviderKind::OllamaCloud.as_str(),
                 crate::config::DEFAULT_OLLAMA_CLOUD_MODEL,
             )
             .expect("authenticated Ollama Cloud candidate");
@@ -791,12 +895,12 @@ mod tests {
             ..Default::default()
         };
 
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
         assert!(
             inventory
                 .candidates
                 .iter()
-                .all(|candidate| candidate.provider != ApiProvider::Moonshot),
+                .all(|candidate| candidate.provider != ProviderKind::Moonshot),
             "unsupported Kimi CLI OAuth must not enter the routing inventory"
         );
         assert_eq!(
@@ -821,9 +925,12 @@ mod tests {
             ..Default::default()
         };
 
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
         let candidate = inventory
-            .candidate(ApiProvider::Moonshot, crate::config::KIMI_CODE_K3_MODEL)
+            .candidate(
+                ProviderKind::Moonshot.as_str(),
+                crate::config::KIMI_CODE_K3_MODEL,
+            )
             .expect("configured Kimi Code K3 route");
 
         assert_eq!(candidate.context_window, 262_144);
@@ -850,9 +957,9 @@ mod tests {
             ..Default::default()
         };
 
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
         let candidate = inventory
-            .candidate(ApiProvider::Vllm, "qwen3-32b-256k")
+            .candidate(ProviderKind::Vllm.as_str(), "qwen3-32b-256k")
             .expect("configured self-hosted route");
         assert_eq!(candidate.context_window, 256_000);
         assert!(
@@ -889,12 +996,12 @@ mod tests {
             ..Default::default()
         };
 
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
         assert!(
             inventory
                 .candidates
                 .iter()
-                .any(|candidate| candidate.provider == ApiProvider::Custom
+                .any(|candidate| candidate.provider == ProviderKind::Custom
                     && candidate.model == "acme-coder"
                     && candidate.auth_source == ModelAuthSource::Env)
         );
@@ -908,7 +1015,12 @@ mod tests {
         let config = Config {
             ..Default::default()
         };
-        assert_eq!(ModelInventory::from_config(&config).router_timeout_secs, 4);
+        assert_eq!(
+            ModelInventory::from_config(&config)
+                .unwrap()
+                .router_timeout_secs,
+            4
+        );
 
         // Explicit value is honored.
         let config = Config {
@@ -924,7 +1036,12 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(ModelInventory::from_config(&config).router_timeout_secs, 15);
+        assert_eq!(
+            ModelInventory::from_config(&config)
+                .unwrap()
+                .router_timeout_secs,
+            15
+        );
 
         // Out-of-range values clamp to the safety ceiling, never to zero.
         let config = Config {
@@ -941,7 +1058,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            ModelInventory::from_config(&config).router_timeout_secs,
+            ModelInventory::from_config(&config)
+                .unwrap()
+                .router_timeout_secs,
             crate::config::MAX_AUTO_ROUTER_TIMEOUT_SECS
         );
 
@@ -959,7 +1078,12 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(ModelInventory::from_config(&config).router_timeout_secs, 4);
+        assert_eq!(
+            ModelInventory::from_config(&config)
+                .unwrap()
+                .router_timeout_secs,
+            4
+        );
     }
 
     #[test]
@@ -990,10 +1114,10 @@ mod tests {
             ..Default::default()
         };
 
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
         assert!(inventory.candidates.iter().all(|candidate| !matches!(
             candidate.provider,
-            ApiProvider::Openai | ApiProvider::Xai
+            ProviderKind::Openai | ProviderKind::Xai
         )));
     }
 
@@ -1014,9 +1138,9 @@ mod tests {
             ..Default::default()
         };
 
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
         assert!(inventory.router_configured);
-        assert_eq!(inventory.router_provider, ApiProvider::Zai);
+        assert_eq!(inventory.router_provider, ProviderKind::Zai);
         assert_eq!(inventory.router_model, "glm-5-turbo");
         assert_eq!(inventory.router_thinking.as_deref(), Some("low"));
     }
@@ -1033,7 +1157,7 @@ mod tests {
             ..Default::default()
         };
 
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
 
         assert!(
             !inventory.router_configured,
@@ -1064,7 +1188,7 @@ mod tests {
             ..Default::default()
         };
 
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
 
         assert!(inventory.router_configured);
         assert!(inventory.router_available);
@@ -1082,12 +1206,12 @@ mod tests {
             ..Default::default()
         };
 
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
         let candidate = inventory
             .candidates
             .iter()
             .find(|candidate| {
-                candidate.provider == ApiProvider::Vllm && candidate.model == "local-model"
+                candidate.provider == ProviderKind::Vllm && candidate.model == "local-model"
             })
             .expect("vLLM no-auth candidate");
 
@@ -1103,9 +1227,13 @@ mod tests {
         use crate::provider_readiness::ResolvedProviderReadiness;
 
         let candidate = ModelRouteCandidate {
-            provider: ApiProvider::Openai,
-            provider_name: "openai",
-            provider_display_name: "OpenAI",
+            provider: ProviderKind::Openai,
+            provider_tag: "openai".into(),
+            identity: Config::default()
+                .builtin_provider_identity(ProviderKind::Openai)
+                .unwrap(),
+            provider_name: "openai".into(),
+            provider_display_name: "OpenAI".into(),
             model: "gpt-5.5".to_string(),
             context_window: 128_000,
             context_window_unverified: false,
@@ -1126,8 +1254,12 @@ mod tests {
     #[test]
     fn active_default_never_falls_back_to_unready_candidate() {
         let inventory = ModelInventory {
-            active_provider: ApiProvider::Openai,
-            router_provider: ApiProvider::Deepseek,
+            active_provider: ProviderKind::Openai,
+            active_identity: Config::default()
+                .builtin_provider_identity(ProviderKind::Openai)
+                .unwrap(),
+            router_provider: ProviderKind::Deepseek,
+            router_identity: None,
             router_model: "deepseek-v4-flash".to_string(),
             router_thinking: None,
             router_timeout_secs: 4,
@@ -1140,9 +1272,13 @@ mod tests {
             router_setup_issue: None,
             cross_provider_auto: false,
             candidates: vec![ModelRouteCandidate {
-                provider: ApiProvider::Openai,
-                provider_name: "openai",
-                provider_display_name: "OpenAI",
+                provider: ProviderKind::Openai,
+                provider_tag: "openai".into(),
+                identity: Config::default()
+                    .builtin_provider_identity(ProviderKind::Openai)
+                    .unwrap(),
+                provider_name: "openai".into(),
+                provider_display_name: "OpenAI".into(),
                 model: "unsupported-model".to_string(),
                 context_window: 1,
                 context_window_unverified: false,
@@ -1164,11 +1300,11 @@ mod tests {
     fn router_context_is_runnable_and_redacts_auth_and_failure_details() {
         let _env_lock = crate::test_support::lock_test_env();
         let _deepseek = crate::test_support::EnvVarGuard::set("DEEPSEEK_API_KEY", "ds-key");
-        let mut inventory = ModelInventory::from_config(&Config::default());
+        let mut inventory = ModelInventory::from_config(&Config::default()).unwrap();
         let candidate = inventory
             .candidates
             .iter_mut()
-            .find(|candidate| candidate.provider == ApiProvider::Deepseek)
+            .find(|candidate| candidate.provider == ProviderKind::Deepseek)
             .expect("DeepSeek inventory candidate");
         candidate.readiness =
             crate::provider_readiness::ResolvedProviderReadiness::SavedLastCheckFailed {
@@ -1176,9 +1312,13 @@ mod tests {
                 message: "Bearer super-secret-router-token".to_string(),
             };
         inventory.candidates.push(ModelRouteCandidate {
-            provider: ApiProvider::Openai,
-            provider_name: "openai",
-            provider_display_name: "OpenAI",
+            provider: ProviderKind::Openai,
+            provider_tag: "openai".into(),
+            identity: Config::default()
+                .builtin_provider_identity(ProviderKind::Openai)
+                .unwrap(),
+            provider_name: "openai".into(),
+            provider_display_name: "OpenAI".into(),
             model: "unsupported-model".to_string(),
             context_window: 1,
             context_window_unverified: false,
@@ -1213,12 +1353,12 @@ mod tests {
             ..Default::default()
         };
 
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
         assert!(
             inventory
                 .candidates
                 .iter()
-                .any(|candidate| candidate.provider == ApiProvider::Deepseek),
+                .any(|candidate| candidate.provider == ProviderKind::Deepseek),
             "the full inventory still knows about DeepSeek for pickers/explicit routes"
         );
 
@@ -1255,7 +1395,9 @@ mod tests {
             ..Default::default()
         };
 
-        let json = ModelInventory::from_config(&config).router_context_json();
+        let json = ModelInventory::from_config(&config)
+            .unwrap()
+            .router_context_json();
 
         assert!(json.contains("\"zai\""), "{json}");
         assert!(json.contains("deepseek"), "{json}");
@@ -1273,7 +1415,7 @@ mod tests {
             provider: Some("zai".to_string()),
             ..Default::default()
         };
-        assert!(!ModelInventory::from_config(&zai).router_available);
+        assert!(!ModelInventory::from_config(&zai).unwrap().router_available);
 
         // `cross_provider = true` widens which candidates Auto may pick; it is
         // NOT a classifier election. With the implicit DeepSeek-flash default
@@ -1287,9 +1429,9 @@ mod tests {
             }),
             ..zai.clone()
         };
-        let widened = ModelInventory::from_config(&opted_in);
+        let widened = ModelInventory::from_config(&opted_in).unwrap();
         assert!(!widened.router_available);
-        assert!(widened.auto_scope_allows(ApiProvider::Deepseek));
+        assert!(widened.auto_scope_allows(ProviderKind::Deepseek.as_str()));
 
         // An explicitly configured `[auto.router]` is itself a persisted
         // opt-in for that classifier route.
@@ -1307,7 +1449,11 @@ mod tests {
             }),
             ..zai.clone()
         };
-        assert!(ModelInventory::from_config(&explicit_router).router_available);
+        assert!(
+            ModelInventory::from_config(&explicit_router)
+                .unwrap()
+                .router_available
+        );
 
         // A DeepSeek session gets no free classifier either: with the
         // implicit flash default removed, only an explicit `[auto.router]`
@@ -1316,7 +1462,11 @@ mod tests {
             provider: Some("deepseek".to_string()),
             ..Default::default()
         };
-        assert!(!ModelInventory::from_config(&deepseek).router_available);
+        assert!(
+            !ModelInventory::from_config(&deepseek)
+                .unwrap()
+                .router_available
+        );
     }
 
     #[test]
@@ -1334,17 +1484,24 @@ mod tests {
         other.id = "preview-fixture".into();
         other.limit.as_mut().unwrap().context = Some(128000);
         config.custom_models.as_mut().unwrap().push(other);
-        config.set_provider_api_key_override(ApiProvider::Deepseek, Some("fixture-key".into()));
-        let inventory = ModelInventory::from_config(&config);
+        config
+            .set_provider_api_key_override(
+                &config.test_identity_for_kind(ProviderKind::Deepseek),
+                Some("fixture-key".into()),
+            )
+            .unwrap();
+        let inventory = ModelInventory::from_config(&config).unwrap();
         for (id, context) in [("Preview-fixture", 96000), ("preview-fixture", 128000)] {
-            let candidate = inventory.candidate(ApiProvider::Deepseek, id).unwrap();
+            let candidate = inventory
+                .candidate(ProviderKind::Deepseek.as_str(), id)
+                .unwrap();
             assert!(candidate.user_declared);
             assert_eq!(candidate.model, id);
             assert_eq!(candidate.context_window, context);
         }
         assert!(
             inventory
-                .candidate(ApiProvider::Deepseek, "PREVIEW-FIXTURE")
+                .candidate(ProviderKind::Deepseek.as_str(), "PREVIEW-FIXTURE")
                 .is_none()
         );
     }
@@ -1367,21 +1524,28 @@ mod tests {
             ..Default::default()
         };
         let endpoint = "http://localhost:11445/v1";
-        config.provider_config_for_mut(ApiProvider::Ollama).base_url = Some(endpoint.into());
+        config
+            .provider_config_for_mut(&config.test_identity_for_kind(ProviderKind::Ollama))
+            .unwrap()
+            .base_url = Some(endpoint.into());
         assert_eq!(
-            provider_default_model(&config, ApiProvider::Ollama),
+            provider_default_model(
+                &config,
+                &(config).test_identity_for_kind(ProviderKind::Ollama)
+            ),
             "unknown"
         );
         assert!(
             ModelInventory::from_config(&config)
+                .unwrap()
                 .candidates
                 .iter()
-                .all(|row| { row.provider != ApiProvider::Ollama || row.model != "unknown" })
+                .all(|row| { row.provider != ProviderKind::Ollama || row.model != "unknown" })
         );
         let fingerprint = base_url_fingerprint(endpoint);
         let now = now_unix();
         let ticket = crate::provider_catalog_live::begin_refresh_for_identity(
-            ApiProvider::Ollama,
+            ProviderKind::Ollama,
             "ollama",
             endpoint,
         );
@@ -1404,20 +1568,28 @@ mod tests {
             },
         );
         assert_eq!(
-            provider_default_model(&config, ApiProvider::Ollama),
+            provider_default_model(
+                &config,
+                &(config).test_identity_for_kind(ProviderKind::Ollama)
+            ),
             "qwen2.5:0.5b"
         );
-        let inventory = ModelInventory::from_config(&config);
+        let inventory = ModelInventory::from_config(&config).unwrap();
         assert!(inventory.candidates.iter().any(|row| {
-            row.provider == ApiProvider::Ollama
+            row.provider == ProviderKind::Ollama
                 && row.model == "qwen2.5:0.5b"
                 && row.default_for_provider
         }));
         let mut other = config.clone();
-        other.provider_config_for_mut(ApiProvider::Ollama).base_url =
-            Some("http://localhost:11446/v1".into());
+        other
+            .provider_config_for_mut(&other.test_identity_for_kind(ProviderKind::Ollama))
+            .unwrap()
+            .base_url = Some("http://localhost:11446/v1".into());
         assert_eq!(
-            provider_default_model(&other, ApiProvider::Ollama),
+            provider_default_model(
+                &other,
+                &(other).test_identity_for_kind(ProviderKind::Ollama)
+            ),
             "unknown"
         );
         crate::provider_catalog_live::record_failure_if_current(
@@ -1427,12 +1599,23 @@ mod tests {
             CatalogRefreshError::Network,
         );
         assert_eq!(
-            provider_default_model(&config, ApiProvider::Ollama),
+            provider_default_model(
+                &config,
+                &(config).test_identity_for_kind(ProviderKind::Ollama)
+            ),
             "unknown"
         );
-        config.set_provider_model_override(ApiProvider::Ollama, Some("chosen:tag".into()));
+        config
+            .set_provider_model_override(
+                &config.test_identity_for_kind(ProviderKind::Ollama),
+                Some("chosen:tag".into()),
+            )
+            .unwrap();
         assert_eq!(
-            provider_default_model(&config, ApiProvider::Ollama),
+            provider_default_model(
+                &config,
+                &(config).test_identity_for_kind(ProviderKind::Ollama)
+            ),
             "chosen:tag"
         );
         crate::provider_catalog_live::reset_cache_for_test();
@@ -1489,7 +1672,8 @@ mod decision_router_inventory_tests {
     #[test]
     fn decision_router_on_openrouter_needs_the_openrouter_key() {
         let _env = hermetic();
-        let with_key = ModelInventory::from_config(&with_router(decision("openrouter"), true));
+        let with_key =
+            ModelInventory::from_config(&with_router(decision("openrouter"), true)).unwrap();
         assert!(with_key.router_configured);
         assert!(with_key.router_available);
         assert_eq!(with_key.router_kind, AutoRouterKind::Decision);
@@ -1504,7 +1688,8 @@ mod decision_router_inventory_tests {
         assert_eq!(with_key.router_min_confidence_bp, 5_000);
         assert_eq!(with_key.router_setup_issue, None);
 
-        let without_key = ModelInventory::from_config(&with_router(decision("openrouter"), false));
+        let without_key =
+            ModelInventory::from_config(&with_router(decision("openrouter"), false)).unwrap();
         assert!(without_key.router_configured);
         assert!(!without_key.router_available);
         assert_eq!(
@@ -1520,7 +1705,7 @@ mod decision_router_inventory_tests {
             kind: Some("bogus".to_string()),
             ..decision("openrouter")
         };
-        let inventory = ModelInventory::from_config(&with_router(bogus, true));
+        let inventory = ModelInventory::from_config(&with_router(bogus, true)).unwrap();
         assert!(!inventory.router_configured);
         assert!(!inventory.router_available);
         assert_eq!(
@@ -1528,7 +1713,7 @@ mod decision_router_inventory_tests {
             Some(AutoRouterSetupIssue::UnknownKind)
         );
 
-        let zai = ModelInventory::from_config(&with_router(decision("zai"), true));
+        let zai = ModelInventory::from_config(&with_router(decision("zai"), true)).unwrap();
         assert!(!zai.router_configured);
         assert_eq!(
             zai.router_setup_issue,
@@ -1546,7 +1731,7 @@ mod decision_router_inventory_tests {
             thinking: Some(thinking.to_string()),
             ..Default::default()
         };
-        let typo = ModelInventory::from_config(&with_router(chat("hgih"), true));
+        let typo = ModelInventory::from_config(&with_router(chat("hgih"), true)).unwrap();
         assert!(!typo.router_configured);
         assert!(!typo.router_available);
         assert_eq!(
@@ -1554,7 +1739,7 @@ mod decision_router_inventory_tests {
             Some(AutoRouterSetupIssue::InvalidThinking)
         );
 
-        let valid = ModelInventory::from_config(&with_router(chat("low"), true));
+        let valid = ModelInventory::from_config(&with_router(chat("low"), true)).unwrap();
         assert!(valid.router_available);
         assert_eq!(valid.router_setup_issue, None);
         assert_eq!(valid.router_thinking.as_deref(), Some("low"));
@@ -1571,7 +1756,8 @@ mod decision_router_inventory_tests {
         };
         // A model from another provider's namespace, either direction.
         for (provider, model) in [("deepseek", "gpt-5-mini"), ("zai", "deepseek-v4-flash")] {
-            let wrong = ModelInventory::from_config(&with_router(chat(provider, model), true));
+            let wrong =
+                ModelInventory::from_config(&with_router(chat(provider, model), true)).unwrap();
             assert!(!wrong.router_configured, "{provider}/{model}");
             assert_eq!(
                 wrong.router_setup_issue,
@@ -1581,7 +1767,8 @@ mod decision_router_inventory_tests {
         }
 
         let valid =
-            ModelInventory::from_config(&with_router(chat("deepseek", "deepseek-v4-flash"), true));
+            ModelInventory::from_config(&with_router(chat("deepseek", "deepseek-v4-flash"), true))
+                .unwrap();
         assert!(valid.router_configured);
         assert_ne!(
             valid.router_setup_issue,
@@ -1611,7 +1798,8 @@ mod decision_router_inventory_tests {
             },
         ];
         for router in tuning_only {
-            let inventory = ModelInventory::from_config(&with_router(router.clone(), true));
+            let inventory =
+                ModelInventory::from_config(&with_router(router.clone(), true)).unwrap();
             assert!(!inventory.router_available, "{router:?}");
             assert_eq!(
                 inventory.router_setup_issue,
@@ -1635,7 +1823,9 @@ mod decision_router_inventory_tests {
                 ..decision("openrouter")
             };
             assert_eq!(
-                ModelInventory::from_config(&with_router(router, true)).router_min_confidence_bp,
+                ModelInventory::from_config(&with_router(router, true))
+                    .unwrap()
+                    .router_min_confidence_bp,
                 expected,
                 "{configured:?}"
             );

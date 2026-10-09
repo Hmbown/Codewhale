@@ -18,6 +18,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
+#[cfg(test)]
 use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -160,6 +161,7 @@ impl HelpView {
     /// Discoverability index over every user-invocable surface (#3912):
     /// built-ins, workspace commands, and discovered skills. `skills` comes
     /// from `App::cached_skills`; pass `&[]` only where none are discovered.
+    #[cfg(test)]
     pub fn new_for_workspace(
         locale: Locale,
         workspace: &Path,
@@ -170,17 +172,20 @@ impl HelpView {
         })
     }
 
-    /// Open Help as the keyboard reference promised by shell shortcut hints.
-    pub fn new_for_shortcuts(
-        locale: Locale,
-        workspace: &Path,
-        skills: &[(String, String)],
-    ) -> Self {
-        commands::user_registry::with_registry_for_workspace(Some(workspace), |registry| {
-            Self::new_with_registry(locale, HelpOrdering::KeybindingsFirst, registry, skills)
+    pub fn new_for_app(app: &crate::tui::app::App, shortcuts: bool) -> Self {
+        commands::user_registry::with_registry_for_app(app, |registry| {
+            Self::new_with_registry(
+                app.ui_locale,
+                if shortcuts {
+                    HelpOrdering::KeybindingsFirst
+                } else {
+                    HelpOrdering::CommandsFirst
+                },
+                registry,
+                &app.cached_skills,
+            )
         })
     }
-
     fn new_with_ordering(locale: Locale, ordering: HelpOrdering) -> Self {
         let registry = commands::user_registry::UserCommandRegistry::new();
         Self::new_with_registry(locale, ordering, &registry, &[])

@@ -188,7 +188,7 @@ pub(crate) fn project_agent_details(app: &App, agent_id: &str) -> Option<AgentDe
     if let Some(duration_ms) = surface_row.duration_ms {
         state.push(format!(
             "elapsed {}",
-            crate::elapsed::format_elapsed_ms(duration_ms)
+            codewhale_command_contract::elapsed::format_elapsed_ms(duration_ms)
         ));
     }
     state.push(format!(
@@ -574,6 +574,7 @@ mod tests {
             git_branch: None,
             agent_type: FleetRole::Builder,
             assignment: SubAgentAssignment {
+                native_preset: None,
                 objective: "Implement the bounded details route".to_string(),
                 role: Some("worker".to_string()),
             },
@@ -713,7 +714,9 @@ mod tests {
         assert!(details.body.contains(&format!(
             "State: {} · elapsed {} · {} steps",
             row.status,
-            crate::elapsed::format_elapsed_ms(row.duration_ms.expect("duration")),
+            codewhale_command_contract::elapsed::format_elapsed_ms(
+                row.duration_ms.expect("duration")
+            ),
             row.steps_taken
         )));
         assert!(details.body.contains("Model: kimi-k3"));

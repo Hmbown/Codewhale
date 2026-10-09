@@ -245,9 +245,12 @@ fn client_for_route(route: &str, base: &str, model: &str) -> CodewhaleClient {
     // The fixture model and the client must share the production resolver.
     // Constructing from Config's default model can bind a different wire
     // format and record an open_failure without exercising the recording.
-    let resolved =
-        crate::route_runtime::resolve_runtime_route(&config, config.api_provider(), Some(model))
-            .expect("resolve fixture route");
+    let resolved = crate::route_runtime::resolve_runtime_route(
+        &config,
+        config.active_provider_identity().unwrap().provider,
+        Some(model),
+    )
+    .expect("resolve fixture route");
     let mut client = CodewhaleClient::from_candidate(&resolved.config, &resolved.candidate)
         .expect("fixture client");
     if route == "deepseek" {

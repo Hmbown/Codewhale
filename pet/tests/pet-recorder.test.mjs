@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile, stat, readdir, rename, symlink, utimes } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, stat, readdir, rename, symlink, utimes, realpath } from 'node:fs/promises';
 import { join, dirname, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createPetRecorder } from '../scripts/lib/pet-recorder.mjs';
@@ -79,19 +79,26 @@ test('the actual watch CLI keeps recording at one pathname through several rotat
   const { setTimeout: delay } = await import('node:timers/promises');
   const path = await destination(), input = `${path}.source.json`;
   await writeFile(input, JSON.stringify({ schemaVersion: 1, id: 'old', traceId: 'fixture', name: 'bash', category: 'code', startTime: 0, endTime: 1, attributes: {} }));
-  const child = spawnRecorder([`--input=${input}`, `--output=${path}`, '--watch', '--segment-buckets=2']);
+  // Test-only preload, using the suspension fixture's existing clock seam:
+  // advance one bucket per tick so a slow filesystem cannot turn this rotation
+  // test into a legitimate partial-segment restart. Production time is unchanged.
+  const clock = 'let calls=0;performance.now=()=>Math.max(0,calls++-1)*400;';
+  const archiveReport = `Archived pet recording: ${join(await realpath(dirname(path)), basename(part(path, 3)))}`;
+  const env = { ...process.env, NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=data:text/javascript,${encodeURIComponent(clock)}`.trim() };
+  const child = spawnRecorder([`--input=${input}`, `--output=${path}`, '--watch', '--segment-buckets=2'], env);
   let log = ''; child.stdout.on('data', b => log += b); child.stderr.on('data', b => log += b);
   const exited = once(child, 'exit');
   t.after(() => { if (child.exitCode === null) child.kill('SIGTERM'); });
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline && child.exitCode === null) {
-    try { if (decodePetJSONL(await readFile(path, 'utf8')).length >= 1 && (await stat(part(path, 3))).size) break; } catch { /* Wait for the next complete segment. */ }
+    try { if (log.includes(archiveReport) && decodePetJSONL(await readFile(path, 'utf8')).length >= 1) break; } catch { /* Wait for the published segment. */ }
     await delay(25);
   }
   child.stopRecorder(); const [code] = await exited; assert.equal(code, 0, log);
-  for (let i = 1; i <= 3; i++) assert.equal(decodePetJSONL(await readFile(part(path, i), 'utf8')).length, 2);
+  for (let i = 1; i <= 3; i++) assert.equal(decodePetJSONL(await readFile(part(path, i), 'utf8')).length, 2, part(path, i));
   assert.ok(decodePetJSONL(await readFile(path, 'utf8')).length >= 1);
-  assert.match(log, /Archived pet recording:/);
+  assert.ok(log.includes(archiveReport), log);
+  assert.doesNotMatch(log, /Recorder was suspended or stalled/);
 });
 
 test('a post-publication error preserves correct row accounting and allows the next distinct append', async () => {

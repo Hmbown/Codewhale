@@ -9,8 +9,8 @@ use cucumber::{World as _, given, then, when, writer::Stats as _};
 use tempfile::TempDir;
 
 use crate::commands::{self, CommandResult};
-use crate::config::ApiProvider;
 use crate::config::Config;
+use crate::config::ProviderKind;
 use crate::tui::app::{App, TuiOptions};
 use crate::tui::command_palette::{self, CommandPaletteEntry};
 use crate::tui::widgets::{self, SlashMenuEntry};
@@ -78,7 +78,7 @@ fn completion_hints(tmpdir: &TempDir, input: &str) -> Vec<SlashMenuEntry> {
         &[],
         Locale::En,
         Some(tmpdir.path()),
-        ApiProvider::Deepseek,
+        ProviderKind::Deepseek,
     )
 }
 

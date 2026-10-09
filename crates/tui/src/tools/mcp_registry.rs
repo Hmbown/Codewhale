@@ -373,7 +373,7 @@ const FULL_RESYNC_INTERVAL_SECS: i64 = 30 * 24 * 60 * 60;
 const USER_AGENT: &str = concat!(
     "Mozilla/5.0 (compatible; codewhale/",
     env!("CARGO_PKG_VERSION"),
-    "; +https://github.com/Hmbown/CodeWhale)"
+    "; +https://github.com/codewhale-hq/CodeWhale)"
 );
 /// Bounded retries for one sync. The on-disk cache only changes at the
 /// final atomic replace, so a failed fetch (HTTP/parse error) never

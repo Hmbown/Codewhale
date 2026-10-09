@@ -208,15 +208,16 @@ test("Docker desktop entrypoint survives repeated orderly restarts", { ...NEED_D
   containers.add(name);
   t.after(() => rmContainer(name));
   const started = await run("docker", [
-    "run", "-d", "--name", name, "--init", "--network", "none",
+    "run", "-d", "--name", name, "--init", "--network", "none", "--pull", "never",
     // Exercise the current entrypoint even if this developer has an older
-    // cached desktop image. No host display or input device is mounted.
-    "--mount", `type=bind,src=${path.join(ROOT, "docker", "entrypoint.sh")},dst=/app/docker/entrypoint.sh,readonly`,
-    spawnMod.DEFAULT_IMAGE, "sleep", "infinity",
+    // cached desktop image. Passing its source through argv also works when
+    // the Docker daemon cannot mount this host's checkout (e.g. a Colima VM).
+    "--entrypoint", "/bin/sh", spawnMod.DEFAULT_IMAGE,
+    "-c", fs.readFileSync(path.join(ROOT, "docker", "entrypoint.sh"), "utf8"), "sh", "sleep", "infinity",
   ], { timeoutMs: 30_000 });
   assert.equal(started.code, 0, started.stderr);
   const request = Buffer.from(JSON.stringify({ tool: "list_windows", args: {} })).toString("base64");
-  for (let cycle = 0; cycle < 3; cycle++) {
+  for (let cycle = 0; cycle <= 3; cycle++) {
     if (cycle) {
       const restarted = await run("docker", ["restart", name], { timeoutMs: 15_000 });
       assert.equal(restarted.code, 0, restarted.stderr);

@@ -4,30 +4,21 @@
 //! This is the spiritual successor to the HTTP sidecar from earlier
 //! versions — except instead of binding a localhost port and routing
 //! through `urllib`, requests come in through stdin/stdout and we just
-//! call the LLM client directly here in Rust.
+//! submit an admitted call to the canonical Engine.
 //!
 //! The bridge tracks cumulative token usage and the recursion budget. For
-//! `Rlm` / `RlmBatch` requests it recursively calls `run_rlm_turn_inner`
-//! at depth-1; the future-type cycle (bridge → run_rlm_turn_inner →
-//! bridge) is broken by `run_rlm_turn_inner` returning a boxed dyn future.
+//! `Rlm` / `RlmBatch` requests it submits an admitted Core turn at depth-1.
+//! Python and its persistent session never retain this borrowed dispatcher.
 
-use std::sync::Arc;
-use std::time::Duration;
-use std::{future::Future, pin::Pin};
-
-use anyhow::Result;
+use crate::repl::runtime::{BatchResp, RpcDispatcher, RpcRequest, RpcResponse, SingleResp};
+use codewhale_models::Usage;
 use futures_util::future::join_all;
-use tokio::sync::Mutex;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
 use uuid::Uuid;
 
-use crate::llm_client::LlmClient;
-use crate::repl::runtime::{BatchResp, RpcDispatcher, RpcRequest, RpcResponse, SingleResp};
-use crate::utils::spawn_supervised;
-use codewhale_models::Role;
-use codewhale_models::{
-    ContentBlock, Message, MessageRequest, MessageResponse, SystemPrompt, Usage,
-    is_incomplete_stop_reason, stop_reason_detail,
-};
+pub const MAX_BATCH: usize = 16;
 
 /// One pre-dispatch reservation in the shared routed-usage ledger.
 #[derive(Debug, Clone, Copy)]
@@ -100,7 +91,10 @@ impl RlmUsageAccumulator {
         &self,
         route: crate::cost_status::EffectiveRouteEnvelope,
     ) -> std::result::Result<RlmUsageReservation, String> {
-        let mut state = self.state.lock().await;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.records.len() == crate::cost_status::MAX_CHILD_USAGE_RECORDS {
             return Err(format!(
                 "RLM provider-call receipt limit reached ({}); request rejected before dispatch",
@@ -122,9 +116,22 @@ impl RlmUsageAccumulator {
         Ok(RlmUsageReservation { index })
     }
 
+    pub(crate) async fn source_id(&self, reservation: RlmUsageReservation) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .records
+            .get(reservation.index)
+            .and_then(Option::as_ref)
+            .map(|slot| slot.record.source_id.clone())
+    }
+
     /// Attach a provider's reported usage to its already-reserved exact route.
     pub(crate) async fn complete(&self, reservation: RlmUsageReservation, usage: &Usage) {
-        let mut state = self.state.lock().await;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let completed = if let Some(Some(slot)) = state.records.get_mut(reservation.index)
             && !slot.completed
         {
@@ -139,27 +146,28 @@ impl RlmUsageAccumulator {
         }
     }
 
-    /// Settle a decoded provider-success response without inventing usage.
-    /// `MessageResponse::usage == Usage::default()` is also what adapters
-    /// produce when the provider omitted the payload, so it is not proof of a
-    /// genuine zero-token request.
-    pub(crate) async fn settle_provider_success(
-        &self,
-        reservation: RlmUsageReservation,
-        usage: &Usage,
-    ) {
-        if usage == &Usage::default() {
-            self.cancel(reservation, true).await;
-        } else {
-            self.complete(reservation, usage).await;
-        }
-    }
-
     /// Remove a reservation that never produced provider-reported usage.
     /// Ambiguous execution increments explicit incomplete coverage instead of
     /// being persisted as a priced-zero response.
+    #[cfg(test)]
     pub(crate) async fn cancel(&self, reservation: RlmUsageReservation, coverage_unknown: bool) {
-        let mut state = self.state.lock().await;
+        self.cancel_sync(
+            reservation,
+            coverage_unknown,
+            crate::cost_status::RuntimeUsageMissingReason::RequestOutcomeUnknown,
+        );
+    }
+
+    pub(crate) fn cancel_sync(
+        &self,
+        reservation: RlmUsageReservation,
+        coverage_unknown: bool,
+        reason: crate::cost_status::RuntimeUsageMissingReason,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cancelled = state.records.get_mut(reservation.index).and_then(|slot| {
             if slot.as_ref().is_some_and(|slot| !slot.completed) {
                 slot.take()
@@ -173,6 +181,7 @@ impl RlmUsageAccumulator {
             state
                 .drop_records
                 .push(crate::cost_status::RuntimeUsageDropRecord {
+                    reason,
                     source_id: slot.record.source_id,
                     route: slot.record.usage.route,
                 });
@@ -183,8 +192,11 @@ impl RlmUsageAccumulator {
     /// Bound even nested runs that fail before their first provider request.
     /// Without this reservation repeated setup failures could grow event
     /// receipts while never consuming the existing provider-call bound.
-    async fn reserve_nested_turn(&self) -> std::result::Result<(), String> {
-        let mut state = self.state.lock().await;
+    pub(crate) async fn reserve_nested_turn(&self) -> std::result::Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.nested_runs == crate::cost_status::MAX_CHILD_USAGE_RECORDS {
             return Err("RLM nested-turn receipt limit reached before dispatch".into());
         }
@@ -193,17 +205,25 @@ impl RlmUsageAccumulator {
     }
 
     pub(crate) async fn record_nested_event(&self, event: serde_json::Value) {
-        self.state.lock().await.nested_events.push(event);
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .nested_events
+            .push(event);
     }
 
     pub(crate) async fn snapshot(&self) -> RlmUsageSnapshot {
-        let state = self.state.lock().await;
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pending = state
             .records
             .iter()
             .flatten()
             .filter(|slot| !slot.completed)
             .map(|slot| crate::cost_status::RuntimeUsageDropRecord {
+                reason: crate::cost_status::RuntimeUsageMissingReason::RequestOutcomeUnknown,
                 source_id: slot.record.source_id.clone(),
                 route: slot.record.usage.route.clone(),
             })
@@ -228,147 +248,49 @@ impl RlmUsageAccumulator {
     }
 }
 
-/// Object-safe runtime-model adapter for a working kernel.
-///
-/// The normal turn loop owns a `SharedModelClient`, while the original RLM
-/// bridge predates that boundary and accepts the concrete [`LlmClient`] trait.
-/// Keeping this small adapter here means a persistent kernel follows exactly
-/// the selected model route (including custom providers) without teaching the
-/// kernel about provider transports or falling back to a side channel.
-pub(crate) struct ModelClientRlmAdapter {
-    client: crate::core::model_client::SharedModelClient,
-}
-
-impl ModelClientRlmAdapter {
-    pub(crate) fn new(client: crate::core::model_client::SharedModelClient) -> Self {
-        Self { client }
-    }
-}
-
-/// Per-child completion timeout — same as the previous sidecar default.
-const CHILD_TIMEOUT_SECS: u64 = 120;
-/// Hard cap on prompts per batch RPC.
-pub const MAX_BATCH: usize = 16;
-
-/// Object-safe slice of the LLM client interface that the RLM bridge needs.
-///
-/// `LlmClient` itself uses native async trait methods, which are not dyn-safe.
-/// The bridge only needs non-streaming completions, so this boxed-future shim
-/// gives tests a clean mock seam without changing the wider provider trait.
-pub(crate) trait RlmLlmClient: Send + Sync {
-    fn effective_route_envelope(
-        &self,
-        requested_model: &str,
-        dispatched_at: chrono::DateTime<chrono::Utc>,
-    ) -> crate::cost_status::EffectiveRouteEnvelope;
-
-    fn effective_max_output_tokens(&self, requested_model: &str) -> u32;
-
-    fn create_message_boxed(
-        &self,
-        request: MessageRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<MessageResponse>> + Send + '_>>;
-}
-
-impl RlmLlmClient for ModelClientRlmAdapter {
-    fn effective_route_envelope(
-        &self,
-        requested_model: &str,
-        dispatched_at: chrono::DateTime<chrono::Utc>,
-    ) -> crate::cost_status::EffectiveRouteEnvelope {
-        self.client
-            .effective_route_envelope(requested_model, dispatched_at)
-    }
-
-    fn effective_max_output_tokens(&self, requested_model: &str) -> u32 {
-        self.client.effective_max_output_tokens(requested_model)
-    }
-
-    fn create_message_boxed(
-        &self,
-        request: MessageRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<MessageResponse>> + Send + '_>> {
-        let client = Arc::clone(&self.client);
-        Box::pin(async move { client.create_message(request).await })
-    }
-}
-
-impl<T> RlmLlmClient for T
-where
-    T: LlmClient + Send + Sync,
-{
-    fn effective_route_envelope(
-        &self,
-        requested_model: &str,
-        dispatched_at: chrono::DateTime<chrono::Utc>,
-    ) -> crate::cost_status::EffectiveRouteEnvelope {
-        LlmClient::effective_route_envelope(self, requested_model, dispatched_at)
-    }
-
-    fn effective_max_output_tokens(&self, requested_model: &str) -> u32 {
-        LlmClient::effective_max_output_tokens(self, requested_model)
-    }
-
-    fn create_message_boxed(
-        &self,
-        request: MessageRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<MessageResponse>> + Send + '_>> {
-        Box::pin(self.create_message(request))
-    }
-}
-
-/// State shared with the bridge across all RPC calls in one turn.
-pub struct RlmBridge {
-    client: Arc<dyn RlmLlmClient>,
-    child_model: String,
-    /// Recursion budget remaining for `Rlm` / `RlmBatch` requests. When
-    /// zero, those requests fall back to plain `Llm` completions.
+/// A dispatcher borrowed by one Python round. Persistent kernels never own
+/// this caller, its services or an Engine. All nested work ends with this borrow.
+pub(crate) struct RlmBridge<'call> {
+    caller: &'call crate::core::engine::rlm_host::CapturedRlmCaller,
     depth_remaining: u32,
     usage: RlmUsageAccumulator,
-    /// Optional live forwarding. Durable receipts are collected at their
-    /// producer and returned through the enclosing tool, independent of this
-    /// best-effort stream (#6511).
     events: Option<tokio::sync::mpsc::Sender<crate::core::events::Event>>,
     deadline: tokio::time::Instant,
-    /// The serving turn's permission gate. A nested RLM turn runs each round
-    /// of model-written Python only after this gate admits that exact code;
-    /// without one the nested turn runs no code at all.
+    query_timeout: Duration,
     gate: Option<crate::tools::codemode::NestedCallGate>,
 }
 
-impl RlmBridge {
+impl<'call> RlmBridge<'call> {
     pub(crate) fn new(
-        client: Arc<dyn RlmLlmClient>,
-        child_model: String,
+        caller: &'call crate::core::engine::rlm_host::CapturedRlmCaller,
         depth_remaining: u32,
+        query_timeout: Duration,
     ) -> Self {
         Self::with_usage_accumulator(
-            client,
-            child_model,
+            caller,
             depth_remaining,
+            query_timeout,
             RlmUsageAccumulator::new(),
         )
     }
 
     pub(crate) fn with_usage_accumulator(
-        client: Arc<dyn RlmLlmClient>,
-        child_model: String,
+        caller: &'call crate::core::engine::rlm_host::CapturedRlmCaller,
         depth_remaining: u32,
+        query_timeout: Duration,
         usage: RlmUsageAccumulator,
     ) -> Self {
         Self {
-            client,
-            child_model,
+            caller,
             depth_remaining,
             usage,
             events: None,
-            deadline: tokio::time::Instant::now() + crate::tools::subagent::DEFAULT_CHILD_WALL_TIME,
+            deadline: caller.deadline(),
+            query_timeout: query_timeout.clamp(Duration::from_secs(1), Duration::from_secs(600)),
             gate: None,
         }
     }
 
-    /// Admit nested RLM code rounds through the serving turn's gate.
-    #[must_use]
     pub(crate) fn with_gate(
         mut self,
         gate: Option<crate::tools::codemode::NestedCallGate>,
@@ -377,8 +299,6 @@ impl RlmBridge {
         self
     }
 
-    /// Clamp recursive work to the already-spent parent budget. An unbounded
-    /// parent keeps the existing child safety cap; no recursive call resets it.
     pub(crate) fn with_deadline(mut self, deadline: Option<tokio::time::Instant>) -> Self {
         if let Some(deadline) = deadline {
             self.deadline = self.deadline.min(deadline);
@@ -390,9 +310,6 @@ impl RlmBridge {
         self.deadline
     }
 
-    /// Forward nested sub-RLM events to the parent's live stream. The shared
-    /// receipt batch independently retains the same producer events.
-    #[must_use]
     pub(crate) fn with_events(
         mut self,
         events: tokio::sync::mpsc::Sender<crate::core::events::Event>,
@@ -405,6 +322,34 @@ impl RlmBridge {
         self.usage.snapshot().await
     }
 
+    async fn invoke(
+        &self,
+        prompt: String,
+        mode: crate::core::engine::rlm_host::RlmMode,
+        max_tokens: Option<u32>,
+        system: Option<String>,
+    ) -> SingleResp {
+        let result = self
+            .caller
+            .dispatch(crate::core::engine::rlm_host::RlmInvocation {
+                prompt,
+                mode,
+                max_tokens,
+                task_instructions: system,
+                deadline: self
+                    .deadline
+                    .min(tokio::time::Instant::now() + self.query_timeout),
+                gate: self.gate.clone(),
+                events: self.events.clone(),
+                usage: self.usage.clone(),
+            })
+            .await;
+        SingleResp {
+            text: result.answer,
+            error: result.error,
+        }
+    }
+
     async fn dispatch_llm(
         &self,
         prompt: String,
@@ -412,108 +357,13 @@ impl RlmBridge {
         max_tokens: Option<u32>,
         system: Option<String>,
     ) -> SingleResp {
-        if tokio::time::Instant::now() >= self.deadline {
-            return SingleResp {
-                text: String::new(),
-                error: Some("llm_query parent turn deadline exhausted before dispatch".into()),
-            };
-        }
-        let request_route = self
-            .client
-            .effective_route_envelope(&self.child_model, chrono::Utc::now());
-        let reservation = match self.usage.reserve(request_route.clone()).await {
-            Ok(reservation) => reservation,
-            Err(error) => {
-                return SingleResp {
-                    text: String::new(),
-                    error: Some(error),
-                };
-            }
-        };
-        let route_max_tokens = self
-            .client
-            .effective_max_output_tokens(&request_route.model);
-        let request = MessageRequest {
-            // The Python helper accepts `model=` for older snippets, but it is
-            // intentionally not authoritative. RLM child calls are pinned to
-            // the tool's configured child model so model-generated Python
-            // cannot silently upgrade cheap fanout work to an expensive model.
-            model: self.child_model.clone(),
-            messages: vec![Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: prompt,
-                    cache_control: None,
-                }],
-            }],
-            // An explicit RLM helper bound remains authoritative, but the
-            // default is the selected route's ordinary allowance rather than
-            // a hidden 4K ceiling.
-            max_tokens: max_tokens.map_or(route_max_tokens, |limit| limit.min(route_max_tokens)),
-            system: system.map(SystemPrompt::Text),
-            tools: None,
-            tool_choice: None,
-            metadata: None,
-            thinking: None,
-            reasoning_effort: None,
-            stream: Some(false),
-            temperature: None,
-            top_p: None,
-        };
-
-        let fut = self.client.create_message_boxed(request);
-        let response = match tokio::time::timeout_at(
-            self.deadline
-                .min(tokio::time::Instant::now() + Duration::from_secs(CHILD_TIMEOUT_SECS)),
-            fut,
+        self.invoke(
+            prompt,
+            crate::core::engine::rlm_host::RlmMode::Completion,
+            max_tokens,
+            system,
         )
         .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                self.usage.cancel(reservation, false).await;
-                return SingleResp {
-                    text: String::new(),
-                    error: Some(format!("llm_query failed: {e}")),
-                };
-            }
-            Err(_) => {
-                self.usage.cancel(reservation, true).await;
-                return SingleResp {
-                    text: String::new(),
-                    error: Some("llm_query timed out at its parent or per-call deadline".into()),
-                };
-            }
-        };
-
-        // Incomplete output is rejected below, but it is still a successful
-        // provider response and therefore billed. Complete the reserved route
-        // before inspecting the stop reason.
-        self.usage
-            .settle_provider_success(reservation, &response.usage)
-            .await;
-
-        if is_incomplete_stop_reason(response.stop_reason.as_deref()) {
-            return SingleResp {
-                text: String::new(),
-                error: Some(format!(
-                    "llm_query response incomplete: provider stop reason `{}`; partial output was not accepted.",
-                    stop_reason_detail(response.stop_reason.as_deref())
-                )),
-            };
-        }
-
-        let text = response
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        SingleResp { text, error: None }
     }
 
     async fn dispatch_llm_batch(
@@ -525,97 +375,29 @@ impl RlmBridge {
         if let Some(resp) = batch_guard(prompts.len(), dependency_mode.as_deref()) {
             return resp;
         }
-
-        let model = Arc::new(self.child_model.clone());
-
-        let futures = prompts.into_iter().map(|prompt| {
-            let model = Arc::clone(&model);
-            async move {
-                self.dispatch_llm((*prompt).to_string(), Some((*model).clone()), None, None)
-                    .await
-            }
-        });
-
         BatchResp {
-            results: join_all(futures).await,
+            results: join_all(
+                prompts
+                    .into_iter()
+                    .map(|prompt| self.dispatch_llm(prompt, None, None, None)),
+            )
+            .await,
         }
     }
 
-    async fn dispatch_rlm(&self, prompt: String, _model: Option<String>) -> SingleResp {
-        if tokio::time::Instant::now() >= self.deadline {
-            return SingleResp {
-                text: String::new(),
-                error: Some("rlm_query parent turn deadline exhausted before dispatch".into()),
-            };
-        }
+    pub(crate) async fn dispatch_rlm(&self, prompt: String, _model: Option<String>) -> SingleResp {
         if self.depth_remaining == 0 {
-            // Budget exhausted — fall back to a one-shot child completion
-            // rather than returning an error. Matches the paper's behaviour
-            // ("sub_RLM gracefully degrades to llm_query at depth=0").
             return self.dispatch_llm(prompt, None, None, None).await;
         }
-
-        if let Err(error) = self.usage.reserve_nested_turn().await {
-            return SingleResp {
-                text: String::new(),
-                error: Some(error),
-            };
-        }
-
-        // Forward the nested turn's events to the parent stream as status
-        // lines (#6511). A nested code round must not stream into the parent's
-        // assistant message, so every event is flattened to a labelled
-        // status; with no parent stream the lines go to `tracing`.
-        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        let parent = self.events.clone();
-        let depth = self.depth_remaining;
-        let mut forwarder = crate::core::engine::turn_heartbeat::AbortOnDrop(spawn_supervised(
-            "rlm-bridge-forward",
-            std::panic::Location::caller(),
-            async move {
-                while let Some(event) = rx.recv().await {
-                    let Some(line) = nested_rlm_status_line(event, depth) else {
-                        continue;
-                    };
-                    match parent.as_ref() {
-                        Some(parent) => {
-                            let _ = parent.send(crate::core::events::Event::status(line)).await;
-                        }
-                        None => tracing::info!(target: "rlm", "{line}"),
-                    }
-                }
-            },
-        ));
-
-        let child_model = self.child_model.clone();
-
-        // Recursive call. The dyn-erasure on `run_rlm_turn_inner` breaks
-        // the `bridge → turn → bridge` opaque-future cycle.
-        let result = super::turn::run_rlm_turn_inner_with_usage(
-            Arc::clone(&self.client),
-            child_model.clone(),
+        self.invoke(
             prompt,
+            crate::core::engine::rlm_host::RlmMode::Recursive {
+                depth_remaining: self.depth_remaining.saturating_sub(1),
+            },
             None,
-            child_model,
-            tx,
-            self.depth_remaining.saturating_sub(1),
-            self.usage.clone(),
-            self.deadline,
-            self.gate.clone(),
+            None,
         )
-        .await;
-
-        // The nested turn has returned and dropped its senders; let the
-        // forwarder flush the tail instead of aborting it mid-record.
-        let flush_deadline = self
-            .deadline
-            .min(tokio::time::Instant::now() + Duration::from_secs(5));
-        let _ = tokio::time::timeout_at(flush_deadline, &mut forwarder.0).await;
-
-        SingleResp {
-            text: result.answer,
-            error: result.error,
-        }
+        .await
     }
 
     async fn dispatch_rlm_batch(
@@ -627,19 +409,23 @@ impl RlmBridge {
         if let Some(resp) = batch_guard(prompts.len(), dependency_mode.as_deref()) {
             return resp;
         }
-
-        let futures = prompts
-            .into_iter()
-            .map(|p| async move { self.dispatch_rlm(p, None).await });
         BatchResp {
-            results: join_all(futures).await,
+            results: join_all(
+                prompts
+                    .into_iter()
+                    .map(|prompt| self.dispatch_rlm(prompt, None)),
+            )
+            .await,
         }
     }
 }
 
 /// One nested sub-RLM event as a parent-stream status line, or `None` for an
 /// event kind the nested loop does not produce.
-fn nested_rlm_status_line(event: crate::core::events::Event, depth: u32) -> Option<String> {
+pub(crate) fn nested_rlm_status_line(
+    event: crate::core::events::Event,
+    depth: u32,
+) -> Option<String> {
     use crate::core::events::Event;
     let body = match event {
         Event::Status { message } => message,
@@ -691,7 +477,7 @@ fn batch_guard(prompt_count: usize, dependency_mode: Option<&str>) -> Option<Bat
     None
 }
 
-impl RpcDispatcher for RlmBridge {
+impl RpcDispatcher for RlmBridge<'_> {
     fn dispatch<'a>(
         &'a self,
         req: RpcRequest,
@@ -735,7 +521,12 @@ impl RpcDispatcher for RlmBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::engine::tests::rlm_host::{BridgeFixture, Replies};
     use crate::llm_client::mock::MockLlmClient;
+    use anyhow::Result;
+    use codewhale_models::{ContentBlock, MessageRequest, MessageResponse};
+    use std::future::Future;
+    use std::pin::Pin;
 
     fn mock_response_with_usage(text: &str, usage: Usage) -> MessageResponse {
         MessageResponse {
@@ -765,9 +556,9 @@ mod tests {
         )
     }
 
-    fn bridge_for(mock: Arc<MockLlmClient>, depth_remaining: u32) -> RlmBridge {
-        let client: Arc<dyn RlmLlmClient> = mock;
-        RlmBridge::new(client, "child-model".to_string(), depth_remaining).with_gate(Some(
+    fn bridge_for(mock: Arc<MockLlmClient>, depth_remaining: u32) -> BridgeFixture {
+        let client: Arc<dyn Replies> = mock;
+        BridgeFixture::new(client, "child-model".to_string(), depth_remaining).with_gate(Some(
             crate::tools::codemode::NestedCallGate::admitting_for_test(),
         ))
     }
@@ -797,16 +588,16 @@ mod tests {
 
     struct PendingClient(MockLlmClient);
 
-    impl RlmLlmClient for PendingClient {
+    impl Replies for PendingClient {
         fn effective_route_envelope(
             &self,
             model: &str,
             at: chrono::DateTime<chrono::Utc>,
         ) -> crate::cost_status::EffectiveRouteEnvelope {
-            RlmLlmClient::effective_route_envelope(&self.0, model, at)
+            Replies::effective_route_envelope(&self.0, model, at)
         }
         fn effective_max_output_tokens(&self, model: &str) -> u32 {
-            RlmLlmClient::effective_max_output_tokens(&self.0, model)
+            Replies::effective_max_output_tokens(&self.0, model)
         }
         fn create_message_boxed(
             &self,
@@ -819,13 +610,16 @@ mod tests {
     #[tokio::test]
     async fn parent_deadline_interrupts_plain_and_recursive_model_calls() {
         for depth in [0, 1] {
-            let bridge = RlmBridge::new(
+            let bridge = BridgeFixture::new(
                 Arc::new(PendingClient(MockLlmClient::new(Vec::new()))),
                 "child-model".into(),
                 depth,
             )
             .with_deadline(Some(
                 tokio::time::Instant::now() + Duration::from_millis(500),
+            ))
+            .with_gate(Some(
+                crate::tools::codemode::NestedCallGate::admitting_for_test(),
             ));
             let response = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -925,10 +719,9 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].model, "child-model");
         assert_eq!(captured[0].max_tokens, 123);
-        assert_eq!(
-            captured[0].system,
-            Some(SystemPrompt::Text("child system".to_string()))
-        );
+        let system = serde_json::to_string(&captured[0].system).unwrap();
+        assert!(system.contains("Captured operator Core policy"));
+        assert!(system.contains("child system"));
 
         let snapshot = bridge.usage_snapshot().await;
         assert_eq!(snapshot.usage.input_tokens, 7);
@@ -979,11 +772,8 @@ mod tests {
     async fn repeated_reservation_settlement_cannot_duplicate_usage_or_missing_coverage() {
         let mock = Arc::new(MockLlmClient::new(Vec::new()));
         let bridge = bridge_for(Arc::clone(&mock), 1);
-        let route = RlmLlmClient::effective_route_envelope(
-            mock.as_ref(),
-            "child-model",
-            chrono::Utc::now(),
-        );
+        let route =
+            Replies::effective_route_envelope(mock.as_ref(), "child-model", chrono::Utc::now());
 
         let usage_reservation = bridge
             .usage
@@ -1095,6 +885,20 @@ mod tests {
         assert_eq!(snapshot.usage, usage);
         assert_eq!(snapshot.records.len(), 1);
         assert_eq!(snapshot.records[0].usage.usage, usage);
+        let rejected_fragments: Vec<_> = snapshot
+            .nested_events
+            .iter()
+            .filter(|event| {
+                event["kind"] == "code"
+                    && event["content"]
+                        == "FINAL('partial answer')\n```repl\nFINAL('also partial')\n```"
+            })
+            .collect();
+        assert_eq!(
+            rejected_fragments.len(),
+            1,
+            "retain the real rejected diagnostic fragment"
+        );
         assert_eq!(mock.call_count(), 1, "truncation must not retry");
     }
 
@@ -1149,21 +953,18 @@ mod tests {
     #[tokio::test]
     async fn shared_accumulator_rejects_the_first_unreceipted_request_before_provider_work() {
         let mock = Arc::new(MockLlmClient::new(Vec::new()));
-        let client: Arc<dyn RlmLlmClient> = mock.clone();
+        let client: Arc<dyn Replies> = mock.clone();
         let usage = RlmUsageAccumulator::new();
-        let bridge = RlmBridge::with_usage_accumulator(
+        let bridge = BridgeFixture::with_usage_accumulator(
             Arc::clone(&client),
             "child-model".to_string(),
             1,
             usage.clone(),
         );
         let nested_bridge =
-            RlmBridge::with_usage_accumulator(client, "child-model".to_string(), 1, usage);
-        let route = RlmLlmClient::effective_route_envelope(
-            mock.as_ref(),
-            "child-model",
-            chrono::Utc::now(),
-        );
+            BridgeFixture::with_usage_accumulator(client, "child-model".to_string(), 1, usage);
+        let route =
+            Replies::effective_route_envelope(mock.as_ref(), "child-model", chrono::Utc::now());
         for _ in 0..crate::cost_status::MAX_CHILD_USAGE_RECORDS {
             let reservation = bridge
                 .usage
@@ -1250,7 +1051,17 @@ mod tests {
             "{lines:#?}"
         );
         let receipts = bridge.usage_snapshot().await.nested_events;
-        assert_eq!(receipts.len(), lines.len(), "one record per producer event");
+        assert_eq!(
+            receipts.len(),
+            2,
+            "one complete model/code reply and one terminal receipt"
+        );
+        assert!(receipts.iter().all(|entry| {
+            let content = entry["content"]
+                .as_str()
+                .expect("canonical receipt content");
+            lines.iter().any(|line| line.contains(content))
+        }));
         assert_eq!(
             receipts
                 .iter()

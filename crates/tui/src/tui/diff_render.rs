@@ -3,7 +3,8 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use similar::{ChangeTag, TextDiff};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use codewhale_palette as palette;
 
@@ -757,7 +758,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
                 current = lead.clone();
                 current_width = lead_width;
             }
-            push_word_breaking_chars(word, width, &mut current, &mut current_width, &mut lines);
+            push_word_breaking_graphemes(word, width, &mut current, &mut current_width, &mut lines);
             has_word = current_width > lead_width;
             continue;
         }
@@ -794,21 +795,21 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn push_word_breaking_chars(
+fn push_word_breaking_graphemes(
     word: &str,
     width: usize,
     current: &mut String,
     current_width: &mut usize,
     lines: &mut Vec<String>,
 ) {
-    for ch in word.chars() {
-        let char_width = ch.width().unwrap_or(1);
-        if *current_width + char_width > width && *current_width > 0 {
+    for grapheme in word.graphemes(true) {
+        let grapheme_width = grapheme.width();
+        if *current_width + grapheme_width > width && *current_width > 0 {
             lines.push(std::mem::take(current));
             *current_width = 0;
         }
-        current.push(ch);
-        *current_width += char_width;
+        current.push_str(grapheme);
+        *current_width += grapheme_width;
     }
 }
 
@@ -1189,6 +1190,25 @@ diff --git a/src/lib.rs b/src/lib.rs
         }
 
         assert_eq!(lines.join(""), text);
+    }
+
+    #[test]
+    fn wrap_text_breaks_overlong_words_between_graphemes() {
+        // A ZWJ family and a skin-toned thumbs-up are one two-column grapheme
+        // each, the way Ratatui counts cells.
+        let word = "ab\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{1f44d}\u{1f3fd}cd";
+        for width in 2..=6 {
+            let lines = wrap_text(word, width);
+            let rejoined: Vec<&str> = lines.iter().flat_map(|line| line.graphemes(true)).collect();
+            assert_eq!(
+                rejoined,
+                word.graphemes(true).collect::<Vec<_>>(),
+                "width {width} split a grapheme: {lines:?}"
+            );
+            for line in &lines {
+                assert!(line.width() <= width, "line {line:?} exceeds width {width}");
+            }
+        }
     }
 
     #[test]

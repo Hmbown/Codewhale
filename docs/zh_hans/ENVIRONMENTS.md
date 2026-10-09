@@ -72,6 +72,12 @@ PowerShell 的拒绝信息会作为该命令的错误返回；Codewhale 不会�
 同一进程范围内运行；决定什么可以运行的是 shell 工具的审批与沙箱设置，而不是
 执行策略。
 
+若希望改由机器或用户策略生效，请在启动 Codewhale 之前设置
+`CODEWHALE_POWERSHELL_EXECUTION_POLICY=inherit`：此时 shell 工具会完全省略
+`-ExecutionPolicy`，因此策略为 `Restricted` 或 `AllSigned` 时，需要临时 `.ps1`
+脚本的多行命令会被拒绝。未设置、设置为 `bypass` 或任何其他值时，仍保持默认的
+`Bypass`。
+
 ## 统一的运行时命令
 
 当前的 `codewhale` 二进制在进程内运行 TUI。发布安装器会把同样的字节复制到

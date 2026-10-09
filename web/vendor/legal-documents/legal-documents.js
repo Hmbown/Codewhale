@@ -2,10 +2,14 @@
  * Publication metadata shared by every Codewhale legal page. This record does
  * not approve legal text or publish a draft; approval and publication require
  * a recorded founder decision before its status can change.
+ *
+ * Recorded founder decision (chat, 2026-10-04): the paid terms and the privacy
+ * revision drafted with them are approved and in effect from October 4, 2026.
+ * They move together: the terms name paid checkout, and so must the policy.
  */
 export const LEGAL_DOCUMENTS = Object.freeze({
-  terms: Object.freeze({ version: "2026-09-07", status: "draft", effectiveAt: null }),
-  privacy: Object.freeze({ version: "2026-08-21", status: "effective", effectiveAt: "2026-08-21" }),
+  terms: Object.freeze({ version: "2026-10-04", status: "effective", effectiveAt: "2026-10-04" }),
+  privacy: Object.freeze({ version: "2026-10-04", status: "effective", effectiveAt: "2026-10-04" }),
 });
 
 /** Render the pinned document's status; a revision date never makes a draft effective. */

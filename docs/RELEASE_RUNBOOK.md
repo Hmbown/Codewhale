@@ -3,6 +3,16 @@
 This runbook is the source of truth for shipping Rust crates, GitHub release assets,
 and the `codewhale` npm wrapper.
 
+Use [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md) as the ordered release
+sequence: reconcile the canonical checkout, prepare and land verified slices,
+freeze one SHA, verify Cargo tarballs and exact-SHA hosted CI/RC, obtain Hunter's
+publication approval, tag that SHA, then verify each public destination.
+Agent-owned work stays in `/Volumes/VIXinSSD/CW/codewhale` on `main`; do not
+create release branches, worktrees or nested clones. Contributor PRs still land
+as PRs. Coordinate file ownership and preserve dirty work before any recovery.
+Keep evidence in the existing release packet instead of maintaining a second
+release queue here.
+
 GitHub assets are uploaded into a draft and published only after every expected
 asset's name, upload state, size and GitHub SHA-256 digest match the verified
 local set. A failed upload leaves an unpublished draft. Reruns may reuse matching
@@ -22,27 +32,11 @@ Current packaging note:
 - End-user crates:
   - `codewhale-tui`
   - `codewhale-cli`
-- Supporting crates published from this workspace:
-  - `codewhale-build-support`
-  - `codewhale-mcp`
-  - `codewhale-paths`
-  - `codewhale-protocol`
-  - `codewhale-release`
-  - `codewhale-secrets`
-  - `codewhale-state`
-  - `codewhale-telemetry`
-  - `codewhale-workflow`
-  - `codewhale-workflow-js`
-  - `codewhale-execpolicy`
-  - `codewhale-hooks`
-  - `codewhale-tools`
-  - `codewhale-config`
-  - `codewhale-cloud-facts`
-  - `codewhale-lane`
-  - `codewhale-agent`
-  - `codewhale-core`
-  - `codewhale-command-contract`
-  - `codewhale-app-server`
+
+The complete supporting-crate list and dependency order live in
+[`scripts/release/crates.sh`](../scripts/release/crates.sh), validated against
+the locked workspace graph by the publish helper. Do not maintain a second
+handwritten list here.
 
 ## Version Coordination
 
@@ -57,18 +51,21 @@ Current packaging note:
 
 ## Release Source Timing
 
-Freeze the source before creating a public `vX.Y.Z` tag. The version bump is
-not the release; it is the last source-prep commit before the tag. Do not keep
-merging same-version feature/fix PRs after `vX.Y.Z` exists and assume the
-release workflow will pick them up. It will not: the tag is the release anchor.
+Freeze the source before creating a public `vX.Y.Z` tag. A version bump is
+preparation, not a release: all intended source must reach `main` before the
+final candidate is chosen. Record the full SHA and coordinate a pause with
+shared writers through packaging and publication. Clean local `HEAD`, `main`
+and freshly fetched `origin/main` must agree. A later fix changes the candidate
+and needs affected proofs replaced. Once created, the tag is the immutable
+release anchor; later main commits cannot change its contents.
 
 Before tagging, verify the live queue and existing anchors:
 
 ```bash
-gh issue list --repo Hmbown/CodeWhale --milestone "vX.Y.Z" --state open
-gh pr list --repo Hmbown/CodeWhale --state open --limit 100
+gh issue list --repo codewhale-hq/CodeWhale --milestone "vX.Y.Z" --state open
+gh pr list --repo codewhale-hq/CodeWhale --state open --limit 100
 git ls-remote origin refs/heads/main refs/tags/vX.Y.Z
-gh release view vX.Y.Z --repo Hmbown/CodeWhale
+gh release view vX.Y.Z --repo codewhale-hq/CodeWhale
 ./scripts/release/check-published.sh X.Y.Z
 ```
 
@@ -81,20 +78,27 @@ is published, stop and choose deliberately:
   after confirming no package, GitHub Release, mirror, or installer consumer has
   treated it as public.
 
-Do not delete, move, or recreate a release tag implicitly as part of ordinary
-PR merge or milestone cleanup work.
+Do not delete, move, or recreate a release tag implicitly during ordinary
+preparation or milestone cleanup. Publishing an older tagged SHA after canonical
+`main` has advanced needs a separately authorized recovery plan; do not switch
+the shared checkout or create another lane to bypass the source guard.
 
 ## Preflight
 
-Run these from the repository root before cutting a tag:
+For each preparation slice, run the existing checks appropriate to its changed
+surface once, then record the actual result in the commit message and land owned
+paths directly on `main`. Batch coherent Rust edits before compiling. Web changes
+use `npm test && npm run check:web` from the repository root. Do not repeat a
+passed check merely to commit/push or run exhaustive local workspace builds in
+addition to the final hosted gates.
+
+Before freezing the candidate, use the lightweight preparation checks:
 
 ```bash
-./scripts/release/check-versions.sh   # workspace/npm/SDK/VS Code/generated-fact/lock drift
-cargo fmt --all -- --check
-cargo check --workspace --all-targets --locked
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-features --locked
-./scripts/release/publish-crates.sh dry-run
+./scripts/release/check-versions.sh --require-dated-release
+./scripts/release/check-ohos-deps.sh
+./scripts/release/check-feature-release-notes.sh vPREV HEAD
+python3 scripts/check-contributor-credit.py
 ```
 
 `check-versions.sh` also runs in CI on every push/PR (the `versions` job in
@@ -103,27 +107,40 @@ manifests, the npm wrapper and Runtime SDK, the VS Code extension and lock,
 generated web facts, and `Cargo.lock` is caught before release time rather than
 at it.
 
-The source-controlled CNB pipeline mirrors the heavy Linux version/fmt/check/
-clippy/test/npm-smoke gates for `fix/*`, `rebrand/*`, `work/v*`, and `main`.
-GitHub Actions keeps the cheap drift/fmt statuses plus macOS and Windows
-coverage, while CNB carries the Linux work.
+Ordinary main-push GitHub CI can delegate heavy Linux checks to CNB and omit
+some smoke coverage. A successful pointer job is not a Linux test receipt.
+The final manual full-CI dispatch forces the real Linux, macOS and Windows
+gates; keep its exact-SHA evidence rather than substituting an older CNB run.
 
 `publish-crates.sh` requires Cargo 1.90 or newer for multi-package verification;
-this release-tool requirement is separate from the runtime's Rust 1.88 MSRV.
-Use an up-to-date stable toolchain (`rustup update stable`) for release work.
+this release-tool requirement is separate from the workspace's Rust 1.89 MSRV.
+Use a release toolchain meeting that requirement.
+
+Run the package preflight once for the clean frozen candidate and retain its
+SHA/result:
+
+```bash
+./scripts/release/publish-crates.sh dry-run
+```
 
 Both modes validate publication order against the locked workspace graph, then
 run one `cargo publish --dry-run --locked --registry crates-io` covering all
 release crates listed in `scripts/release/crates.sh`. Cargo resolves unpublished
 workspace dependencies through a
 temporary local registry, builds every unpacked tarball, and checks publication
-metadata before any upload. Dry-run mode permits source edits and stops there.
+metadata and real tarball sizes before any upload. Dry-run mode can permit
+source edits, but the final release receipt must describe the frozen source.
+It stops without uploading. CI/RC does not verify Cargo publication tarballs
+and cannot replace this gate. Publish mode necessarily verifies them again.
 
-If a dry-run is interrupted (Ctrl-C, or a shell that gets killed), delete the
-half-packed `target/package` before re-running. Cargo resumes against it and
-every unpacked tarball then fails with `error: Current directory is invalid:
+If a dry-run is interrupted (Ctrl-C, or a shell that gets killed), inspect the
+half-packed `target/package` before retrying and coordinate with active builds.
+Cargo can resume against it and every unpacked tarball may then fail with
+`error: Current directory is invalid:
 No such file or directory (os error 2)` — which looks like a compiler or
 workspace defect and is neither (seen 2026-09-21; a clean re-run passed).
+Keep recovery material and obtain explicit cleanup approval before deleting
+shared build/package directories; do not reset the source to repair packaging.
 Publish mode requires the approved release checkout and assets, then skips
 versions already on crates.io and uploads the remaining crates in dependency
 order. Resuming still verifies the complete source release; it never weakens
@@ -131,14 +148,16 @@ the artifact gate merely because an earlier crate was already uploaded.
 Registry-side acceptance and credentials are still checked during real upload;
 a successful preflight cannot guarantee that every later upload will succeed.
 
-For npm wrapper verification, build the single runtime and run the
-cross-platform smoke harness. This packs the npm wrapper, installs it into a
+The final full-CI and RC workflows own npm wrapper build/install smoke. When a
+wrapper change needs focused local verification, reuse a valid matching runtime
+or build the single runtime once and run the cross-platform smoke harness.
+This packs the npm wrapper, installs it into a
 clean temporary project, serves local release assets over HTTP, and checks both
 published commands against that runtime: `codewhale doctor --help` and
 `codew --version`.
 
 ```bash
-cargo build --release --locked -p codewhale-cli -p codewhale-tui
+cargo build --release --locked -p codewhale-cli --bin codewhale
 node scripts/release/npm-wrapper-smoke.js
 ```
 
@@ -148,13 +167,13 @@ directory for inspection.
 ## Exact-head GitHub proof before publication
 
 Two manual workflows provide exact-head evidence without crossing the public
-release boundary. Run them only after the intended source is on a named ref
-(normally the frozen `main`), and pass the full commit SHA as an independent
+release boundary. Run them after the intended source is frozen on canonical
+`main`, and pass the full commit SHA as an independent
 guard against that ref moving between inspection and dispatch:
 
 ```bash
 git fetch origin main
-candidate_sha="$(git rev-parse origin/main)"
+candidate_sha="$(git rev-parse HEAD)"
 
 gh workflow run ci.yml --ref main \
   -f expected_sha="${candidate_sha}"
@@ -168,13 +187,20 @@ workflow, mobile, Actions, Linux, macOS, Windows, npm-wrapper, and documentation
 gates. A mismatch fails before those gates start; it never silently tests a
 different head.
 
+Verify beforehand that clean local `HEAD`, `main` and `origin/main` agree.
+Record both run URLs, resolved SHAs and required job results; inspect executed
+gates rather than the workflow badge. If `main` changes before tagging, choose
+the new candidate deliberately and replace affected evidence. Do not run these
+exhaustive gates locally as well.
+
 `release-candidate.yml` also fails unless the selected ref resolves to the
 exact requested SHA. It runs the same parity gate as the public release
 (`release-parity.yml`: fmt, check, clippy, workspace nextest, doctests,
 protocol and state parity), and `release.yml` refuses to start unless a green
 release-candidate run with a green Parity job exists for the exact tag SHA
-(`scripts/release/require-rc-receipt.sh`). Tag the SHA the RC validated; if
-the receipt check fails, run the RC on that SHA rather than moving the tag.
+(`scripts/release/require-rc-receipt.sh`). Tag the SHA the final full CI and RC
+validated. A missing receipt stops publication; do not move the tag to conceal
+it or use a different SHA's green run.
 It invokes the same reusable artifact workflow as the
 public release, building all seven targets (including Android arm64 and native
 Windows arm64), staging `codewhale` and `codew` (single binary), building the
@@ -186,13 +212,18 @@ clients). It then installs
 the packed npm wrapper against those assembled local assets and exercises its
 delegated entrypoints. The resulting `codewhale-release-assets` bundle is a
 short-lived GitHub Actions artifact only.
+Retain required asset/evidence copies before artifact expiry; record cross-build,
+install and real-device/provider results separately in the existing packet.
 
 This candidate workflow does not create a tag or GitHub Release, publish a
 crate or npm package, push a container, update Homebrew, deploy anything, or
 write repository contents. Its green result is evidence, not publication
 authorization. The stop line remains explicit Hunter approval: do not create
 the `vX.Y.Z` tag, dispatch `release.yml`, or run any registry publication step
-until that approval is given.
+until that approval is given for the exact version/SHA and intended destinations.
+Tag creation can immediately start GitHub, npm, GHCR, CNB and Homebrew
+publication; include those destinations in the approval. Cargo publication and
+any deployment/downstream launch also require their applicable authorization.
 
 The Android target is cross-built and included in the checksum/bundle gates,
 but GitHub's Linux runner cannot execute the Android binary as a real Termux
@@ -210,8 +241,10 @@ DEEPSEEK_TUI_VERSION=X.Y.Z DEEPSEEK_TUI_RELEASE_BASE_URL=http://127.0.0.1:8123/ 
 
 Set `DEEPSEEK_TUI_VERSION` to the npm package version you are verifying for that local run.
 
-The CNB workflow runs the Linux tarball install + delegated-entrypoint smoke
-test; GitHub Actions keeps macOS and Windows smoke coverage.
+CNB can supply a separate Linux tarball/install receipt. The final manual
+full-CI run supplies hosted Linux, macOS and Windows wrapper smoke. Neither
+proves installation from a subsequently published registry or a real provider
+turn; retain those separate acceptance receipts where required.
 
 After publishing, prove the release is visible in both registries:
 
@@ -224,33 +257,28 @@ on npm and every `codewhale-*` crate at `X.Y.Z` on crates.io. For a rare
 npm packaging-only release, run with `--allow-npm-binary-mismatch` and keep the
 release notes explicit that no new Rust binary version shipped.
 
-## Post-Merge Branch Hygiene
+## Historical Branch and Checkout Inventory
 
-After a release or scratch integration branch lands, run the branch hygiene
-helper before pruning anything:
+No new agent release/integration branch is part of this process. For historical
+branches, the existing helper can produce a read-only report against `main`:
 
 ```bash
-./scripts/release/branch-hygiene.sh --release-branch codex/vX.Y.Z
+./scripts/release/branch-hygiene.sh --release-branch main
 ```
 
 The default mode is a dry run. It reports the current checkout branch, main ref,
 local and remote release tips, safe local or remote branch deletes, branches
-kept for contributor work, and branches that still need a human decision. Review
-that report before running `--prune --yes`, and add `--prune-remote` only when
-you have confirmed the remote branches are safe to delete.
+kept for contributor work, and branches that still need a human decision. A
+safe-delete label is not cleanup authority: removal of any branch or checkout
+needs explicit Hunter approval for the named targets. Preserve unique commits,
+dirty/untracked work and contributor credit before an approved cleanup. Cleanup
+does not block a release once its canonical source is reconciled.
 
 Use `--remote upstream` when you are working from a fork and the canonical
 release refs live on the upstream remote instead of `origin`.
 
-Verify the helper itself after changing it:
-
-```bash
-bash scripts/release/branch-hygiene.test.sh
-bash scripts/release/ensure-release-on-main.test.sh
-```
-
-Those scripts are pinned to LF line endings so the same command works from a
-Windows checkout under Bash.
+Report canonical path, branch, SHA, upstream state and unresolved work at
+handoff. Keep backups as recovery artifacts, not alternate development lanes.
 
 ## Rust Crates Release
 
@@ -259,11 +287,9 @@ Crate publishing to crates.io is **manual** — there is no automated
 `scripts/release/` from a developer workstation that has `cargo login`
 configured.
 
-Release commits must land on `main` before any `vX.Y.Z` tag is pushed. Do not
-tag a release-only branch. Open the release PR against `main`, let required
-review and CI finish, merge it, then explicitly tag the final source commit
-that is reachable from `main`. This is what lets GitHub process `Closes #N`
-lines automatically and show the release PR as merged. The tag release workflow runs
+Release preparation lands directly on canonical `main` in verified slices;
+contributor PRs retain their normal review/merge process. The source must be on
+`main` before any approved `vX.Y.Z` tag is pushed. The tag release workflow runs
 `scripts/release/ensure-release-on-main.sh` for tag pushes and manual dispatches,
 and fails branch-only release sources before assets are published.
 
@@ -276,9 +302,11 @@ and fails branch-only release sources before assets are published.
    the version and OHOS gates. It is safe to rerun after the workspace already
    equals `X.Y.Z`: the second run skips replacements, refreshes the packaged
    changelog and web facts, and reruns both gates.
-2. Run `./scripts/release/publish-crates.sh dry-run` locally; it must be clean.
-3. Merge the release PR into `main` before tagging. After the same-version
-   queue is frozen and `main` is at the intended source SHA, create `vX.Y.Z`
+2. Freeze clean canonical `main` at the intended SHA, run
+   `./scripts/release/publish-crates.sh dry-run`, and complete the exact-SHA
+   manual full-CI/RC and version-specific acceptance gates above. Retain the
+   receipts rather than repeating unchanged local checks.
+3. Obtain Hunter's explicit publication approval, then create `vX.Y.Z`
    from `main` with the manual **Create release tag** workflow or with a signed
    local tag push from a developer machine.
    - If `RELEASE_TAG_PAT` is configured, the tag push starts `release.yml`.
@@ -296,16 +324,14 @@ and fails branch-only release sources before assets are published.
    Cargo or npm package until it passes:
 
    ```bash
-   git fetch --force origin +refs/tags/vX.Y.Z:refs/tags/vX.Y.Z
+   git fetch origin tag vX.Y.Z
    ./scripts/release/verify-release-assets.sh X.Y.Z
    ```
 
-5. Create a clean detached checkout of the immutable release tag, then publish
-   the Rust crates from that checkout only:
+5. Publish approved Rust crates from the same clean canonical checkout on
+   `main`, with `HEAD` still matching the immutable remote release tag:
 
    ```bash
-   git worktree add --detach ../codewhale-release-vX.Y.Z vX.Y.Z
-   cd ../codewhale-release-vX.Y.Z
    ./scripts/release/require-release-tag-checkout.sh X.Y.Z
    ./scripts/release/publish-crates.sh publish
    ```
@@ -316,6 +342,10 @@ and fails branch-only release sources before assets are published.
    second handwritten order in this runbook. The helper waits for each new
    version to appear on crates.io before moving to dependents and safely skips
    versions that are already public on a rerun.
+   If shared `main` advances or the checkout becomes dirty, stop and coordinate
+   a new candidate or separately authorized recovery with Hunter. Do not switch
+   branches, create another checkout, force-fetch a conflicting tag or bypass
+   the guard.
 
 The publish helper is idempotent for reruns: already-published crate versions are skipped.
 
@@ -385,8 +415,8 @@ long-lived bypass-2FA credential.
 Before the first automated publish, configure the `codewhale` package's npm
 Trusted Publisher with these exact values:
 
-- organization or user: `Hmbown`
-- repository: `CodeWhale`
+- organization or user: `codewhale-hq`
+- repository: `Codewhale`
 - workflow filename: `release.yml`
 - environment: leave blank (the workflow does not claim a GitHub environment)
 
@@ -398,12 +428,10 @@ fail; do not add a token fallback to make it pass.
 
 1. Set the npm package version in [npm/codewhale/package.json](../npm/codewhale/package.json) to match the workspace `Cargo.toml`. CI's version-drift guard will catch mismatches before tag.
 2. Set `codewhaleBinaryVersion` to the GitHub release tag that should supply binaries.
-3. Push the version bump to `main`. After the release source is frozen, create
-   the matching `vX.Y.Z` tag from `main`; `release.yml` then builds the binary
-   matrix and publishes the GitHub Release after its artifact and container gates.
-   The tag also syncs to `cnb.cool/codewhale.net/codewhale`, whose pipeline
-   independently publishes a Linux x64 release and marks it latest. Include
-   that destination in publication approval; it does not wait for GitHub Release.
+3. Follow the single candidate/approval/tag sequence above. `release.yml` builds
+   the binary matrix and publishes the GitHub Release after its artifact and
+   container-build gates. CNB release-tag sync and GHCR uploads depend on that
+   GitHub publication; include these destinations in publication approval.
 4. **Wait for the GitHub Release to finalize** with the full binary and archive
    matrix, Windows installer, and both checksum manifests. The dependent `npm`
    job checks the remote tag again, runs the public asset freshness gate and
@@ -429,7 +457,8 @@ Do not publish `npm/deepseek-tui`; it is deprecated compatibility metadata only.
 ### Manual recovery
 
 If GitHub OIDC is unavailable after the GitHub Release and public-asset gate are
-green, use a clean detached checkout of the immutable tag. Authenticate
+green and manual npm publication is approved, use the same clean canonical
+checkout on `main` with `HEAD` matching the immutable tag. Authenticate
 interactively with npm's normal WebAuthn/2FA flow; never create a long-lived
 bypass-2FA token:
 
@@ -448,11 +477,13 @@ verification.
 
 ## CNB Cool mirror
 
-Every push to `main`, `fix/*`, `rebrand/*`, `work/v*`, and every `v*` tag is mirrored to
-`cnb.cool/codewhale.net/codewhale` via the `Sync to CNB` workflow
-so users behind GitHub-blocking networks can fetch the source and so CNB can
-run the heavy Linux CI lane. After a release tag, **verify the mirror caught
-it** before declaring the release shipped:
+The `Sync to CNB` workflow mirrors `main` source pushes (and existing supported
+contributor branch patterns) to `cnb.cool/codewhale.net/codewhale` for source
+access and Linux CI. These workflow patterns do not require an agent branch.
+Release-tag sync is called by `release.yml` after canonical GitHub publication;
+an ordinary GitHub tag push is not an independent CNB publication receipt.
+After approved release publication, **verify the mirror caught the exact tag**
+before declaring that destination shipped:
 
 ```bash
 git ls-remote https://cnb.cool/codewhale.net/codewhale.git refs/tags/vX.Y.Z
@@ -472,21 +503,24 @@ crates unpublished), the tag is still recoverable — a bug found after tagging
 can be fixed and the same version recut. Confirm first that nothing consumed it:
 `npm view codewhale version` and crates.io both show the PRIOR version, no
 Homebrew/Winget/mirror points at it, and the GitHub Release download counts are
-only the release pipeline's own verification passes. Then, with explicit
-maintainer approval:
+only the release pipeline's own verification passes. Then, only with explicit
+Hunter approval naming the release/tag to remove and recreate, use this
+exceptional recovery sequence:
 
 ```bash
-# 1. land the fix on main (normal PR + required CI)
+# 1. land the verified fix on canonical main, then freeze its new candidate
 # 2. delete the premature Release + tag
-gh release delete vX.Y.Z --repo Hmbown/CodeWhale --yes --cleanup-tag
+gh release delete vX.Y.Z --repo codewhale-hq/CodeWhale --yes --cleanup-tag
 git push origin :refs/tags/vX.Y.Z    # belt-and-suspenders
 git tag -d vX.Y.Z                    # local
-# 3. validate the fixed HEAD first: release.yml refuses a tag without a
-#    green release-candidate receipt (Parity included) for its exact SHA
-gh workflow run release-candidate.yml --repo Hmbown/CodeWhale --ref main \
-  -f expected_sha="$(git rev-parse origin/main)"
-# 4. once that RC run is green, recut at the same HEAD (version unchanged)
-gh workflow run auto-tag.yml --repo Hmbown/CodeWhale --ref main
+# 3. validate the fixed HEAD: full CI and RC (Parity included), same exact SHA
+candidate_sha="$(git rev-parse HEAD)"
+gh workflow run ci.yml --repo codewhale-hq/Codewhale --ref main \
+  -f expected_sha="${candidate_sha}"
+gh workflow run release-candidate.yml --repo codewhale-hq/CodeWhale --ref main \
+  -f expected_sha="${candidate_sha}"
+# 4. after both receipts and approval, recut at that same HEAD
+gh workflow run auto-tag.yml --repo codewhale-hq/CodeWhale --ref main
 # 5. release.yml rebuilds assets; rebuild + reinstall locally from the new tag
 ```
 
@@ -513,7 +547,7 @@ for that version — bump to the next patch instead.
   means the token is missing/expired — `cargo login`, then
   `./scripts/release/publish-crates.sh publish`.
 - **npm:** the OIDC job publishes only if the npmjs.com Trusted Publisher for
-  `Hmbown` / `CodeWhale` / workflow `release.yml` / blank environment is
+  `codewhale-hq` / `Codewhale` / workflow `release.yml` / blank environment is
   configured. Missing config → the `npm` job fails `E404 No match found`. Fix
   the binding (or use the manual WebAuthn recovery above), then re-run the
   failed `npm` job: `gh run rerun <release-run-id> --failed`.
@@ -525,7 +559,7 @@ for that version — bump to the next patch instead.
     [docs/INSTALL.md](INSTALL.md#7-build-from-source)
   - manual assets: download binaries or the platform archive plus the matching
     `codewhale-artifacts-sha256.txt` or `codewhale-bundles-sha256.txt`
-    manifest from `https://github.com/Hmbown/CodeWhale/releases/tag/vX.Y.Z`
+    manifest from `https://github.com/codewhale-hq/CodeWhale/releases/tag/vX.Y.Z`
   - workspace files: use `/restore list [N]` and `/restore <N>` for side-git
     snapshots; this does not change the installed binary version or rewrite
     conversation history

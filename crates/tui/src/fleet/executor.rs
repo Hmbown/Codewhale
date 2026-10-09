@@ -474,7 +474,7 @@ fn parse_exec_terminal_final_answer(value: &serde_json::Value) -> Option<FleetWo
         .and_then(|chars| usize::try_from(chars).ok())
         .unwrap_or_else(|| excerpt.chars().count());
     Some(FleetWorkerFinalAnswer {
-        excerpt: crate::exec_stream_final_answer_excerpt(excerpt),
+        excerpt: exec_stream_final_answer_excerpt(excerpt),
         chars,
     })
 }
@@ -494,7 +494,7 @@ fn parse_exec_terminal_route(value: &serde_json::Value) -> ParsedTerminalRoute {
         if provider.is_empty() || model.is_empty() {
             return None;
         }
-        let provider_kind = crate::config::ApiProvider::parse(provider)?;
+        let provider_kind = crate::config::ProviderKind::parse(provider)?;
         let provider_exact_id = match meta.get("provider_id") {
             None => None,
             Some(value) => {
@@ -505,7 +505,7 @@ fn parse_exec_terminal_route(value: &serde_json::Value) -> ParsedTerminalRoute {
                 Some(id.to_string())
             }
         };
-        if provider_exact_id.is_some() && provider_kind != crate::config::ApiProvider::Custom {
+        if provider_exact_id.is_some() && provider_kind != crate::config::ProviderKind::Custom {
             return None;
         }
         Some(FleetWorkerReportedRoute {
@@ -1036,6 +1036,29 @@ impl FleetExecutor {
     }
 }
 
+/// Character bound for `metadata.visible_final_answer_excerpt`. The excerpt
+/// is a status surface (fleet receipts, event labels, runtime API payloads),
+/// not the transcript: the full answer lives in the saved session and the
+/// worker's stream-json log, and `visible_final_answer_chars` carries the real
+/// length so a consumer can tell a bounded excerpt from a short answer.
+pub(crate) const EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS: usize = 4_000;
+
+/// Bound and secret-redact the visible final answer once, at the emitter, so
+/// every downstream consumer reads the same excerpt.
+pub(crate) fn exec_stream_final_answer_excerpt(output: &str) -> String {
+    let redacted = codewhale_config::persistence::redact_secrets(output.trim());
+    let mut chars = redacted.chars();
+    let excerpt: String = chars
+        .by_ref()
+        .take(EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS)
+        .collect();
+    if chars.next().is_some() {
+        format!("{excerpt}...")
+    } else {
+        excerpt
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1083,6 +1106,7 @@ mod tests {
 
     fn agent_profile(id: &str, role: &str, instructions: &str) -> AgentProfile {
         AgentProfile {
+            native_preset: None,
             id: id.to_string(),
             display_name: Some(format!("{role} profile")),
             description: Some(format!("{role} description")),
@@ -2058,7 +2082,7 @@ mod tests {
         })).unwrap();
         assert!(!answer.excerpt.contains("sk-ant-must-not-leak"));
         assert!(
-            answer.excerpt.chars().count() <= crate::EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS + 3
+            answer.excerpt.chars().count() <= super::EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS + 3
         );
         assert_eq!(answer.chars, 9000);
     }

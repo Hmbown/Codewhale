@@ -158,8 +158,9 @@ test("b64 round-trips JSON payloads", () => {
 
 test("localExec provides run/runOk/tmpFile", async () => {
   const ex = localExec();
-  const r = await ex.run("echo", ["hi"]);
+  const r = await ex.run(process.execPath, ["-e", "process.stdout.write(process.argv[1])", "hi"]);
   assert.equal(r.code, 0);
+  assert.equal(r.stdout, "hi");
   const f = ex.tmpFile("cu-test-");
   assert.ok(typeof f === "string");
 });

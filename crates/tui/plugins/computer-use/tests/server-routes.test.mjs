@@ -123,6 +123,111 @@ if (args[0] === 'file' && args[1] === 'recv') {
 
 const point = { type: "coordinate", x: 10, y: 10 };
 
+// The real SSH executor has no filesLocal flag. These handles exist only in
+// replies from this command fixture; no image or provider is created locally.
+const captureSSH = String.raw`
+  const fs = require('node:fs');
+  const {createInterface} = require('node:readline');
+  const host = process.argv.find(arg => arg.startsWith('fixture-'));
+  let captures = 0, crops = 0;
+  const remoteFile = (kind, index) => '/cu-remote-only-fixture/' + host + '/' + kind + '-' + index + '.png';
+  const reply = (request, value) => process.stdout.write(JSON.stringify({...value, id:request.id}) + '\n');
+  function handle(request) {
+    if (request.tool === 'platform') return reply(request, {ok:true,platform:'linux'});
+    const args = request.args ?? {};
+    fs.appendFileSync(process.env.ROUTE_LOG, JSON.stringify({method:request.tool,host,args}) + '\n');
+    if (request.tool === 'screenshot') return reply(request, {ok:true,data:{
+      file:remoteFile('capture', ++captures), points:{x:100,y:50,w:200,h:100},
+      pixels:{w:400,h:200}, scale:2,
+    }});
+    if (request.tool === 'zoom') return reply(request, {ok:true,data:{
+      file:remoteFile('crop', ++crops), source:args.source, region:args.region,
+    }});
+    if (request.tool === 'left_click') return reply(request, {ok:true,data:{action_sent:true}});
+    return reply(request, {ok:false,error:{code:'unexpected_fixture_tool',message:request.tool}});
+  }
+  const decode = encoded => JSON.parse(Buffer.from(encoded, 'base64'));
+  if (process.argv.includes('--serve')) {
+    createInterface({input:process.stdin}).on('line', line => handle(decode(line)));
+  } else handle(decode(process.argv.at(-1)));
+`;
+
+test("remote-only capture pins preserve nested zoom sources and refuse superseded crops before dispatch", async t => {
+  const f = fixture(t, null, captureSSH);
+  const registration = await f.tool("computer_register", {
+    computer: "remote", transport: "ssh", host: "fixture-capture.test", installAgent: false,
+  });
+  assert.equal(registration.ok, true, JSON.stringify(registration));
+  const shot = await f.tool("screenshot", { computer: "remote" });
+  assert.equal(shot.ok, true, JSON.stringify(shot));
+  assert.equal(shot.computer.transport, "ssh");
+  assert.equal(typeof shot.raster_id, "string");
+  assert.equal(fs.existsSync(shot.file), false, "the remote handle is not a locally readable image");
+
+  const first = await f.tool("zoom", {
+    region: [40, 20, 100, 80], raster_id: shot.raster_id, source: "/untrusted/caller.png",
+  });
+  assert.equal(first.ok, true, JSON.stringify(first));
+  assert.equal(first.parent_raster_id, shot.raster_id);
+  assert.notEqual(first.raster_id, shot.raster_id);
+  assert.equal(fs.existsSync(first.file), false);
+  assert.equal(f.calls().filter(call => call.method === "zoom").at(-1).args.source, shot.file);
+
+  const before = f.calls().length;
+  const stale = await f.tool("zoom", { region: [0, 0, 10, 10], raster_id: shot.raster_id });
+  assert.equal(stale.error?.code, "raster_stale", JSON.stringify(stale));
+  assert.equal(f.calls().length, before, "a superseded pin sends no crop or input to SSH");
+
+  const child = await f.tool("zoom", { region: [20, 10, 30, 20], raster_id: first.raster_id });
+  assert.equal(child.ok, true, JSON.stringify(child));
+  assert.equal(child.parent_raster_id, first.raster_id);
+  assert.notEqual(child.raster_id, first.raster_id);
+  assert.equal(fs.existsSync(child.file), false);
+  const crops = f.calls().filter(call => call.method === "zoom");
+  assert.deepEqual(crops.map(call => call.args.source), [shot.file, first.file]);
+  assert.ok(crops.every(call => !Object.hasOwn(call.args, "raster_id")), "capture pins stay at the MCP boundary");
+
+  const clicked = await f.tool("left_click", { target: { type: "coordinate", x: 10, y: 8, raster_id: child.raster_id } });
+  assert.equal(clicked.ok, true, JSON.stringify(clicked));
+  assert.equal(clicked.target_raster_id, child.raster_id);
+  const target = f.calls().filter(call => call.method === "left_click").at(-1).args.target;
+  assert.deepEqual({ x: target.x, y: target.y }, { x: 135, y: 69 });
+  assert.equal(target.coordinate_space, "raster");
+  assert.equal(Object.hasOwn(target, "raster_id"), false);
+});
+
+test("identical geometry on another computer cannot accept a foreign capture pin", async t => {
+  const f = fixture(t, null, captureSSH);
+  const shots = [];
+  for (const computer of ["first", "second"]) {
+    const registration = await f.tool("computer_register", {
+      computer, transport: "ssh", host: "fixture-" + computer + ".test", installAgent: false,
+    });
+    assert.equal(registration.ok, true, JSON.stringify(registration));
+    const shot = await f.tool("screenshot", { computer });
+    assert.equal(shot.ok, true, JSON.stringify(shot));
+    shots.push(shot);
+  }
+  assert.deepEqual(shots[0].points, shots[1].points);
+  assert.deepEqual(shots[0].pixels, shots[1].pixels);
+  assert.notEqual(shots[0].raster_id, shots[1].raster_id);
+  const before = f.calls().length;
+  const foreign = await f.tool("left_click", {
+    computer: "second", target: { ...point, raster_id: shots[0].raster_id },
+  });
+  assert.equal(foreign.error?.code, "raster_stale", JSON.stringify(foreign));
+  assert.equal(f.calls().length, before, "foreign pixels never become input on the other computer");
+  const own = await f.tool("left_click", {
+    computer: "second", target: { ...point, raster_id: shots[1].raster_id },
+  });
+  assert.equal(own.ok, true, JSON.stringify(own));
+  assert.equal(own.target_raster_id, shots[1].raster_id);
+  const sent = f.calls().filter(call => call.method === "left_click");
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].host, "fixture-second.test");
+  assert.deepEqual({ x: sent[0].args.target.x, y: sent[0].args.target.y }, { x: 105, y: 55 });
+});
+
 test("a warmed HDC backend cannot send input to A after registration reports B", async t => {
   const f = fixture(t);
   await f.register("A");
@@ -432,8 +537,8 @@ test("SSH registration retains its trusted host-key file after platform discover
   assert.equal(JSON.parse(fs.readFileSync(path.join(f.dir, "computers.json"))).computers.pad.knownHosts, knownHosts);
   const calls = f.calls();
   assert.equal(calls.length, 1);
-  assert.ok(calls[0].args.includes(`UserKnownHostsFile=${knownHosts}`));
-  assert.ok(calls[0].args.includes("GlobalKnownHostsFile=/dev/null"));
+  assert.ok(calls[0].args.includes(`UserKnownHostsFile=${process.platform === "win32" ? knownHosts.replaceAll("\\", "/") : knownHosts}`));
+  assert.ok(calls[0].args.includes(`GlobalKnownHostsFile=${process.platform === "win32" ? "NUL" : "/dev/null"}`));
   assert.ok(calls[0].args.includes("StrictHostKeyChecking=yes"));
 });
 

@@ -32,7 +32,7 @@ describe("changelog derivation", () => {
     for (const release of CHANGELOG.slice(1)) {
       expect(release.version).toMatch(/^\d+\.\d+\.\d+$/);
       expect(release.compareUrl, release.version).toMatch(
-        /^https:\/\/github\.com\/Hmbown\/CodeWhale\/compare\//,
+        /^https:\/\/github\.com\/codewhale-hq\/CodeWhale\/compare\//,
       );
       expect(release.sections.length, release.version).toBeGreaterThan(0);
       for (const section of release.sections) {
@@ -62,8 +62,8 @@ describe("changelog derivation", () => {
 
 Trailing prose that is not a bullet.
 
-[Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v1.2.3...HEAD
-[1.2.3]: https://github.com/Hmbown/CodeWhale/compare/v1.2.2...v1.2.3
+[Unreleased]: https://github.com/codewhale-hq/CodeWhale/compare/v1.2.3...HEAD
+[1.2.3]: https://github.com/codewhale-hq/CodeWhale/compare/v1.2.2...v1.2.3
 `;
     const { releases } = parseChangelog(md);
     expect(releases).toHaveLength(2);
@@ -71,7 +71,7 @@ Trailing prose that is not a bullet.
       version: "Unreleased",
       unreleased: true,
       date: null,
-      compareUrl: "https://github.com/Hmbown/CodeWhale/compare/v1.2.3...HEAD",
+      compareUrl: "https://github.com/codewhale-hq/CodeWhale/compare/v1.2.3...HEAD",
     });
     expect(releases[0].sections[0].items).toEqual([
       "First entry that continues on the next line.",

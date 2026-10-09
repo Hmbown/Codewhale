@@ -33,16 +33,19 @@ import type { LocalizedText } from "./content/vocabulary";
  * capture (`capture`, via scripts/render-terminal-capture.mjs and
  * components/terminal-capture.tsx); `src` is the same frame rasterized by
  * that script for the README, which cannot run the site's renderer. Captured
- * build identity is independent of the current source/release.
+ * build identity is independent of the current source/release. This local
+ * website-demo session exercises real Engine tools; it does not qualify an
+ * inference provider. sourceCommit is the candidate's base; exact binary and
+ * dirty-source hashes are recorded in terminal-captures/manifest.json.
  */
 export const TERMINAL_SCREENSHOT = {
   capture: "web/lib/terminal-captures/website-home-100x24.json",
-  src: "/codewhale-tui-5765d80.png",
-  width: 1872,
-  height: 956,
-  version: "0.10.0",
-  sourceCommit: "5765d80278f7184d187fa6682ba96b403a006523",
-  sha256: "359359275fefed015ba0e3772fee9e09d64048813d311c31d6ee2a83b1ee85b5",
+  src: "/codewhale-tui-0102-demo.png",
+  width: 1000,
+  height: 480,
+  version: "0.10.2",
+  sourceCommit: "bd0c32567024d5bc3efac7d13331c68711de031e",
+  sha256: "43ebde941cedb690612945b712e9565e92a441045c78646bf8841f3ad43ac369",
 } as const;
 
 /** Published-asset budgets; see the module contract for what tests inspect. */

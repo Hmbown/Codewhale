@@ -14,7 +14,9 @@
       "runtime": {
         "name": "deno",
         "version": "2.0.0"
-      }
+      },
+      "tier": "plugin",
+      "builtin_modules": []
     }
   }
 }

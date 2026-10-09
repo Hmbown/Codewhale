@@ -596,3 +596,104 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
         actor_task.await.unwrap();
     });
 }
+
+/// A refused `/edit` rollback has already consumed the revision from the
+/// composer. It must come back, with edit mode re-armed, not be lost.
+#[tokio::test]
+async fn refused_edit_rollback_returns_the_revision_to_the_composer() {
+    use crate::task_manager::{
+        TaskExecutionResult, TaskManagerConfig, TaskStatus, TaskTerminalReason,
+    };
+    struct Idle;
+    #[async_trait::async_trait]
+    impl crate::task_manager::TaskExecutor for Idle {
+        async fn execute(
+            &self,
+            _: crate::task_manager::ExecutionTask,
+            _: tokio::sync::mpsc::Sender<crate::task_manager::TaskExecutionEvent>,
+            _: tokio_util::sync::CancellationToken,
+        ) -> TaskExecutionResult {
+            TaskExecutionResult {
+                status: TaskStatus::Completed,
+                result_text: None,
+                error: None,
+                terminal_reason: TaskTerminalReason::Completed,
+            }
+        }
+    }
+    let root = TempDir::new().unwrap();
+    let tasks = TaskManager::start_with_executor(
+        TaskManagerConfig {
+            data_dir: root.path().into(),
+            worker_count: 1,
+            default_workspace: root.path().into(),
+            default_model: "fixture".into(),
+            default_mode: "plan".into(),
+            allow_shell: false,
+            trust_mode: false,
+            execution_limits: crate::task_manager::TaskExecutionLimits::default(),
+        },
+        Arc::new(Idle),
+    )
+    .await
+    .unwrap();
+    let mut backend = ColorCompatBackend::new(
+        std::io::stdout(),
+        codewhale_palette::ColorDepth::Monochrome,
+        codewhale_palette::PaletteMode::Dark,
+    );
+    backend.set_terminal_size(Size::new(80, 24));
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut config = Config::default();
+    let mut engine = mock_engine_handle();
+
+    let mut app = create_test_app();
+    app.push_history_cell(HistoryCell::User {
+        content: "original prompt".into(),
+    });
+    let loaded = commands::execute("/edit", &mut app);
+    assert!(!loaded.is_error, "{:?}", loaded.message);
+    assert!(app.edit_in_progress);
+    // The user revises the prompt and presses Enter: the composer is consumed
+    // and the replacement is staged behind a rollback.
+    app.input = "revised prompt".into();
+    let submitted = std::mem::take(&mut app.input);
+    let result = super::super::event_loop::edit_replacement_result(&mut app, &submitted)
+        .expect("a pending edit stages a replacement");
+    assert!(!app.edit_in_progress);
+    assert!(app.input.is_empty());
+    // Force the refusal: the rollback is only allowed on an idle app.
+    app.is_loading = true;
+
+    apply_command_result(
+        &mut terminal,
+        &mut app,
+        &mut engine.handle,
+        &tasks,
+        &mut config,
+        result,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(app.input, "revised prompt", "the revision is restored");
+    assert_eq!(app.cursor_position, "revised prompt".chars().count());
+    assert!(app.edit_in_progress, "edit mode is active again");
+    assert!(
+        app.history.iter().any(
+            |cell| matches!(cell, HistoryCell::User { content } if content == "original prompt")
+        ),
+        "the refused rollback leaves the original exchange alone"
+    );
+    assert!(
+        app.status_toasts
+            .iter()
+            .any(|toast| toast.text.contains("rollback failed")),
+        "the refusal is still reported"
+    );
+    assert!(
+        engine.rx_op.try_recv().is_err(),
+        "nothing reached the engine"
+    );
+    tasks.shutdown_and_wait().await.unwrap();
+}
