@@ -338,7 +338,7 @@ pub const CHATGPT_OAUTH_PARAMS: OAuthProviderParams<'static> = OAuthProviderPara
     default_issuer: CHATGPT_OAUTH_ISSUER,
     default_client_id: CHATGPT_OAUTH_CLIENT_ID,
     default_scopes: CHATGPT_OAUTH_SCOPE,
-    originator: Some(CHATGPT_OAUTH_ORIGINATOR),
+    originator: None,
     env: OAuthEnvOverrides {
         issuer_vars: &["CODEWHALE_CHATGPT_OAUTH_ISSUER"],
         client_id_vars: &["CODEWHALE_CHATGPT_OAUTH_CLIENT_ID"],
@@ -2317,8 +2317,6 @@ pub(crate) const DEVICE_POLL_MAX_SECS: u64 = 900;
 /// ChatGPT issuer and public client.
 pub const CHATGPT_OAUTH_ISSUER: &str = "https://auth.openai.com";
 pub const CHATGPT_OAUTH_CLIENT_ID: &str = "dynamic_agent_client";
-/// Honest originator; never impersonate `codex_cli_rs`.
-pub const CHATGPT_OAUTH_ORIGINATOR: &str = "codewhale";
 pub const CHATGPT_OAUTH_RESOURCE: &str = "https://api.openai.com/v1";
 pub const CHATGPT_OAUTH_SCOPE: &str =
     "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
@@ -5917,7 +5915,7 @@ mod tests {
     }
 
     #[test]
-    fn authorize_url_is_honest_originator_and_pkce() {
+    fn authorize_url_uses_documented_chatgpt_parameters_and_pkce() {
         let _lock = crate::test_support::lock_test_env();
         let _prompt = crate::test_support::EnvVarGuard::remove("CODEWHALE_CHATGPT_OAUTH_NO_PROMPT");
         let pkce = PkceChallenge {
@@ -5937,7 +5935,7 @@ mod tests {
         assert!(url.starts_with("https://auth.openai.com/api/accounts/authorize?"));
         assert!(url.contains("code_challenge=challenge"));
         assert!(url.contains("code_challenge_method=S256"));
-        assert!(url.contains("originator=codewhale"));
+        assert!(!url.contains("originator="), "{url}");
         assert!(!url.contains("codex_cli_rs"));
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
         assert!(url.contains("resource=https%3A%2F%2Fapi.openai.com%2Fv1"));
@@ -8072,7 +8070,7 @@ consent_version = 1
                 "expires_at": rfc3339_from_now(3600),
                 "oidc_issuer": CHATGPT_OAUTH_ISSUER,
                 "oidc_client_id": CHATGPT_OAUTH_CLIENT_ID,
-                "originator": CHATGPT_OAUTH_ORIGINATOR
+                "originator": "codewhale"
             }
         });
         codewhale_config::with_xai_oauth_lifecycle_lock(|store| {

@@ -559,7 +559,7 @@ owner = "crates/tui/src/voice.rs"
 [[feature]]
 id = "pet"
 name = "Pet"
-summary = "/pet on remembers the animated main view across launches; /pet inspect opens replies and agents with a copy-finished-reply action."
+summary = "/pet on saves the animated main view; /pet inspect shows replies and agents and lets you copy finished replies."
 status = "stable"
 surfaces = { tui = "stable" }
 owner = "crates/tui/src/tui/pet_watch"

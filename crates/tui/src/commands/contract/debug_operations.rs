@@ -246,6 +246,8 @@ fn request_prompts(app: &App) -> Vec<Option<String>> {
         .collect()
 }
 
+type RequestPositionResult = Result<Option<bool>, Box<DebugUndoOutcome>>;
+
 /// Match only lossless, unique prompt labels. Display snippets are not durable
 /// request identities: repeated, multiline, truncated or multipart prompts cannot
 /// authorize a combined file/conversation rollback. `/restore` remains explicit.
@@ -253,7 +255,7 @@ fn request_is_last(
     requests: &[Option<String>],
     owned_request_snippets: &[Option<String>],
     label: &str,
-) -> Result<Option<bool>, Box<DebugUndoOutcome>> {
+) -> RequestPositionResult {
     use crate::core::turn::{parse_snapshot_label, snapshot_label_prompt_snippet};
     if requests.is_empty() {
         return Ok(None);
@@ -457,7 +459,7 @@ fn plan_undo_step(
     snapshots: Vec<crate::snapshot::Snapshot>,
     owners: &[SnapshotOwner],
     force: bool,
-    request_position: &dyn Fn(&str) -> Result<Option<bool>, Box<DebugUndoOutcome>>,
+    request_position: &dyn Fn(&str) -> RequestPositionResult,
 ) -> Result<UndoStep, Box<DebugUndoOutcome>> {
     let owned: Vec<crate::snapshot::Snapshot> = snapshots
         .into_iter()

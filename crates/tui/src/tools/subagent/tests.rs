@@ -24508,7 +24508,9 @@ mod child_permission_gate {
                     );
                     if by == ApprovalDecider::User {
                         assert!(
-                            err.to_string().starts_with("Tool 'bash' denied by user — "),
+                            matches!(err.downcast_ref::<ToolError>(),
+                                Some(ToolError::PermissionDenied { message })
+                                    if message.starts_with("Tool 'bash' denied by user — ")),
                             "{err}"
                         );
                     }

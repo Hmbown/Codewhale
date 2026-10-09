@@ -140,6 +140,15 @@ launcher guidance.
 
 ### Fixed
 
+- ChatGPT sign-in omits the unsupported `originator` query parameter that
+  caused an initial `invalid_authorize_request` rejection. PKCE, account
+  binding and granted-scope validation remain in the same login flow
+  (Refs #6925).
+- The shared pet pauses its world and periodic checkpoint writes after its
+  viewers, producer and audio leases expire. Authenticated clients wake it
+  through the existing request queue; its active clock waits for the next
+  frame instead of polling every two milliseconds (Refs #6728, #6155).
+
 - `Ctrl+B` and steering input release foreground and background shell waits
   without stopping their commands. Requests apply only to active waits in the
   current session, including waits on several tasks; a later wait starts fresh
