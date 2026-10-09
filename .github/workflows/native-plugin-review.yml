@@ -1,0 +1,73 @@
+name: Native plugin final verification
+on:
+  push:
+    branches: [feat/native-plugin-login-install]
+permissions:
+  contents: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install upstream build dependencies
+        run: bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-plugin-login-review
+          cache-on-failure: true
+      - name: Fix the diagnosed registry API uses and preserve setup help
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          for name in ['crates/tui/src/commands/groups/config/config.rs', 'crates/tui/src/commands/groups/config/mod.rs', 'crates/tui/src/plugins/providers.rs']:
+              p = Path(name)
+              text = p.read_text()
+              text, count = re.subn(r'\.active_plugins\(\)(\s*)\.any\(', r'.active_plugins().into_iter()\1.any(', text)
+              assert count == 1, (name, count)
+              p.write_text(text)
+          for name, comment, setup in [
+              ('crates/cli/src/lib.rs', '    /// Bootstrap MCP config and/or skills directories.\n', '    Setup(TuiPassthroughArgs),'),
+              ('crates/tui/src/lib.rs', '    /// Bootstrap MCP config and/or skills directories\n', '    Setup(SetupArgs),'),
+          ]:
+              p = Path(name)
+              text = p.read_text()
+              assert text.count(comment) == 1 and text.count(setup) == 1
+              p.write_text(text.replace(comment, '', 1).replace(setup, comment + setup, 1))
+          PY
+          git diff --name-only -- '*.rs' | xargs -r rustfmt --edition 2024 --config skip_children=true
+          git diff --check
+          mkdir -p "$RUNNER_TEMP/native-results"
+          git diff --binary > "$RUNNER_TEMP/native-results/fix.patch"
+          git rm .github/workflows/native-plugin-review.yml
+          git add crates/cli/src/lib.rs crates/tui/src/lib.rs crates/tui/src/commands/groups/config/config.rs crates/tui/src/commands/groups/config/mod.rs crates/tui/src/plugins/providers.rs
+          git -c user.name=LIghtJUNction -c user.email=lightjunction.me@gmail.com commit -m 'fix(plugins): iterate active registry snapshots and retain setup help'
+          git push origin HEAD:feat/native-plugin-login-install
+          git rev-parse HEAD > "$RUNNER_TEMP/native-results/commit.txt"
+      - name: Check Rust packages and test code
+        run: |
+          set -o pipefail
+          cargo check -p codewhale-tui -p codewhale-cli --tests --locked 2>&1 | tee "$RUNNER_TEMP/native-results/cargo-check.log"
+      - name: Check localization
+        if: always()
+        run: |
+          set -o pipefail
+          cargo test -p codewhale-localization --locked 2>&1 | tee "$RUNNER_TEMP/native-results/localization.log"
+      - name: Check blocking-call budget
+        if: always()
+        run: python3 scripts/check-blocking-calls-budget.py > "$RUNNER_TEMP/native-results/blocking-budget.log" 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-plugin-final-verification
+          path: ${{ runner.temp }}/native-results
+          retention-days: 3
