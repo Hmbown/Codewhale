@@ -24507,8 +24507,12 @@ mod child_permission_gate {
                         "{err}"
                     );
                     if by == ApprovalDecider::User {
+                        // Match the typed message: Display prefixes
+                        // "Failed to authorize tool execution: ".
                         assert!(
-                            err.to_string().starts_with("Tool 'bash' denied by user — "),
+                            matches!(err.downcast_ref::<ToolError>(),
+                                Some(ToolError::PermissionDenied { message })
+                                    if message.starts_with("Tool 'bash' denied by user — ")),
                             "{err}"
                         );
                     }
