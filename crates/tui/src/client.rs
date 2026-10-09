@@ -290,6 +290,7 @@ pub struct CodewhaleClient {
     plugin_provider: Option<Box<crate::config::ProviderConfig>>,
     /// Read-only diagnostic probes must never migrate or refresh the grant.
     plugin_oauth_read_only: bool,
+    claude_oauth_config: Option<Box<Config>>,
     /// Exact configured credential values removed from model-bound tool
     /// results. Structural redaction handles config/JSON assignments, while
     /// this list closes the gap for bare provider tokens with no recognizable
@@ -603,7 +604,9 @@ fn mark_recovery_probe_if_due(health: &mut ConnectionHealth, now: Instant) -> bo
 
 /// The one command that replaces a rejected key, by where it came from.
 fn auth_fix_hint(route: &str, key_source: &str) -> String {
-    if key_source.starts_with("--api-key") {
+    if key_source == "Claude sign-in" {
+        "codewhale auth claude".to_string()
+    } else if key_source.starts_with("--api-key") {
         "pass a valid --api-key".to_string()
     } else if let Some(rest) = key_source.strip_prefix("env var ")
         && rest.contains("api_key_env")
@@ -653,6 +656,7 @@ impl Clone for CodewhaleClient {
             subscription_limit_guidance: self.subscription_limit_guidance.clone(),
             plugin_provider: self.plugin_provider.clone(),
             plugin_oauth_read_only: self.plugin_oauth_read_only,
+            claude_oauth_config: self.claude_oauth_config.clone(),
             model_bound_secret_values: Arc::clone(&self.model_bound_secret_values),
             catalog_error_secret_values: Arc::clone(&self.catalog_error_secret_values),
             model_bound_masking: self.model_bound_masking,
@@ -1735,6 +1739,14 @@ impl CodewhaleClient {
             });
             (resolved, None, guidance, None)
         };
+        let subscription_limit_guidance = if api_key_source == "Claude sign-in" {
+            Some(crate::oauth::usage_limit_guidance(
+                crate::oauth::OAuthProvider::Claude,
+                None,
+            ))
+        } else {
+            subscription_limit_guidance
+        };
         let model_bound_secret_values =
             Arc::new(configured_model_bound_secret_values(config, &api_key));
         // The opt-out is effective only after an explicit startup confirmation;
@@ -1756,10 +1768,32 @@ impl CodewhaleClient {
         }
         // A newly reviewed plugin destination must not inherit credentials or
         // routing headers from unrelated, global provider configuration.
-        let http_headers = plugin_provider.as_ref().map_or_else(
+        let mut http_headers = plugin_provider.as_ref().map_or_else(
             || config.http_headers(),
             |entry| entry.http_headers.clone().unwrap_or_default(),
         );
+        if api_key_source == "Claude sign-in" {
+            http_headers.retain(|name, _| !is_upstream_auth_header(name));
+            let mut beta = http_headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
+                .flat_map(|(_, value)| value.split(',').map(str::trim))
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            http_headers.retain(|name, _| !name.eq_ignore_ascii_case("anthropic-beta"));
+            if !beta.iter().any(|value| value == "oauth-2025-04-20") {
+                beta.push("oauth-2025-04-20".into());
+            }
+            http_headers.insert("anthropic-beta".into(), beta.join(","));
+            anyhow::ensure!(
+                config
+                    .provider_config_for(&admitted_identity)
+                    .and_then(|entry| entry.oauth_credential_generation.as_deref())
+                    .is_some_and(codewhale_config::is_valid_claude_oauth_generation),
+                "Claude sign-in generation is missing; sign in again"
+            );
+        }
         let auth_disabled = auth_mode_disables_api_key(
             config.auth_mode_for_provider(&admitted_identity).as_deref(),
         );
@@ -1817,7 +1851,7 @@ impl CodewhaleClient {
             force_http1,
             config,
         )?;
-        let http_client = if plugin_provider.is_some() {
+        let http_client = if plugin_provider.is_some() || api_key_source == "Claude sign-in" {
             http_client.redirect(reqwest::redirect::Policy::none())
         } else {
             http_client
@@ -1848,7 +1882,7 @@ impl CodewhaleClient {
             true,
             config,
         )?;
-        let http1_client = if plugin_provider.is_some() {
+        let http1_client = if plugin_provider.is_some() || api_key_source == "Claude sign-in" {
             http1_client.redirect(reqwest::redirect::Policy::none())
         } else {
             http1_client
@@ -1865,6 +1899,8 @@ impl CodewhaleClient {
             models_http_client,
             http1_client,
             api_key,
+            claude_oauth_config: (api_key_source == "Claude sign-in")
+                .then(|| Box::new(config.clone())),
             api_key_source,
             subscription_limit_guidance,
             plugin_provider,
@@ -1909,6 +1945,35 @@ impl CodewhaleClient {
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder> {
+        if let Some(config) = self.claude_oauth_config.clone() {
+            let destination = request
+                .try_clone()
+                .context("Claude request cannot be inspected")?
+                .build()?;
+            anyhow::ensure!(
+                destination.url().scheme() == "https"
+                    && destination.url().host_str() == Some("api.anthropic.com")
+                    && destination.url().port_or_known_default() == Some(443),
+                "Claude subscription request escaped the native Anthropic origin"
+            );
+            let read_only = self.plugin_oauth_read_only;
+            let token = tokio::task::spawn_blocking(move || {
+                if read_only {
+                    crate::oauth::get_owned_credentials_read_only(
+                        crate::oauth::OAuthProvider::Claude,
+                        &config,
+                    )
+                } else {
+                    crate::oauth::get_owned_credentials(
+                        crate::oauth::OAuthProvider::Claude,
+                        &config,
+                    )
+                }
+            })
+            .await
+            .context("Claude credential worker failed")??;
+            return Ok(request.bearer_auth(token.access_token));
+        }
         let Some(provider) = self.plugin_provider.clone() else {
             return Ok(request);
         };
@@ -3037,11 +3102,20 @@ impl CodewhaleClient {
     /// route that was actually installed for the turn.
     #[must_use]
     pub fn turn_route_receipt(&self) -> crate::route_receipt::TurnRouteReceipt {
+        let credential =
+            self.claude_oauth_config
+                .as_ref()
+                .map_or(self.api_key.as_str(), |config| {
+                    config
+                        .provider_config_for(&self.admitted_identity)
+                        .and_then(|entry| entry.oauth_credential_generation.as_deref())
+                        .unwrap_or_default()
+                });
         crate::route_receipt::TurnRouteReceipt::from_admitted(
             &self.admitted_identity,
             &self.default_model,
             &self.base_url,
-            &self.api_key,
+            credential,
         )
         .with_openrouter_vendor(self.openrouter_vendor.as_deref())
     }
@@ -3823,7 +3897,10 @@ impl CodewhaleClient {
         raw: &str,
     ) -> String {
         // Rotated opaque bearer values are not part of this client's frozen
-        // redaction list. Do not disclose an untrusted plugin endpoint's body.
+        // redaction list. Do not disclose a dynamic OAuth endpoint's body.
+        if self.claude_oauth_config.is_some() {
+            return "Claude subscription request failed".into();
+        }
         if self.plugin_provider.is_some() {
             return "plugin provider request failed".into();
         }
@@ -4490,7 +4567,7 @@ struct BasetenModelItem {
     #[serde(default)]
     supports_structured_output: Option<bool>,
     #[serde(default)]
-    reasoning_options: Vec<serde_json::Value>,
+    reasoning_options: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4730,6 +4807,7 @@ fn codewhale_catalog_offerings_from_body(
                 base_url_fingerprint: fingerprint.to_string(),
                 fetched_at,
             },
+            ..Default::default()
         });
     }
     if offerings.is_empty() {
@@ -4859,7 +4937,7 @@ fn catalog_delta_from_models_body(
     } else if provider == "concentrate" {
         // Concentrate's unauthenticated `GET /v1/models` is the same
         // OpenAI list shape (`{"object":"list","data":[{"id":..}]}`);
-        // rows stay unclaimed unless a same-provider bundled row exists.
+        // Rows state existence; the shared resolver owns metadata completion.
         named_gateway_catalog_offerings_from_body(
             body,
             codewhale_config::ProviderKind::Concentrate,
@@ -4905,6 +4983,7 @@ fn catalog_delta_from_models_body(
                     base_url_fingerprint: fingerprint.clone(),
                     fetched_at,
                 },
+                ..Default::default()
             })
             .collect()
     };
@@ -4940,62 +5019,21 @@ fn named_gateway_catalog_offerings_from_body(
         return Err(CatalogRefreshError::EmptyList);
     }
 
-    let bundled = codewhale_config::catalog::bundled_catalog_offerings();
     let default_model_id = kind.provider().default_model();
     Ok(models
         .into_iter()
         .map(|model| {
             let is_default = model.id.eq_ignore_ascii_case(default_model_id);
-            let same_provider_match = bundled.iter().find(|offering| {
-                offering.provider.eq_ignore_ascii_case(provider)
-                    && offering.wire_model_id.eq_ignore_ascii_case(&model.id)
-            });
-            if let Some(matched) = same_provider_match {
-                CatalogOffering {
-                    cost_source: Some(matched.pricing_source().clone()),
-                    modalities_source: Some(matched.modalities_source().clone()),
-                    provider: provider.to_string(),
-                    wire_model_id: model.id,
-                    canonical_model: matched.canonical_model.clone(),
-                    endpoint_key: "chat".to_string(),
-                    default_for_provider: is_default,
-                    family: matched.family.clone(),
-                    limit: matched.limit.clone(),
-                    cost: matched.cost.clone(),
-                    modalities: matched.modalities.clone(),
-                    attachment: matched.attachment,
-                    reasoning: matched.reasoning,
-                    tool_call: matched.tool_call,
-                    structured_output: matched.structured_output,
-                    reasoning_options: matched.reasoning_options.clone(),
-                    source: CatalogSource::Live {
-                        base_url_fingerprint: fingerprint.to_string(),
-                        fetched_at,
-                    },
-                }
-            } else {
-                CatalogOffering {
-                    cost_source: None,
-                    modalities_source: None,
-                    provider: provider.to_string(),
-                    wire_model_id: model.id,
-                    canonical_model: None,
-                    endpoint_key: "chat".to_string(),
-                    default_for_provider: is_default,
-                    family: None,
-                    limit: None,
-                    cost: None,
-                    modalities: None,
-                    attachment: None,
-                    reasoning: None,
-                    tool_call: None,
-                    structured_output: None,
-                    reasoning_options: Vec::new(),
-                    source: CatalogSource::Live {
-                        base_url_fingerprint: fingerprint.to_string(),
-                        fetched_at,
-                    },
-                }
+            CatalogOffering {
+                provider: provider.to_string(),
+                wire_model_id: model.id,
+                endpoint_key: "chat".to_string(),
+                default_for_provider: is_default,
+                source: CatalogSource::Live {
+                    base_url_fingerprint: fingerprint.to_string(),
+                    fetched_at,
+                },
+                ..Default::default()
             }
         })
         .collect())
@@ -5277,6 +5315,7 @@ fn baseten_to_catalog_offering(
             output: catalog_price_per_million(pricing.completion.as_ref())?,
             cache_read: catalog_price_per_million(pricing.input_cache_read.as_ref())?,
             cache_write: catalog_price_per_million(pricing.input_cache_write.as_ref())?,
+            ..Default::default()
         };
         if !codewhale_config::pricing::catalog_cost_is_valid(&cost) {
             return Err(CatalogRefreshError::InvalidResponse);
@@ -5361,7 +5400,10 @@ fn baseten_to_catalog_offering(
     let structured_output = item.supports_structured_output.or(Some(true));
 
     Ok(CatalogOffering {
-        cost_source: None,
+        cost_source: (item.pricing.is_some() && cost.is_none()).then(|| CatalogSource::Live {
+            base_url_fingerprint: base_url_fingerprint.to_string(),
+            fetched_at,
+        }),
         modalities_source: None,
         provider: provider.to_string(),
         wire_model_id: item.id.clone(),
@@ -5378,11 +5420,13 @@ fn baseten_to_catalog_offering(
         reasoning,
         tool_call,
         structured_output,
-        reasoning_options: item.reasoning_options.clone(),
+        reasoning_options: item.reasoning_options.clone().unwrap_or_default(),
+        reasoning_options_present: item.reasoning_options.is_some(),
         source: CatalogSource::Live {
             base_url_fingerprint: base_url_fingerprint.to_string(),
             fetched_at,
         },
+        ..Default::default()
     })
 }
 
@@ -5465,6 +5509,7 @@ fn openrouter_to_catalog_offering(
                 output: per_million(raw[1])?,
                 cache_read: per_million(raw[2])?,
                 cache_write: per_million(raw[3])?,
+                ..Default::default()
             };
             if !codewhale_config::pricing::catalog_cost_is_valid(&cost) {
                 return Err(CatalogRefreshError::InvalidResponse);
@@ -5515,7 +5560,10 @@ fn openrouter_to_catalog_offering(
     });
 
     Ok(CatalogOffering {
-        cost_source: None,
+        cost_source: (item.pricing.is_some() && cost.is_none()).then(|| CatalogSource::Live {
+            base_url_fingerprint: base_url_fingerprint.to_string(),
+            fetched_at,
+        }),
         modalities_source: None,
         provider: provider.to_string(),
         wire_model_id: item.id.clone(),
@@ -5535,6 +5583,7 @@ fn openrouter_to_catalog_offering(
             base_url_fingerprint: base_url_fingerprint.to_string(),
             fetched_at,
         },
+        ..Default::default()
     })
 }
 

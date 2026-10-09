@@ -6537,6 +6537,12 @@ impl Config {
             .map_err(anyhow::Error::msg)?;
 
         let mut diagnostic = self.clone();
+        if identity.provider == ProviderKind::Anthropic
+            && self.auth_mode_for_provider(&identity).as_deref() == Some("oauth")
+        {
+            diagnostic.plugin_oauth_read_only = true;
+            return Ok(diagnostic);
+        }
         if identity.provider == ProviderKind::Custom
             && self
                 .provider_config_for(&identity)
@@ -6591,6 +6597,26 @@ impl Config {
 
         if auth_mode_disables_api_key(auth_mode.as_deref()) {
             return Ok(keyless());
+        }
+        if provider == ProviderKind::Anthropic && auth_mode.as_deref() == Some("oauth") {
+            anyhow::ensure!(
+                matches!(
+                    self.base_url_for_route(&identity).trim_end_matches('/'),
+                    "https://api.anthropic.com" | "https://api.anthropic.com/v1"
+                ),
+                "Claude subscription credentials require the native Anthropic endpoint"
+            );
+            if read_only {
+                return Ok((
+                    crate::oauth::get_owned_credentials_read_only(
+                        crate::oauth::OAuthProvider::Claude,
+                        self,
+                    )?
+                    .access_token,
+                    "Claude sign-in".to_string(),
+                ));
+            }
+            return Ok((String::new(), "Claude sign-in".to_string()));
         }
         let custom_endpoint = self.provider_uses_custom_endpoint(&identity);
         let explicit_cli_key = explicit_cli_api_key_override();
@@ -11509,6 +11535,8 @@ fn provider_uses_oauth_credentials(config: &Config, identity: &ProviderIdentity)
     !auth_mode_disables_api_key(config.auth_mode_for_provider(identity).as_deref())
         && !config.provider_uses_custom_endpoint(identity)
         && (provider == ProviderKind::OpenaiCodex
+            || (provider == ProviderKind::Anthropic
+                && config.auth_mode_for_provider(identity).as_deref() == Some("oauth"))
             || (provider == ProviderKind::Moonshot
                 && config
                     .provider_config_for(identity)
@@ -11890,6 +11918,15 @@ pub(crate) fn save_api_key_for_identity(
             save_api_key_for_identity_unlocked(identity, route_config, api_key)
         });
     }
+    if identity.provider == ProviderKind::Anthropic {
+        return codewhale_config::with_xai_oauth_lifecycle_lock(|_| {
+            let saved = save_api_key_for_identity_unlocked(identity, route_config, api_key)?;
+            codewhale_config::clear_all_claude_oauth_credentials_locked().context(
+                "API-key billing was selected and saved, but old Claude sign-in cleanup failed",
+            )?;
+            Ok(saved)
+        });
+    }
     save_api_key_for_identity_unlocked(identity, route_config, api_key)
 }
 
@@ -11980,7 +12017,7 @@ fn save_api_key_for_identity_unlocked(
                                     doc,
                                     &["providers", key_inside, "external_credentials"],
                                 )?;
-                                if provider == ProviderKind::Xai {
+                                if matches!(provider, ProviderKind::Xai | ProviderKind::Anthropic) {
                                     crate::config_persistence::unset_document_value(
                                         doc,
                                         &["providers", key_inside, "oauth_credential_generation"],
@@ -12067,7 +12104,7 @@ fn save_api_key_for_identity_unlocked(
             doc,
             &["providers", key_inside, "external_credentials"],
         )?;
-        if provider == ProviderKind::Xai {
+        if matches!(provider, ProviderKind::Xai | ProviderKind::Anthropic) {
             crate::config_persistence::unset_document_value(
                 doc,
                 &["providers", key_inside, "oauth_credential_generation"],

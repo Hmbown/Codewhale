@@ -2474,6 +2474,40 @@ async fn apply_command_result_inner(
                 let _switched =
                     run_xai_device_login_from_tui(terminal, app, engine_handle, config).await?;
             }
+            AppAction::StartClaudeLogin => {
+                let _ = run_claude_login_from_tui(terminal, app, engine_handle, config).await?;
+            }
+            AppAction::StartClaudeRevoke => {
+                let path = app.config_path.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::oauth::revoke_owned_login(
+                        crate::oauth::OAuthProvider::Claude,
+                        path.as_deref(),
+                        None,
+                    )
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("Claude sign-out worker failed: {error}"))
+                .and_then(|result| result);
+                if result.is_ok() {
+                    let identity = config
+                        .builtin_provider_identity(ProviderKind::Anthropic)
+                        .map_err(anyhow::Error::msg)?;
+                    let entry = config.provider_config_for_mut(&identity)?;
+                    entry.oauth_credential_generation = None;
+                }
+                let (message, level) = match result {
+                    Ok(()) => (
+                        "Removed Codewhale's saved Claude sign-in.".to_string(),
+                        StatusToastLevel::Info,
+                    ),
+                    Err(error) => (
+                        format!("Claude sign-out failed: {error}"),
+                        StatusToastLevel::Error,
+                    ),
+                };
+                app.push_status_toast(message, level, Some(8_000));
+            }
             AppAction::StartChatgptPkceLogin => {
                 let _switched =
                     run_chatgpt_pkce_login_from_tui(terminal, app, engine_handle, config).await?;
@@ -4043,7 +4077,7 @@ pub(crate) async fn apply_provider_picker_setup_confirmed(
     switched
 }
 
-async fn apply_codewhale_owned_login(
+pub(crate) async fn apply_codewhale_owned_login(
     app: &mut App,
     engine_handle: &mut EngineHandle,
     config: &mut Config,
@@ -4052,8 +4086,18 @@ async fn apply_codewhale_owned_login(
     status_prefix: &str,
     login_kind: &str,
 ) -> bool {
-    match crate::oauth::activate_login(pending, app.config_path.as_deref(), Some(&mut *config)) {
-        Ok(activation) => {
+    let path = app.config_path.clone();
+    let mut live = config.clone();
+    let activation = tokio::task::spawn_blocking(move || {
+        crate::oauth::activate_login(pending, path.as_deref(), Some(&mut live))
+            .map(|activation| (activation, live))
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("OAuth activation worker failed: {error}"))
+    .and_then(|result| result);
+    match activation {
+        Ok((activation, live)) => {
+            config.refresh_provider_routes_from(&live);
             // The account line goes to the transcript: the status line is
             // overwritten by the route summary once the switch lands.
             let locale = app.ui_locale;

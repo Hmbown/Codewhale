@@ -562,21 +562,17 @@ fn compute_merged_snapshot() -> SharedSnapshot {
     };
     let mut merged: BTreeMap<(String, String), Arc<CatalogOffering>> = BTreeMap::new();
     for row in &bundled_snapshot().offerings {
-        if !is_authoritative(&row.provider) {
+        merged.insert(
+            (row.provider.clone(), row.wire_model_id.clone()),
+            Arc::clone(row),
+        );
+    }
+    if let Some(models_dev) = &live.models_dev {
+        for row in &models_dev.offerings {
             merged.insert(
                 (row.provider.clone(), row.wire_model_id.clone()),
                 Arc::clone(row),
             );
-        }
-    }
-    if let Some(models_dev) = &live.models_dev {
-        for row in &models_dev.offerings {
-            if !is_authoritative(&row.provider) {
-                merged.insert(
-                    (row.provider.clone(), row.wire_model_id.clone()),
-                    Arc::clone(row),
-                );
-            }
         }
     }
     if let Some(facts) = &cloud.facts {
@@ -596,43 +592,35 @@ fn compute_merged_snapshot() -> SharedSnapshot {
             cloud.fetched_at.unwrap_or(0),
         );
         merged.extend(patched.into_iter().map(|(key, row)| (key, Arc::new(row))));
-        // A provider roster owns its omissions as well as the ids it lists, and
-        // the loops above already withheld the lower layers for such a provider
-        // — so a signed row surviving here would be one this client cannot
-        // otherwise justify. Only an explicit `allow_unlisted` assertion keeps
-        // it; without one the roster stands. The partition loop below still
-        // owns every id the roster does list.
-        merged.retain(|(provider, model), row| {
-            if !is_authoritative(provider) {
-                return true;
-            }
-            matches!(row.source, CatalogSource::CloudFacts { .. })
-                && codewhale_config::cloud_facts::catalog_patch::is_unlisted_attested(
-                    facts, provider, model,
-                )
-        });
     }
-    for provider_snapshot in live
-        .per_provider
-        .iter()
-        .filter_map(|(owner, snapshot)| match owner {
-            LivePartitionOwner::BuiltIn(_) => Some(snapshot),
-            LivePartitionOwner::Custom(identity) if ProviderKind::parse(identity).is_none() => {
-                Some(snapshot)
-            }
-            LivePartitionOwner::Custom(_) => None,
-        })
+    let lower_rows = merged.clone();
+    merged.retain(|(provider, model), row| {
+        !is_authoritative(provider)
+            || (matches!(row.source, CatalogSource::CloudFacts { .. })
+                && cloud.facts.as_ref().is_some_and(|facts| {
+                    codewhale_config::cloud_facts::catalog_patch::is_unlisted_attested(
+                        facts, provider, model,
+                    )
+                }))
+    });
+    for (owner, provider_snapshot) in
+        live.per_provider
+            .iter()
+            .filter_map(|(owner, snapshot)| match owner {
+                LivePartitionOwner::BuiltIn(_) => Some((owner, snapshot)),
+                LivePartitionOwner::Custom(identity) if ProviderKind::parse(identity).is_none() => {
+                    Some((owner, snapshot))
+                }
+                LivePartitionOwner::Custom(_) => None,
+            })
     {
         for row in &provider_snapshot.offerings {
             let mut row = row.clone();
-            // The roster owns this id. Where it stated a fact, that fact wins;
-            // where it said nothing, the signed layer may still complete the
-            // row instead of leaving the picker and the executor with an
-            // unknown it does not have to have.
-            if let Some(facts) = &cloud.facts {
-                codewhale_config::cloud_facts::catalog_patch::complete_provider_live_row(
-                    &mut row, facts,
-                );
+            if matches!(owner, LivePartitionOwner::BuiltIn(_))
+                && let Some(lower) =
+                    lower_rows.get(&(row.provider.clone(), row.wire_model_id.clone()))
+            {
+                row.complete_from(lower, None);
             }
             merged.insert(
                 (row.provider.clone(), row.wire_model_id.clone()),
@@ -657,6 +645,31 @@ fn apply_cloud_facts_for_provider(
             cloud.fetched_at.unwrap_or(0),
         );
     }
+}
+
+fn source_rows_for_provider(
+    provider: &str,
+    models_dev: Option<&SharedSnapshot>,
+    cloud: Option<&codewhale_config::cloud_facts::overlay::OverlaySnapshot>,
+) -> BTreeMap<(String, String), CatalogOffering> {
+    let mut rows: BTreeMap<_, _> = bundled_snapshot()
+        .offerings_for_provider(provider)
+        .into_iter()
+        .cloned()
+        .map(|row| ((row.provider.clone(), row.wire_model_id.clone()), row))
+        .collect();
+    if let Some(models_dev) = models_dev {
+        for row in models_dev.offerings_for_provider(provider) {
+            rows.insert(
+                (row.provider.clone(), row.wire_model_id.clone()),
+                row.clone(),
+            );
+        }
+    }
+    if let Some(cloud) = cloud {
+        apply_cloud_facts_for_provider(&mut rows, provider, cloud);
+    }
+    rows
 }
 
 /// Does the signed cloud layer describe this exact route?
@@ -824,39 +837,44 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
     }
 
     let partition_owner = live_partition_owner_for_route(provider, provider_identity);
-    let (endpoint_catalog_authoritative, selected_rows) = if let Ok(live) = LIVE_SNAPSHOT.read() {
-        let exact_partition = live.per_provider.get(&partition_owner);
-        let exact_matches = status_is_fresh
-            && exact_partition.is_some_and(|partition| {
-                !partition.offerings.is_empty()
-                    && partition.offerings.iter().all(|row| {
-                        catalog_partition_key(&row.provider) == catalog_key
-                            && row_matches_endpoint_fingerprint(row, &fingerprint)
-                    })
-            });
-        let rows = if exact_matches {
-            exact_partition
-                .map(|partition| partition.offerings.clone())
-                .unwrap_or_default()
-        } else if provider != ProviderKind::Custom {
-            live.models_dev
-                .as_ref()
-                .map(|snapshot| {
-                    snapshot
-                        .offerings
-                        .iter()
-                        .filter(|row| catalog_partition_key(&row.provider) == catalog_key)
-                        .map(|row| CatalogOffering::clone(row))
-                        .collect()
-                })
-                .unwrap_or_default()
+    let route_cloud = cloud_facts_apply_to_route(
+        provider,
+        provider_identity.unwrap_or(provider.as_str()),
+        base_url,
+    )
+    .then_some(&cloud);
+    let (endpoint_catalog_authoritative, selected_rows, lower_rows) =
+        if let Ok(live) = LIVE_SNAPSHOT.read() {
+            let exact_partition = live.per_provider.get(&partition_owner);
+            let exact_matches = status_is_fresh
+                && exact_partition.is_some_and(|partition| {
+                    !partition.offerings.is_empty()
+                        && partition.offerings.iter().all(|row| {
+                            catalog_partition_key(&row.provider) == catalog_key
+                                && row_matches_endpoint_fingerprint(row, &fingerprint)
+                        })
+                });
+            let rows = if exact_matches {
+                exact_partition
+                    .map(|partition| partition.offerings.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let lower = if !matches!(provider, ProviderKind::Custom | ProviderKind::OpenaiCodex) {
+                source_rows_for_provider(catalog_id.as_ref(), live.models_dev.as_ref(), route_cloud)
+            } else {
+                BTreeMap::new()
+            };
+            (exact_matches, rows, lower)
         } else {
-            Vec::new()
+            let lower = if !matches!(provider, ProviderKind::Custom | ProviderKind::OpenaiCodex) {
+                source_rows_for_provider(catalog_id.as_ref(), None, route_cloud)
+            } else {
+                BTreeMap::new()
+            };
+            (false, Vec::new(), lower)
         };
-        (exact_matches, rows)
-    } else {
-        (false, Vec::new())
-    };
 
     // Nonselected providers retain the bundled/curated resolver baseline.
     // Another endpoint's live roster must not alter this route's ownership
@@ -874,15 +892,8 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
             base_url,
         );
     if !endpoint_catalog_authoritative {
-        for row in &selected_rows {
-            source_rows.insert(
-                (row.provider.clone(), row.wire_model_id.clone()),
-                row.clone(),
-            );
-        }
-        if cloud_applies {
-            apply_cloud_facts_for_provider(&mut source_rows, catalog_id.as_ref(), &cloud);
-        }
+        source_rows.retain(|(row_provider, _), _| row_provider != catalog_id.as_ref());
+        source_rows.extend(lower_rows.clone());
     }
     let mut route_offerings: BTreeMap<(String, String), ProviderModelOffering> = source_rows
         .values()
@@ -939,23 +950,12 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
             catalog_id.as_ref()
         };
         route_offerings.retain(|_, offering| offering.provider.as_str() != transport_provider);
-        let route_facts = cloud_facts_apply_to_route(
-            provider,
-            provider_identity.unwrap_or(provider.as_str()),
-            base_url,
-        )
-        .then_some(cloud.facts.as_ref())
-        .flatten();
         for mut row in selected_rows {
-            row.provider = transport_provider.to_string();
-            // Same completion the picker applies, from the same helper: the
-            // executor must not resolve with an unknown the signed layer has
-            // already stated, nor with anything the provider itself contradicts.
-            if let Some(facts) = route_facts {
-                codewhale_config::cloud_facts::catalog_patch::complete_provider_live_row(
-                    &mut row, facts,
-                );
+            if let Some(lower) = lower_rows.get(&(row.provider.clone(), row.wire_model_id.clone()))
+            {
+                row.complete_from(lower, Some(base_url));
             }
+            row.provider = transport_provider.to_string();
             let offering = row.to_offering();
             route_offerings.insert(offering_key(&offering), offering);
         }
@@ -1200,16 +1200,23 @@ pub(crate) fn catalog_offering_for_route(
             .into_iter()
             .find(|row| row.wire_model_id == model)
         {
-            // An id-only roster row states existence, not that its limits and
-            // capabilities are unknown. Complete it from the signed layer for
-            // this exact route; anything the provider did state stays.
-            let cloud = codewhale_config::cloud_facts::overlay::snapshot();
-            if cloud_facts_apply_to_route(provider, identity, base_url)
-                && let Some(facts) = &cloud.facts
-            {
-                codewhale_config::cloud_facts::catalog_patch::complete_provider_live_row(
-                    &mut row, facts,
-                );
+            if !matches!(provider, ProviderKind::Custom | ProviderKind::OpenaiCodex) {
+                let cloud = codewhale_config::cloud_facts::overlay::snapshot();
+                let route_cloud =
+                    cloud_facts_apply_to_route(provider, identity, base_url).then_some(&cloud);
+                let catalog_id = catalog_provider_id_for_identity(provider, Some(identity));
+                let mut lower_rows = if let Ok(live) = LIVE_SNAPSHOT.read() {
+                    source_rows_for_provider(
+                        catalog_id.as_ref(),
+                        live.models_dev.as_ref(),
+                        route_cloud,
+                    )
+                } else {
+                    source_rows_for_provider(catalog_id.as_ref(), None, route_cloud)
+                };
+                if let Some(lower) = lower_rows.remove(&(row.provider.clone(), model.to_string())) {
+                    row.complete_from(&lower, Some(base_url));
+                }
             }
             return Some(row);
         }
@@ -1413,28 +1420,12 @@ pub(crate) fn catalog_models_for_route(
     // Do not borrow a live partition published for another endpoint.
     let catalog_id = catalog_provider_id(provider);
     let live = LIVE_SNAPSHOT.read().ok();
-    let mut rows: BTreeMap<(String, String), CatalogOffering> = bundled_snapshot()
-        .offerings_for_provider(catalog_id)
-        .into_iter()
-        .map(|row| {
-            (
-                (row.provider.clone(), row.wire_model_id.clone()),
-                row.clone(),
-            )
-        })
-        .collect();
-    if let Some(models_dev) = live.as_ref().and_then(|live| live.models_dev.as_ref()) {
-        for row in models_dev.offerings_for_provider(catalog_id) {
-            rows.insert(
-                (row.provider.clone(), row.wire_model_id.clone()),
-                row.clone(),
-            );
-        }
-    }
     let cloud = codewhale_config::cloud_facts::overlay::snapshot();
-    if cloud_facts_apply_to_route(provider, identity, base_url) {
-        apply_cloud_facts_for_provider(&mut rows, catalog_id, &cloud);
-    }
+    let rows = source_rows_for_provider(
+        catalog_id,
+        live.as_ref().and_then(|live| live.models_dev.as_ref()),
+        cloud_facts_apply_to_route(provider, identity, base_url).then_some(&cloud),
+    );
     let mut models = catalog_models_from_offerings(rows.values());
     if models.is_empty() && cloud.facts.is_none() {
         models.extend(
@@ -4053,8 +4044,8 @@ mod tests {
     /// A roster that answers with ids alone has not said its models have no
     /// limits. Signed facts complete that silence for the picker, the metadata
     /// lookup and the executor alike — and lose every field the provider did
-    /// state. Price stays the provider's business: nothing renders a cloud rate
-    /// on a provider row that the dispatch quote would refuse to bill.
+    /// state. A completed price keeps its signed source separately from the
+    /// provider roster's existence claim.
     #[test]
     fn provider_id_only_rows_take_signed_limits_while_provider_facts_and_prices_win() {
         use codewhale_config::cloud_facts::{ModelFact, PricingFact};
@@ -4107,13 +4098,11 @@ mod tests {
             "the row is still the provider's: {:?}",
             bare.source
         );
-        assert_eq!(
-            bare.cost, None,
-            "a signed price must not appear on a provider-live row"
-        );
+        assert_eq!(bare.cost.as_ref().and_then(|cost| cost.input), Some(1.0));
+        assert_eq!(bare.cost.as_ref().and_then(|cost| cost.output), Some(2.0));
         assert!(
-            !matches!(bare.pricing_source(), CatalogSource::CloudFacts { .. }),
-            "price provenance must not claim a cloud rate here"
+            matches!(bare.pricing_source(), CatalogSource::CloudFacts { .. }),
+            "the estimate must retain its signed price authority"
         );
         assert!(
             crate::provider_catalog_live::fresh_dispatch_pricing_quote_at(
@@ -4124,7 +4113,7 @@ mod tests {
                 codewhale_config::catalog::now_unix(),
             )
             .is_none(),
-            "and nothing bills against one either"
+            "a completed estimate must not become a provider-confirmed quote"
         );
 
         let stated = catalog_offering_for_route(provider, "deepseek", base, detailed)

@@ -1758,6 +1758,7 @@ fn priced_deepseek_resolver() -> RouteResolver {
             output: Some(0.42),
             cache_read: Some(0.028),
             cache_write: None,
+            ..Default::default()
         }),
         source: CatalogSource::Bundled,
         ..Default::default()

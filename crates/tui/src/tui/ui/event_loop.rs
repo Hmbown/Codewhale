@@ -7482,6 +7482,52 @@ pub(crate) async fn run_xai_device_login_from_tui(
     Ok(switched)
 }
 
+pub(crate) async fn run_claude_login_from_tui(
+    terminal: &mut AppTerminal,
+    app: &mut App,
+    engine_handle: &mut EngineHandle,
+    config: &mut Config,
+) -> Result<bool> {
+    pause_terminal(
+        terminal,
+        app.use_alt_screen(),
+        app.use_mouse_capture,
+        app.use_bracketed_paste,
+    )?;
+    let result = crate::oauth::login(crate::oauth::OAuthProvider::Claude).await;
+    resume_terminal(
+        terminal,
+        app.use_alt_screen(),
+        app.use_mouse_capture,
+        app.use_bracketed_paste,
+        app.synchronized_output_enabled,
+    )?;
+    let switched = match result {
+        Ok(pending) => {
+            apply_codewhale_owned_login(
+                app,
+                engine_handle,
+                config,
+                ProviderKind::Anthropic,
+                pending,
+                "Claude sign-in complete",
+                "Claude sign-in",
+            )
+            .await
+        }
+        Err(error) => {
+            app.push_status_toast(
+                format!("Claude sign-in failed: {error}"),
+                StatusToastLevel::Error,
+                Some(App::STICKY_ERROR_TTL_MS),
+            );
+            false
+        }
+    };
+    app.needs_redraw = true;
+    Ok(switched)
+}
+
 pub(crate) async fn run_chatgpt_pkce_login_from_tui(
     terminal: &mut AppTerminal,
     app: &mut App,

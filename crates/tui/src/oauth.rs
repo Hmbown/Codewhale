@@ -11,7 +11,7 @@
 //! redact sensitive fields.
 
 use std::collections::BTreeMap;
-use std::io::{IsTerminal, Read, Write as _};
+use std::io::{BufRead as _, IsTerminal, Read, Write as _};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::config::Config;
+use crate::config::{Config, ProviderKind};
 
 /// OAuth token payload stored in `auth.json`.
 #[derive(Debug, Clone, Deserialize)]
@@ -202,6 +202,7 @@ pub enum OAuthProvider {
         reason = "3b-i(b) wires the PKCE login that constructs this"
     )]
     Chatgpt,
+    Claude,
 }
 
 impl AccessMethod {
@@ -215,6 +216,7 @@ impl AccessMethod {
         match self {
             AccessMethod::OwnedOAuth(OAuthProvider::Xai) => "xAI subscription",
             AccessMethod::OwnedOAuth(OAuthProvider::Chatgpt) => "ChatGPT subscription",
+            AccessMethod::OwnedOAuth(OAuthProvider::Claude) => "Claude subscription",
             AccessMethod::ExternalImport(ExternalImportSource::GrokCli) => "Grok CLI import",
             AccessMethod::ExternalImport(ExternalImportSource::CodexCli) => "Codex CLI import",
             AccessMethod::ExternalImport(ExternalImportSource::Antigravity) => "Antigravity import",
@@ -332,6 +334,34 @@ pub const XAI_OAUTH_PARAMS: OAuthProviderParams<'static> = OAuthProviderParams {
     callback_conflict_hint: "",
 };
 
+pub const CLAUDE_OAUTH_PARAMS: OAuthProviderParams<'static> = OAuthProviderParams {
+    display_name: "Claude",
+    default_issuer: "https://console.anthropic.com",
+    default_client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+    default_scopes: "org:create_api_key user:profile user:inference",
+    env: OAuthEnvOverrides {
+        issuer_vars: &[],
+        client_id_vars: &[],
+        scope_vars: &[],
+        no_browser_var: "CODEWHALE_CLAUDE_OAUTH_NO_BROWSER",
+        no_account_prompt_var: None,
+    },
+    device_code_path: None,
+    authorize_path: Some("oauth/authorize"),
+    token_path: "v1/oauth/token",
+    discover_endpoints: false,
+    device_poll_floor_secs: 0,
+    authorize_extras: &[],
+    account_choice_extras: &[],
+    originator: None,
+    revoke_path: None,
+    callback_path: "/oauth/code/callback",
+    loopback_ports: &[],
+    relogin_hint: "codewhale auth claude",
+    session_login_hint: "/auth claude",
+    callback_conflict_hint: "",
+};
+
 pub const CHATGPT_OAUTH_PARAMS: OAuthProviderParams<'static> = OAuthProviderParams {
     display_name: "ChatGPT",
     // Single source: same arrangement as the xAI row above.
@@ -375,6 +405,7 @@ pub fn oauth_provider_params(provider: OAuthProvider) -> &'static OAuthProviderP
     match provider {
         OAuthProvider::Xai => &XAI_OAUTH_PARAMS,
         OAuthProvider::Chatgpt => &CHATGPT_OAUTH_PARAMS,
+        OAuthProvider::Claude => &CLAUDE_OAUTH_PARAMS,
     }
 }
 
@@ -1399,7 +1430,50 @@ fn device_code_login_with(
 /// One login entry point for every provider: the params row decides whether
 /// the grant is device-code or browser PKCE. A provider with neither fails
 /// here with the reason.
+async fn claude_login() -> Result<PendingOAuthLogin> {
+    let mut output = oauth_challenge_writer()?;
+    tokio::task::spawn_blocking(move || {
+        let params = &CLAUDE_OAUTH_PARAMS;
+        let pkce = generate_pkce();
+        let redirect = "https://console.anthropic.com/oauth/code/callback";
+        let mut url = reqwest::Url::parse("https://claude.ai/oauth/authorize")?;
+        url.query_pairs_mut().extend_pairs([
+            ("code", "true"), ("client_id", params.default_client_id),
+            ("response_type", "code"), ("redirect_uri", redirect),
+            ("scope", params.default_scopes), ("code_challenge", pkce.challenge.as_str()),
+            ("code_challenge_method", "S256"), ("state", pkce.verifier.as_str()),
+        ]);
+        writeln!(output, "Open this URL to sign in with Claude:\n{url}\nPaste the authorization code (code#state):")?;
+        output.flush()?;
+        if std::env::var_os(params.env.no_browser_var).is_none() {
+            let _ = webbrowser::open(url.as_str());
+        }
+        let mut input = String::new();
+        std::io::stdin().lock().take(8193).read_line(&mut input)?;
+        anyhow::ensure!(input.len() <= 8192, "Claude authorization code is too long");
+        let (code, state) = input.trim().split_once('#').context("Expected Claude authorization code#state")?;
+        anyhow::ensure!(!code.is_empty() && !code.chars().any(char::is_control)
+            && codewhale_core::secret_eq::constant_time_eq(state.as_bytes(), pkce.verifier.as_bytes()),
+            "Claude authorization state did not match the pending login");
+        let (status, body) = ReqwestOAuthFormClient.post_form(
+            &form_token_url(params, params.default_issuer), &[
+                ("grant_type", "authorization_code"), ("client_id", params.default_client_id),
+                ("code", code), ("state", state), ("redirect_uri", redirect),
+                ("code_verifier", &pkce.verifier),
+            ],
+        )?;
+        let token = parse_oauth_form_response(status, &body, "sign-in", params)?;
+        Ok(PendingOAuthLogin {
+            provider: OAuthProvider::Claude, issuer: params.default_issuer.to_string(),
+            client_id: params.default_client_id.to_string(), token,
+        })
+    }).await.context("Claude login worker failed")?
+}
+
 pub async fn login(provider: OAuthProvider) -> Result<PendingOAuthLogin> {
+    if provider == OAuthProvider::Claude {
+        return claude_login().await;
+    }
     if provider == OAuthProvider::Chatgpt {
         let config = Config::load(None, None)?;
         return login_with_config(provider, &config).await;
@@ -1419,6 +1493,9 @@ pub async fn login_with_config(
     provider: OAuthProvider,
     config: &Config,
 ) -> Result<PendingOAuthLogin> {
+    if provider == OAuthProvider::Claude {
+        return claude_login().await;
+    }
     if provider != OAuthProvider::Chatgpt {
         let params = oauth_provider_params(provider);
         return if params.device_code_path.is_some() {
@@ -1500,11 +1577,13 @@ impl OAuthFormClient for ReqwestOAuthFormClient {
         #[cfg(test)]
         crate::external_credentials::record_oauth_network();
         let client = oauth_http_client(&url, "form")?;
-        let response = client
-            .post(url)
-            .form(form)
-            .send()
-            .context("OAuth form request failed")?;
+        let request = client.post(url.clone());
+        let request = if url.as_str() == "https://console.anthropic.com/v1/oauth/token" {
+            request.json(&form.iter().copied().collect::<BTreeMap<_, _>>())
+        } else {
+            request.form(form)
+        };
+        let response = request.send().context("OAuth token request failed")?;
         let status = response.status().as_u16();
         let mut reader = response.take(OAUTH_RESPONSE_BODY_LIMIT + 1);
         let mut body = Vec::new();
@@ -1545,6 +1624,15 @@ pub(crate) fn parse_oauth_form_response(
     })?;
     if !(200..300).contains(&status) || parsed.error.is_some() {
         let err = parsed.error.as_deref().unwrap_or("token_error");
+        let err = if params.display_name == "Claude"
+            && !matches!(
+                err,
+                "invalid_grant" | "invalid_client" | "invalid_request" | "access_denied"
+            ) {
+            "token_error"
+        } else {
+            err
+        };
         if matches!(
             err,
             "invalid_grant"
@@ -2299,7 +2387,7 @@ fn pkce_login_with_selected(
     })
 }
 
-// ── owned credential storage (one store, two providers) ───────────────
+// ── owned credential storage (one shared store) ───────────────
 //
 // Codewhale-owned OAuth generations live in the config crate's credential
 // store under per-provider generation prefixes. xAI historically stored the
@@ -2615,6 +2703,7 @@ impl OAuthProvider {
         match self {
             OAuthProvider::Xai => crate::config::ProviderKind::Xai,
             OAuthProvider::Chatgpt => crate::config::ProviderKind::OpenaiCodex,
+            OAuthProvider::Claude => crate::config::ProviderKind::Anthropic,
         }
     }
 
@@ -2627,6 +2716,7 @@ impl OAuthProvider {
         match self {
             OAuthProvider::Xai => codewhale_config::LEGACY_XAI_OAUTH_FILE_NAME,
             OAuthProvider::Chatgpt => codewhale_config::LEGACY_CHATGPT_OAUTH_FILE_NAME,
+            OAuthProvider::Claude => codewhale_config::LEGACY_CLAUDE_OAUTH_FILE_NAME,
         }
     }
 
@@ -2635,6 +2725,7 @@ impl OAuthProvider {
         match self {
             OAuthProvider::Xai => codewhale_config::is_valid_xai_oauth_generation(name),
             OAuthProvider::Chatgpt => codewhale_config::is_valid_chatgpt_oauth_generation(name),
+            OAuthProvider::Claude => codewhale_config::is_valid_claude_oauth_generation(name),
         }
     }
 
@@ -2642,6 +2733,7 @@ impl OAuthProvider {
         match self {
             OAuthProvider::Xai => codewhale_config::validate_xai_oauth_generation(name),
             OAuthProvider::Chatgpt => codewhale_config::validate_chatgpt_oauth_generation(name),
+            OAuthProvider::Claude => codewhale_config::validate_claude_oauth_generation(name),
         }
         .map(|_| ())
     }
@@ -2650,6 +2742,7 @@ impl OAuthProvider {
         match self {
             OAuthProvider::Xai => codewhale_config::xai_oauth_generation_path(name),
             OAuthProvider::Chatgpt => codewhale_config::chatgpt_oauth_generation_path(name),
+            OAuthProvider::Claude => codewhale_config::claude_oauth_generation_path(name),
         }
     }
 
@@ -2659,6 +2752,10 @@ impl OAuthProvider {
             OAuthProvider::Xai => (
                 codewhale_config::XAI_OAUTH_GENERATION_PREFIX,
                 codewhale_config::XAI_OAUTH_GENERATION_SUFFIX,
+            ),
+            OAuthProvider::Claude => (
+                codewhale_config::CLAUDE_OAUTH_GENERATION_PREFIX,
+                codewhale_config::CLAUDE_OAUTH_GENERATION_SUFFIX,
             ),
             OAuthProvider::Chatgpt => (
                 codewhale_config::CHATGPT_OAUTH_GENERATION_PREFIX,
@@ -3054,6 +3151,21 @@ fn apply_token_response(
         }
         entry.account_id = Some(registration.subject.clone());
     }
+    if provider == OAuthProvider::Claude {
+        anyhow::ensure!(
+            token
+                .expires_in
+                .is_some_and(|seconds| seconds > 60 && seconds < 31_536_000),
+            "Claude token response omitted a usable expiration"
+        );
+        anyhow::ensure!(
+            token
+                .refresh_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty()),
+            "Claude token response omitted its rotating refresh token"
+        );
+    }
     let access = token
         .access_token
         .as_deref()
@@ -3378,7 +3490,7 @@ pub fn usable_sign_in(provider: OAuthProvider, config: &Config) -> Option<Usable
     // explicitly selects OAuth. A failed post-login config finalization can
     // therefore never make a newly written token silently ready on the next
     // launch.
-    if provider == OAuthProvider::Chatgpt
+    if matches!(provider, OAuthProvider::Chatgpt | OAuthProvider::Claude)
         && config
             .provider_config_for(&identity)
             .and_then(|entry| entry.auth_mode.as_deref())
@@ -3398,6 +3510,9 @@ pub fn usable_sign_in(provider: OAuthProvider, config: &Config) -> Option<Usable
         && let Ok(Some(mut file)) = load_owned_auth_file(&path)
         && let Some((_, entry)) = select_entry(provider, &mut file)
         && (provider != OAuthProvider::Chatgpt || registration_from_entry(&entry).is_ok())
+        && (provider != OAuthProvider::Claude
+            || (entry.oidc_issuer.as_deref() == Some(CLAUDE_OAUTH_PARAMS.default_issuer)
+                && entry.oidc_client_id.as_deref() == Some(CLAUDE_OAUTH_PARAMS.default_client_id)))
         && owned_entry_is_usable(&entry)
     {
         return Some(usable(&entry));
@@ -3528,7 +3643,7 @@ pub fn get_xai_credentials(config: &Config) -> Result<OwnedOAuthCredentials> {
     ))
 }
 
-/// Load ChatGPT owned credentials from the configured generation,
+/// Load owned subscription credentials from the configured generation,
 /// refreshing through the seam when stale.
 pub fn get_owned_credentials(
     provider: OAuthProvider,
@@ -3537,13 +3652,13 @@ pub fn get_owned_credentials(
     let identity = config
         .builtin_provider_identity(provider.api())
         .map_err(anyhow::Error::msg)?;
-    if provider == OAuthProvider::Chatgpt {
+    if matches!(provider, OAuthProvider::Chatgpt | OAuthProvider::Claude) {
         anyhow::ensure!(
             config
                 .provider_config_for(&identity)
                 .and_then(|entry| entry.auth_mode.as_deref())
                 == Some("oauth"),
-            "ChatGPT credentials are inactive; run `codewhale auth chatgpt`"
+            "Owned subscription credentials are inactive; sign in again"
         );
     }
     get_owned_credentials_with(provider, config, &ReqwestOAuthFormClient)
@@ -3555,24 +3670,47 @@ pub(crate) fn get_owned_credentials_read_only(
     config: &Config,
 ) -> Result<OwnedOAuthCredentials> {
     anyhow::ensure!(
-        provider == OAuthProvider::Chatgpt,
-        "Read-only official credentials require ChatGPT"
+        matches!(provider, OAuthProvider::Chatgpt | OAuthProvider::Claude),
+        "Read-only credentials require an owned subscription sign-in"
     );
-    official_chatgpt_registration(config)?;
+    if provider == OAuthProvider::Chatgpt {
+        official_chatgpt_registration(config)?;
+    }
+    let label = oauth_provider_params(provider).display_name;
     let path = configured_owned_auth_file_path(provider, config)?
-        .context("ChatGPT credentials are not configured")?;
-    let mut file = load_owned_auth_file(&path)?.context("ChatGPT credentials are missing")?;
-    let (scope, entry) =
-        select_entry(provider, &mut file).context("ChatGPT credentials are unavailable")?;
-    registration_from_entry(&entry)?;
+        .with_context(|| format!("{label} credentials are not configured"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Codewhale-owned OAuth path must have a UTF-8 basename")?;
+    if provider == OAuthProvider::Claude {
+        validate_saved_claude_generation(config, name, false)?;
+    }
+    let mut file =
+        load_owned_auth_file(&path)?.with_context(|| format!("{label} credentials are missing"))?;
+    let (scope, entry) = select_entry(provider, &mut file)
+        .with_context(|| format!("{label} credentials are unavailable"))?;
+    if provider == OAuthProvider::Chatgpt {
+        registration_from_entry(&entry)?;
+    }
+    if provider == OAuthProvider::Claude {
+        anyhow::ensure!(
+            entry.oidc_issuer.as_deref() == Some(CLAUDE_OAUTH_PARAMS.default_issuer)
+                && entry.oidc_client_id.as_deref() == Some(CLAUDE_OAUTH_PARAMS.default_client_id),
+            "Claude credential issuer or client is invalid"
+        );
+    }
     anyhow::ensure!(
         entry_access_token_is_fresh(&entry),
-        "ChatGPT access token needs runtime refresh; read-only diagnostics do not refresh"
+        "{label} access token needs runtime refresh; read-only diagnostics do not refresh"
     );
     let access = entry
         .access_token
         .clone()
-        .context("ChatGPT access token is missing")?;
+        .with_context(|| format!("{label} access token is missing"))?;
+    if provider == OAuthProvider::Claude {
+        validate_saved_claude_generation(config, name, false)?;
+    }
     Ok(credentials_from_entry(provider, &scope, &entry, access))
 }
 
@@ -3592,7 +3730,10 @@ fn get_owned_credentials_with(
         .and_then(|name| name.to_str())
         .context("Codewhale-owned OAuth path must have a UTF-8 basename")?;
     codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
-        get_owned_credentials_locked(
+        if provider == OAuthProvider::Claude {
+            validate_saved_claude_generation(config, name, true)?;
+        }
+        let credentials = get_owned_credentials_locked(
             provider,
             store,
             name,
@@ -3600,8 +3741,38 @@ fn get_owned_credentials_with(
             |issuer, client_id, refresh| {
                 refresh_for_provider(provider, client, issuer, client_id, refresh)
             },
-        )
+        )?;
+        if provider == OAuthProvider::Claude {
+            validate_saved_claude_generation(config, name, true)?;
+        }
+        Ok(credentials)
     })
+}
+
+fn validate_saved_claude_generation(config: &Config, name: &str, locked: bool) -> Result<()> {
+    let path = crate::config_persistence::config_toml_path(config.loaded_config_path.as_deref())?;
+    let validate = |path: &Path| {
+        let contents = std::fs::read_to_string(path)
+            .context("Could not verify current Claude sign-in configuration")?;
+        let saved = Config::from_saved_document(&contents, config.account_profile.as_deref())
+            .map_err(|_| anyhow::anyhow!("Current Claude sign-in configuration is invalid"))?;
+        let identity = saved
+            .builtin_provider_identity(ProviderKind::Anthropic)
+            .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            saved.provider_config_for(&identity).is_some_and(|entry| {
+                entry.auth_mode.as_deref() == Some("oauth")
+                    && entry.oauth_credential_generation.as_deref() == Some(name)
+            }),
+            "Claude sign-in was removed or changed; sign in again"
+        );
+        Ok(())
+    };
+    if locked {
+        codewhale_config::with_config_write_lock(&path, validate)
+    } else {
+        validate(&path)
+    }
 }
 
 fn get_owned_credentials_at(provider: OAuthProvider, path: &Path) -> Result<OwnedOAuthCredentials> {
@@ -3667,6 +3838,13 @@ where
         None
     };
 
+    if provider == OAuthProvider::Claude {
+        anyhow::ensure!(
+            entry.oidc_issuer.as_deref() == Some(CLAUDE_OAUTH_PARAMS.default_issuer)
+                && entry.oidc_client_id.as_deref() == Some(CLAUDE_OAUTH_PARAMS.default_client_id),
+            "Claude credential issuer or client is invalid; sign in again"
+        );
+    }
     if entry_access_token_is_fresh(&entry) {
         let token = entry
             .access_token
@@ -3925,6 +4103,15 @@ fn activate_login_locked(
 
     if let Some(config) = live_config {
         match provider {
+            OAuthProvider::Claude => {
+                let identity = config
+                    .builtin_provider_identity(provider.api())
+                    .map_err(anyhow::Error::msg)?;
+                let entry = config.provider_config_for_mut(&identity)?;
+                entry.auth_mode = Some("oauth".to_string());
+                entry.oauth_credential_generation = Some(generation.clone());
+                entry.external_credentials = None;
+            }
             OAuthProvider::Xai => config.mark_codewhale_owned_xai_oauth(generation.clone())?,
             OAuthProvider::Chatgpt => {
                 config.mark_codewhale_owned_chatgpt_oauth(generation.clone())?;
@@ -4012,7 +4199,7 @@ fn revoke_owned_login_locked_with(
             .and_then(|provider| provider.get("auth_mode"))
             .and_then(toml_edit::Item::as_str)
             == Some("oauth");
-        if auth_mode_is_oauth {
+        if auth_mode_is_oauth && provider != OAuthProvider::Claude {
             codewhale_config::unset_config_document_value(
                 document,
                 &["providers", key_inside, "auth_mode"],
@@ -4021,11 +4208,26 @@ fn revoke_owned_login_locked_with(
         Ok(previous)
     })?;
     let live_config_clear = match live_config {
+        Some(config) if provider == OAuthProvider::Claude => {
+            let identity = config
+                .builtin_provider_identity(provider.api())
+                .map_err(anyhow::Error::msg)?;
+            let entry = config.provider_config_for_mut(&identity)?;
+            entry.oauth_credential_generation = None;
+            Ok(())
+        }
         Some(config) if provider == OAuthProvider::Chatgpt => {
             config.clear_codewhale_owned_chatgpt_oauth()
         }
         _ => Ok(()),
     };
+    if provider == OAuthProvider::Claude {
+        store.clear_claude().context(
+            "Claude sign-in was disabled, but local credential cleanup failed; retry sign-out",
+        )?;
+        return live_config_clear
+            .context("Signed out locally, but the live route could not be refreshed");
+    }
     let names = match previous.as_deref() {
         Some(generation) if provider.is_valid_generation(generation) => {
             vec![generation.to_string()]
@@ -4202,6 +4404,7 @@ pub fn grok_auth_file_path() -> PathBuf {
 #[must_use]
 pub fn missing_auth_message(provider: OAuthProvider) -> String {
     match provider {
+        OAuthProvider::Claude => "Claude sign-in is unavailable. Run `codewhale auth claude`, or use an Anthropic API key with separate API billing.".to_string(),
         OAuthProvider::Xai => format!(
             "xAI OAuth credentials not found.\n\
              Options:\n\

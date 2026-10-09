@@ -2675,6 +2675,7 @@ mod tests {
                 output: Some(30.0),
                 cache_read: Some(0.05),
                 cache_write: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -4098,6 +4099,7 @@ mod tests {
                 output: Some(50.0),
                 cache_read: Some(1.0),
                 cache_write: Some(12.5),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -5233,6 +5235,7 @@ mod tests {
                         output: Some(199.0),
                         cache_read: Some(9.0),
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: "models-dev-capabilities".to_string(),
@@ -5284,6 +5287,7 @@ mod tests {
                         output: Some(199.0),
                         cache_read: Some(9.0),
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: "other-endpoint".to_string(),
@@ -5329,6 +5333,7 @@ mod tests {
                         output: Some(18.0),
                         cache_read: Some(1.0),
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: fingerprint.clone(),
@@ -5387,6 +5392,7 @@ mod tests {
                         output: Some(18.0),
                         cache_read: Some(1.0),
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: fingerprint.clone(),
@@ -5443,6 +5449,7 @@ mod tests {
                         output: Some(199.0),
                         cache_read: Some(9.0),
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: "models-dev-capabilities".to_string(),
@@ -5525,6 +5532,7 @@ mod tests {
                         output: Some(1.5),
                         cache_read: None,
                         cache_write: None,
+                        ..Default::default()
                     }),
                     source: codewhale_config::catalog::CatalogSource::Live {
                         base_url_fingerprint: fingerprint.clone(),

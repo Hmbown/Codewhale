@@ -5527,6 +5527,7 @@ fn turn_record_round_trips_frozen_provider_live_pricing_and_drops_hostile_quotes
                 output: Some(output),
                 cache_read: Some(0.25),
                 cache_write: None,
+                ..Default::default()
             }),
             ..Default::default()
         }],

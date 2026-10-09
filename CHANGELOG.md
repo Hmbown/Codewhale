@@ -17,6 +17,12 @@ launcher guidance.
 
 ### Added
 
+- `codewhale auth claude` and `/auth claude` add Claude subscription sign-in
+  to the existing Anthropic route, with protected owned credentials, refresh
+  before requests, a provider-picker choice and local sign-out. API-key billing
+  remains an explicit separate choice. This is experimental: live subscription
+  grant and inference acceptance have not been qualified (#6932).
+
 - `/pet on` makes the animated GPUI whale the main terminal view, with the
   existing message box, queued messages and permission controls always available.
   F5 or `/pet inspect` opens streamed replies, errors and the current session's

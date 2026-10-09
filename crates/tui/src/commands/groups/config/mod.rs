@@ -195,6 +195,12 @@ pub(in crate::commands) fn dispatch(
             Some("xai-device") | Some("xai_device") => {
                 CommandResult::action(crate::tui::app::AppAction::StartXaiDeviceLogin)
             }
+            Some("claude") | Some("anthropic") => {
+                CommandResult::action(crate::tui::app::AppAction::StartClaudeLogin)
+            }
+            Some("claude-revoke") => {
+                CommandResult::action(crate::tui::app::AppAction::StartClaudeRevoke)
+            }
             Some("chatgpt") | Some("openai-codex") | Some("openai_codex") => {
                 CommandResult::action(crate::tui::app::AppAction::StartChatgptPkceLogin)
             }
@@ -208,7 +214,7 @@ pub(in crate::commands) fn dispatch(
                 CommandResult::action(crate::tui::app::AppAction::StartOrcarouterRevoke)
             }
             _ => CommandResult::error(
-                "Usage: /auth xai-device|chatgpt|chatgpt-revoke|orcarouter|orcarouter-revoke",
+                "Usage: /auth xai-device|chatgpt|chatgpt-revoke|claude|claude-revoke|orcarouter|orcarouter-revoke",
             ),
         },
         "workbar" | "rail" | "sidebar" => config::sidebar(app, arg),
