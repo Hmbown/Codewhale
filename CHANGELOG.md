@@ -23,7 +23,7 @@ launcher guidance.
   agents; Escape returns to the same pet view and draft. `/pet off` restores the
   ordinary shell. The selected view is remembered across launches, and the
   inspector can copy the last finished reply with c or its footer action.
-  Motion preferences and unknown usage stay truthful (#6920),
+  Motion preferences and unknown usage stay truthful (#6920, #6907),
   using the shared `codewhale-ratatui` components
   ([#23](https://github.com/codewhale-hq/codewhale-ratatui/pull/23), [#25](https://github.com/codewhale-hq/codewhale-ratatui/pull/25)).
 
@@ -238,6 +238,7 @@ launcher guidance.
 
 ### Contributors
 
+- **[@SparkofSpike](https://github.com/SparkofSpike)** — live network-policy updates and goal milestone hand-back ([#6928](https://github.com/codewhale-hq/Codewhale/pull/6928), [#6930](https://github.com/codewhale-hq/Codewhale/pull/6930)).
 - **[@dajiaohuang](https://github.com/dajiaohuang)** — cache-write token accounting ([#6913](https://github.com/codewhale-hq/Codewhale/pull/6913)).
 - **[@gaord](https://github.com/gaord)** — embedder telemetry surface support ([#6916](https://github.com/codewhale-hq/Codewhale/pull/6916)).
 - **[@Lstarsky0](https://github.com/Lstarsky0)** — localized profile replies ([#6919](https://github.com/codewhale-hq/Codewhale/pull/6919)).
