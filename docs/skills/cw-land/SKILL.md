@@ -1,6 +1,6 @@
 ---
 name: cw-land
-description: "Use when turning verified Codewhale work into commits, branches, or a merge: choosing direct-main vs. worktree vs. integration branch, preserving contributor credit, and honoring the gate artifact before merging."
+description: "Use when turning verified Codewhale work into commits, branches, or a merge: choosing direct-main vs. PR vs. worktree vs. integration branch, preserving contributor credit, and honoring the gate artifact before merging."
 ---
 
 # cw-land
@@ -25,16 +25,20 @@ Stage 5 of the loop: [cw-orient](../cw-orient/SKILL.md) →
 ## Workflow
 
 1. **Choose the landing shape.**
-   - **Direct to `main`** is permitted for a small coherent change when this
-     checkout is current, clean, and owns the affected files. Local commit
-     permission never implies push, merge, tag, release, or deploy permission.
-   - **A worktree** is the right safety boundary for conflicting, dirty, stale,
-     or independent work — and for anything that would otherwise fight the dirt
-     you found in [cw-orient](../cw-orient/SKILL.md).
-   - **An integration branch** — `integration/<topic>-<pr>-<date>` — is the
-     normal path for anything with conflicts or several moving PRs. It is
-     cheaper than rebasing onto a `main` that keeps moving, and it leaves the
-     contributor's branch untouched.
+   - **The checkout that already exists** is the default. Direct to `main` is
+     permitted for a small coherent change when that checkout is current and
+     owns the affected files; when several agents share it, partition by file,
+     stage only your paths, and retry a commit that fails on `index.lock`.
+     Local commit permission never implies push, merge, tag, release, or
+     deploy permission.
+   - **A branch and PR** is the path when the change wants CI on all three
+     OSes before `main`, or another pair of eyes. One PR per coherent slice.
+   - **A worktree** is for a lane that genuinely conflicts with the dirt you
+     found in [cw-orient](../cw-orient/SKILL.md), or an experiment you may
+     throw away — not for parallel agents on the same lane.
+   - **An integration branch** (`integration/<topic>-<pr>-<date>`) is for
+     resolving a contributor PR that conflicts with a moving `main` when you
+     cannot push to their fork. It leaves their branch untouched.
 
 2. **Commit narrow and build-green.** One coherent change per commit; the tree
    builds at every commit. Put the real verification in the message — actual
@@ -91,10 +95,10 @@ Stage 5 of the loop: [cw-orient](../cw-orient/SKILL.md) →
    the artifact must literally say PASS, the review thread outranks the check
    rollup, and ambiguity blocks the merge — never the reverse.
 
-7. **Clean up your own lane.** When a worktree's branch lands on `main`, remove
-   the worktree (`git worktree remove <path>`). `scripts/worktree-gc.sh`
-   lists lanes by merged/dirty state; `--remove-merged --yes` prunes the
-   merged-and-clean ones. Worktree sprawl was a 560 GB problem here once.
+7. **Clean up your own lane.** When a worktree you created lands on `main`,
+   remove it (`git worktree remove <path>`) and delete its merged branch.
+   Leave other writers' worktrees alone; `git worktree list` shows them.
+   Worktree sprawl was a 560 GB problem here once.
 
 ## Red flags / don't
 
@@ -113,7 +117,7 @@ Stage 5 of the loop: [cw-orient](../cw-orient/SKILL.md) →
 
 ## Output
 
-- The landing shape you chose and why (direct main / worktree / integration).
+- The landing shape you chose and why (direct main / PR / worktree / integration).
 - Commit SHAs, branch name, and whether the branch is local-only or pushed.
 - The credit trailers applied and to whom.
 - The gate artifact's literal verdict at merge time, if a gate applies.
