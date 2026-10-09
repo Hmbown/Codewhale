@@ -236,6 +236,7 @@ pub(in crate::commands) fn dispatch(
                 if app
                     .plugin_registry
                     .active_plugins()
+                    .into_iter()
                     .any(|plugin| plugin.manifest.providers.contains_key(provider)) =>
             {
                 CommandResult::action(crate::tui::app::AppAction::StartPluginLogout {

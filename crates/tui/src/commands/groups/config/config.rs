@@ -3337,6 +3337,7 @@ pub fn login(app: &mut App, arg: Option<&str>) -> CommandResult {
             if app
                 .plugin_registry
                 .active_plugins()
+                .into_iter()
                 .any(|plugin| plugin.manifest.providers.contains_key(provider)) =>
         {
             CommandResult::action(AppAction::StartPluginLogin {

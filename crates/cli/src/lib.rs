@@ -220,9 +220,9 @@ enum Commands {
     Fork(TuiPassthroughArgs),
     /// Create a default AGENTS.md in the current directory.
     Init(TuiPassthroughArgs),
-    /// Bootstrap MCP config and/or skills directories.
     #[command(about = "Install a plugin bundle without trusting or enabling it")]
     Install(TuiPassthroughArgs),
+    /// Bootstrap MCP config and/or skills directories.
     Setup(TuiPassthroughArgs),
     /// Generate a remote Codewhale agent deploy bundle (cloud + chat bridge).
     RemoteSetup(RemoteSetupArgs),

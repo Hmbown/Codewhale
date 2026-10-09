@@ -246,11 +246,9 @@ enum Commands {
     Doctor(DoctorArgs),
     /// Summarize failure signals from a local JSONL session log without raw content
     SessionDiagnostics(SessionDiagnosticsArgs),
-    /// Bootstrap MCP config and/or skills directories
     #[command(about = "Install a local, GitHub or version-pinned npm plugin bundle")]
-    Install {
-        source: String,
-    },
+    Install { source: String },
+    /// Bootstrap MCP config and/or skills directories
     Setup(SetupArgs),
     /// Generate a remote Codewhale agent deploy bundle (cloud + chat bridge)
     RemoteSetup(remote_setup::RemoteSetupArgs),

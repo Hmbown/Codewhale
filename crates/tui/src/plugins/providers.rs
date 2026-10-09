@@ -276,7 +276,7 @@ fn model_preference(entry: &ProviderConfig) -> Option<&str> {
 
 pub(crate) fn is_account_catalog_scope(provider: &str, fingerprint: &str) -> bool {
     STARTUP_REGISTRY.get().is_some_and(|registry| {
-        registry.active_plugins().any(|plugin| {
+        registry.active_plugins().into_iter().any(|plugin| {
             plugin.manifest.providers.iter().any(|(name, declaration)| {
                 provider == format!("custom:{name}")
                     && fingerprint
