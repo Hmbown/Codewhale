@@ -546,6 +546,17 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         None,
     ),
     def(
+        "pet_mode",
+        SettingKind::Bool(ON_OFF),
+        "false",
+        ui(
+            TAB_APPEARANCE,
+            "display",
+            "ConfigLabelPetMode",
+            "ConfigHintPetMode",
+        ),
+    ),
+    def(
         "calm_mode",
         SettingKind::Bool(ON_OFF),
         "true",

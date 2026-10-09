@@ -9,12 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.10.2] - 2026-10-08
 
-Codewhale v0.10.2 adds a live Terminal work dock and improves recovery,
-plugin approval and provider reliability. `/undo` takes back a whole request,
-`/diff` works outside a Git repository, and contributor fixes improve token
-accounting, localized replies and Windows launcher guidance.
+Codewhale v0.10.2 adds an animated pet view (`/pet on`) and a live Terminal work
+dock, and improves recovery, plugin approval and provider reliability. `/undo`
+takes back a whole request, `/diff` works outside a Git repository, and
+contributor fixes improve token accounting, localized replies and Windows
+launcher guidance.
 
 ### Added
+
+- `/pet on` makes the animated GPUI whale the main terminal view, with the
+  existing message box, queued messages and permission controls always available.
+  F5 or `/pet inspect` opens streamed replies, errors and the current session's
+  agents; Escape returns to the same pet view and draft. `/pet off` restores the
+  ordinary shell. The selected view is remembered across launches, and the
+  inspector can copy the last finished reply with c or its footer action.
+  Motion preferences and unknown usage stay truthful (#6920),
+  using the shared `codewhale-ratatui` components
+  ([#23](https://github.com/codewhale-hq/codewhale-ratatui/pull/23), [#25](https://github.com/codewhale-hq/codewhale-ratatui/pull/25)).
 
 - A Terminal work dock (`/workbar terminal`) shows the model’s live PTY sessions
   in the current workspace, with ANSI-styled output, session selection, resize

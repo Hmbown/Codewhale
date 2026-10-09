@@ -22,6 +22,11 @@ pub struct Sprite<'a> {
     frame: usize,
 }
 impl<'a> Sprite<'a> {
+    /// One bounded RGBA image, such as the canonical pet's live cove.
+    pub fn image(pixels: &'a [u8], width: usize, height: usize) -> Result<Self, String> {
+        Self::tiles(pixels, width, height, 0, 1)
+    }
+
     pub fn new(
         pack: &crate::avatar::Pack,
         pixels: &'a [u8],

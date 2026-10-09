@@ -3518,6 +3518,7 @@ impl App {
                     self.tr(match subject {
                         StartupDefaultSubject::Mode => MessageId::StartupDefaultSubjectMode,
                         StartupDefaultSubject::Thinking => MessageId::StartupDefaultSubjectThinking,
+                        StartupDefaultSubject::PetMode => MessageId::ConfigLabelPetMode,
                     })
                     .into_owned()
                 })

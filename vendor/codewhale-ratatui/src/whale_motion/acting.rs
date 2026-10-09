@@ -907,6 +907,14 @@ impl Director {
         self.pose_out
     }
 
+    /// An authorized, once-per-turn completion clip is still playing.
+    /// Surfaces use the canonical clip to settle without a second timer.
+    pub fn completing(&self) -> bool {
+        self.shots
+            .iter()
+            .any(|shot| shot.clip == ClipId::Enter(Act::Done))
+    }
+
     /// Whether anything is still moving beyond the settled loop: a clip, a
     /// departure fade, a particle or a calf in transit. Surfaces use it to
     /// choose their active or resting paint cap.

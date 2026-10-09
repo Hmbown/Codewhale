@@ -18,6 +18,7 @@ pub mod data;
 pub mod habitat;
 pub mod ink;
 pub mod math;
+pub(crate) mod pixels;
 pub mod props;
 pub mod rig;
 pub mod scene;

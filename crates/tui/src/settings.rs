@@ -254,6 +254,8 @@ pub struct Settings {
     pub(crate) auto_compact_explicit: bool,
     /// Reduce status noise and collapse details more aggressively
     pub calm_mode: bool,
+    /// Use the pet as the main view on the next launch.
+    pub pet_mode: bool,
     /// Dense tool-run collapse mode: compact, expanded, or calm.
     pub tool_collapse_mode: String,
     /// Reduce decorative motion. This must never synthesize model text speed;
@@ -541,6 +543,7 @@ impl Default for Settings {
             auto_compact_explicit: false,
             // #4095: default presentation is compact/calm; verbose detail is opt-in.
             calm_mode: true,
+            pet_mode: false,
             tool_collapse_mode: "compact".to_string(),
             low_motion: false,
             load_error: None,
@@ -1436,6 +1439,7 @@ impl Settings {
                 "auto_compact_threshold_percent"
             }
             "calm_mode" | "calm" => "calm_mode",
+            "pet_mode" => "pet_mode",
             "tool_collapse" | "tool_collapse_mode" | "collapse" => "tool_collapse",
             "low_motion" | "motion" => "low_motion",
             "fancy_animations" | "fancy" | "animations" => "fancy_animations",
@@ -1504,6 +1508,9 @@ impl Settings {
             }
             "calm_mode" | "calm" => {
                 self.calm_mode = parse_bool(value)?;
+            }
+            "pet_mode" => {
+                self.pet_mode = parse_bool(value)?;
             }
             "tool_collapse" | "tool_collapse_mode" | "collapse" => {
                 let normalized = normalize_tool_collapse_mode(value);
@@ -1808,6 +1815,7 @@ impl Settings {
             self.auto_compact_threshold_percent
         ));
         lines.push(format!("  calm_mode:          {}", self.calm_mode));
+        lines.push(format!("  pet_mode:           {}", self.pet_mode));
         lines.push(format!("  tool_collapse:      {}", self.tool_collapse_mode));
         lines.push(format!("  low_motion:         {}", self.low_motion));
         lines.push(format!("  fancy_animations:   {}", self.fancy_animations));

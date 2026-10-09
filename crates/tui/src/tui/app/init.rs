@@ -1210,6 +1210,11 @@ impl App {
             receipt_started_at: None,
             tool_evidence: Vec::new(),
         };
+        // Restore presentation only; the visible-frame tick owns companion startup.
+        app.pet_watch.enabled = settings.pet_mode;
+        if settings.pet_mode {
+            app.launch.visible = false;
+        }
         if yolo_compat {
             app.notify_yolo_compat_once();
         }

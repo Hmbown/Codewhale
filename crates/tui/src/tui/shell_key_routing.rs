@@ -111,11 +111,17 @@ pub enum ShellBindingId {
     ElevationDown,
     ElevationConfirm,
     ElevationAbort,
+    PetInspect,
     PetResultUp,
     PetResultDown,
     PetResultPageUp,
     PetResultPageDown,
     PetBack,
+    PetResultStart,
+    PetResultEnd,
+    PetFocusAgents,
+    PetOpenAgent,
+    PetCopyReply,
     PetSound,
     PetBrowser,
     PetWindow,
@@ -173,6 +179,7 @@ impl ShellBinding {
                 key.code == KeyCode::Enter && key.modifiers.is_empty()
             }
             ShellBindingId::ElevationAbort => key.code == KeyCode::Esc && key.modifiers.is_empty(),
+            ShellBindingId::PetInspect => key.code == KeyCode::F(5) && key.modifiers.is_empty(),
             ShellBindingId::PetResultUp => key.code == KeyCode::Up && key.modifiers.is_empty(),
             ShellBindingId::PetResultDown => key.code == KeyCode::Down && key.modifiers.is_empty(),
             ShellBindingId::PetResultPageUp => {
@@ -182,6 +189,13 @@ impl ShellBinding {
                 key.code == KeyCode::PageDown && key.modifiers.is_empty()
             }
             ShellBindingId::PetBack => key.code == KeyCode::Esc && key.modifiers.is_empty(),
+            ShellBindingId::PetResultStart => key.code == KeyCode::Home && key.modifiers.is_empty(),
+            ShellBindingId::PetResultEnd => key.code == KeyCode::End && key.modifiers.is_empty(),
+            ShellBindingId::PetFocusAgents => key.code == KeyCode::Tab && key.modifiers.is_empty(),
+            ShellBindingId::PetOpenAgent => key.code == KeyCode::Enter && key.modifiers.is_empty(),
+            ShellBindingId::PetCopyReply => {
+                key.code == KeyCode::Char('c') && key.modifiers.is_empty()
+            }
             ShellBindingId::PetSound => key.code == KeyCode::F(6) && key.modifiers.is_empty(),
             ShellBindingId::PetBrowser => key.code == KeyCode::F(8) && key.modifiers.is_empty(),
             ShellBindingId::PetWindow => key.code == KeyCode::F(9) && key.modifiers.is_empty(),
@@ -282,6 +296,12 @@ pub const SHELL_BINDINGS: &[ShellBinding] = &[
         focus: FocusScope::Elevation,
     },
     ShellBinding {
+        id: ShellBindingId::PetInspect,
+        catalog_chord: "F5 / /pet inspect",
+        footer_chord: "F5",
+        focus: FocusScope::AnyShell,
+    },
+    ShellBinding {
         id: ShellBindingId::PetResultUp,
         catalog_chord: "Up",
         footer_chord: "↑",
@@ -309,6 +329,36 @@ pub const SHELL_BINDINGS: &[ShellBinding] = &[
         id: ShellBindingId::PetBack,
         catalog_chord: "Esc",
         footer_chord: "Esc",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetResultStart,
+        catalog_chord: "Home",
+        footer_chord: "Home",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetResultEnd,
+        catalog_chord: "End",
+        footer_chord: "End",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetFocusAgents,
+        catalog_chord: "Tab",
+        footer_chord: "Tab",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetOpenAgent,
+        catalog_chord: "Enter",
+        footer_chord: "Enter",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetCopyReply,
+        catalog_chord: "c",
+        footer_chord: "c",
         focus: FocusScope::PetHabitat,
     },
     ShellBinding {

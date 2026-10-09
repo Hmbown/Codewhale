@@ -21,7 +21,19 @@ impl RegisterCommand for CopyCmd {
     }
 
     fn execute(app: &mut App, _arg: Option<&str>) -> CommandResult {
-        execute_copy(app)
+        let result = execute_copy(app);
+        if let Some(message) = result.message.as_ref() {
+            use crate::tui::app::{StatusToast, StatusToastLevel};
+            let level = if result.is_error {
+                StatusToastLevel::Error
+            } else {
+                StatusToastLevel::Info
+            };
+            app.push_status_toast_record(
+                StatusToast::new(message.clone(), level, Some(8_000)).for_command_receipt(),
+            );
+        }
+        result
     }
 }
 
@@ -419,5 +431,23 @@ mod tests {
         assert!(result.is_error);
         let message = result.message.as_deref().unwrap_or_default();
         assert!(message.contains("/export file <path>"), "{message}");
+    }
+    #[test]
+    fn copy_command_failure_surfaces_the_existing_recovery_receipt_over_a_finished_turn() {
+        let tmp = TempDir::new().unwrap();
+        let _env_lock = crate::test_support::lock_test_env();
+        let (_home, _state) = isolate_state_home(tmp.path());
+        let mut app = test_app();
+        app.clipboard = ClipboardHandler::unavailable_for_test(false);
+        add_completed_assistant(&mut app, "recoverable answer");
+        let result = CopyCmd::execute(&mut app, None);
+        assert!(result.is_error);
+        let toast = app
+            .active_status_toast(crate::tui::underwater::ShellPhase::Done)
+            .expect("copy failure must stay visible");
+        assert_eq!(toast.text, result.message.unwrap());
+        assert_eq!(toast.level, crate::tui::app::StatusToastLevel::Error);
+        assert_eq!(toast.ttl_ms, Some(8_000));
+        assert!(toast.text.contains("last-copy.md"));
     }
 }

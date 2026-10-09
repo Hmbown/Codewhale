@@ -8083,3 +8083,124 @@ fn a_typed_drop_with_the_question_on_its_line_still_sends_the_image() {
             .any(|block| matches!(block, codewhale_models::ContentBlock::ImageUrl { .. }))
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pet_view_choice_restores_without_launch_overlay_and_preserves_other_settings() {
+    let _lock = lock_test_env();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = sealed_settings_home(tmp.path());
+    let _writes = crate::tui::startup_defaults::allow_writes_in_tests();
+    let path = tmp.path().join(".codewhale/settings.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "# keep this comment\nlow_motion = true\ncontextual_tips = false\n",
+    )
+    .unwrap();
+    let mut app = App::new(test_options(false), &Config::default());
+    assert!(
+        !app.pet_watch.enabled,
+        "old settings keep their existing view"
+    );
+    app.pet_watch.detach_for_test();
+    app.input = "unfinished draft".into();
+    assert!(
+        !crate::commands::execute_with_config("/pet on", &mut app, &Config::default()).is_error
+    );
+    assert!(app.pet_watch.enabled);
+    assert!(app.view_stack.is_empty());
+    assert_eq!(app.input, "unfinished draft");
+    app.startup_defaults.flush();
+    let restored = App::new(test_options(false), &Config::default());
+    assert!(restored.pet_watch.enabled);
+    assert!(
+        !restored.launch.visible,
+        "the welcome overlay must not hide the remembered view"
+    );
+    assert!(restored.low_motion);
+    assert!(restored.view_stack.is_empty());
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("# keep this comment"));
+    assert!(!Settings::load_persisted().unwrap().contextual_tips);
+
+    // Both public selectors enqueue in user-action order; quit immediately
+    // after the last choice and prove the existing shutdown join persists it.
+    for value in [false, true, false, true] {
+        app.pet_watch.detach_for_test();
+        let result = crate::commands::execute_with_config(
+            &format!(
+                "/config pet_mode {} --save",
+                if value { "true" } else { "false" }
+            ),
+            &mut app,
+            &Config::default(),
+        );
+        assert!(!result.is_error);
+    }
+    assert!(
+        !crate::commands::execute_with_config("/pet off", &mut app, &Config::default()).is_error
+    );
+    assert!(app.startup_defaults.shutdown().is_empty());
+    assert!(!Settings::load_persisted().unwrap().pet_mode);
+    assert!(
+        !App::new(test_options(false), &Config::default())
+            .pet_watch
+            .enabled
+    );
+
+    // Session overrides and rejected values must not change the saved choice.
+    app.pet_watch.detach_for_test();
+    assert!(
+        !crate::commands::execute_with_config(
+            "/config pet_mode true",
+            &mut app,
+            &Config::default()
+        )
+        .is_error
+    );
+    assert!(
+        crate::commands::execute_with_config(
+            "/config pet_mode banana --save",
+            &mut app,
+            &Config::default()
+        )
+        .is_error
+    );
+    assert!(app.pet_watch.enabled);
+    app.startup_defaults.flush();
+    assert!(!Settings::load_persisted().unwrap().pet_mode);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pet_view_save_failure_keeps_the_live_view_and_reports_without_overwriting_bad_settings() {
+    let _lock = lock_test_env();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = sealed_settings_home(tmp.path());
+    let _writes = crate::tui::startup_defaults::allow_writes_in_tests();
+    let path = tmp.path().join(".codewhale/settings.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let bad = "# preserve for repair\npet_mode = [broken";
+    std::fs::write(&path, bad).unwrap();
+    let mut app = App::new(test_options(false), &Config::default());
+    app.pet_watch.detach_for_test();
+    app.ui_locale = codewhale_localization::Locale::Fr;
+    assert!(
+        !crate::commands::execute_with_config("/pet on", &mut app, &Config::default()).is_error
+    );
+    assert!(app.pet_watch.enabled);
+    app.startup_defaults.flush();
+    let failures = app.startup_defaults.drain_failures();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(
+        failures[0].subjects,
+        vec![crate::tui::startup_defaults::StartupDefaultSubject::PetMode]
+    );
+    let message = app.startup_default_failure_message(&failures[0]);
+    assert!(message.contains(app.tr(MessageId::ConfigLabelPetMode).as_ref()));
+    assert!(!message.contains(tmp.path().to_str().unwrap()));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), bad);
+    assert!(
+        app.pet_watch.enabled,
+        "a failed save does not undo the live view"
+    );
+}
