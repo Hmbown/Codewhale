@@ -20675,6 +20675,74 @@ fn session_transition_waits_for_pending_dispatch_and_cancelled_turn() {
     assert!(app.session_transition_blocked());
 }
 
+/// The gate and its explanation derive from one list; a drift would show as
+/// the boolean disagreeing with the named blockers.
+#[test]
+fn transition_blockers_follow_the_gate_and_name_the_blocking_task() {
+    let mut app = create_test_app();
+    assert!(!app.session_transition_blocked());
+    assert!(app.session_transition_blockers().is_empty());
+
+    app.task_panel.push(crate::tui::app::TaskPanelEntry {
+        exit_code: None,
+        id: "shell_a3f2".to_string(),
+        status: "running".to_string(),
+        prompt_summary: "cw-leftovers.ps1".to_string(),
+        duration_ms: Some(5 * 60 * 60 * 1_000 + 18 * 60 * 1_000),
+        kind: crate::tui::app::TaskPanelEntryKind::Shell,
+        stale: false,
+        elapsed_since_output_ms: None,
+        owner_agent_id: None,
+        owner_agent_name: None,
+        current_tool: None,
+        role: None,
+        files_touched: 0,
+    });
+
+    let blockers = app.session_transition_blockers();
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    assert!(blockers[0].contains("shell_a3f2"), "{blockers:?}");
+    assert!(blockers[0].contains("running"), "{blockers:?}");
+    assert!(blockers[0].contains("5h 18m"), "{blockers:?}");
+    assert!(blockers[0].contains("cw-leftovers.ps1"), "{blockers:?}");
+    assert_eq!(app.session_transition_blocked(), !blockers.is_empty());
+}
+
+#[test]
+fn transition_blockers_summarize_past_the_fifth_task_and_bound_each_summary() {
+    let mut app = create_test_app();
+    for index in 0..6 {
+        app.task_panel.push(crate::tui::app::TaskPanelEntry {
+            exit_code: None,
+            id: format!("shell_{index:04}"),
+            status: "queued".to_string(),
+            prompt_summary: "x".repeat(200),
+            duration_ms: None,
+            kind: crate::tui::app::TaskPanelEntryKind::Shell,
+            stale: false,
+            elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+            current_tool: None,
+            role: None,
+            files_touched: 0,
+        });
+    }
+    let blockers = app.session_transition_blockers();
+    assert_eq!(
+        blockers.len(),
+        6,
+        "five rows plus the remainder line: {blockers:?}"
+    );
+    assert_eq!(blockers[5], "…and 1 more");
+    assert!(
+        blockers[..5]
+            .iter()
+            .all(|row| row.chars().count() <= 100 && row.contains("...")),
+        "summaries stay bounded and truncated: {blockers:?}"
+    );
+}
+
 #[test]
 fn engine_drain_budget_respects_event_and_time_limits() {
     let start = Instant::now();

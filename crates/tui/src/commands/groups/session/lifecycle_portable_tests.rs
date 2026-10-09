@@ -52,13 +52,14 @@ fn branch_composes_exact_baseline_messages() {
     // Blocked transition first.
     let mut canned = CannedLifecycle {
         blocked: true,
+        blockers: vec!["shell_a3f2  running  5h 18m  cw-leftovers.ps1".to_string()],
         ..CannedLifecycle::default()
     };
     let result = super::branch::branch_portable(&mut canned, Some("entry-1"));
     assert_eq!(
         result.message.as_deref(),
         Some(
-            "Error: Cannot branch while runtime work is active. Wait for the turn to finish, or cancel it first."
+            "Error: Cannot branch while runtime work is active:\n  • shell_a3f2  running  5h 18m  cw-leftovers.ps1\n\nWait for them to finish, or cancel them with /jobs cancel-all."
         )
     );
     assert_eq!(canned.transition_checks.get(), 1);
@@ -278,17 +279,18 @@ fn new_composes_exact_baseline_outcomes() {
     // Blocked.
     let mut canned = CannedLifecycle {
         blocked: true,
+        blockers: vec!["shell_a3f2  running  5h 18m  cw-leftovers.ps1".to_string()],
         ..CannedLifecycle::default()
     };
     let result = super::new::new_portable(&mut canned, None);
     assert!(result.is_error);
+    let message = result.message.as_deref().unwrap_or_default();
     assert!(
-        result
-            .message
-            .as_deref()
-            .unwrap_or_default()
-            .contains("only discards draft or queued input")
+        message.contains("Cannot start a new session while runtime work is active"),
+        "{message}"
     );
+    assert!(message.contains("shell_a3f2"), "{message}");
+    assert!(message.contains("/jobs cancel-all"), "{message}");
     assert_eq!(canned.transition_checks.get(), 1);
     assert!(canned.fresh_forces.is_empty());
 

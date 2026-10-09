@@ -1,6 +1,6 @@
 //! `/new` command — start a fresh saved session from the current TUI state.
 
-use super::CommandResult;
+use super::{CommandResult, transition_blocked_message};
 
 use codewhale_command_contract::facets::CommandSessionLifecycleContext;
 use codewhale_command_contract::handler::{CommandContexts, CommandHandler};
@@ -61,10 +61,10 @@ pub(in crate::commands) fn new_portable(
         }
     };
     if lifecycle.transition_blocked() {
-        return CommandResult::error(
-            "Cannot start a new session while runtime work is active. Wait for the current turn, maintenance, and background tasks to finish, or cancel that specific work. `/new --force` only discards draft or queued input."
-                .to_string(),
-        );
+        return CommandResult::error(transition_blocked_message(
+            "start a new session",
+            &lifecycle.transition_blockers(),
+        ));
     }
     match lifecycle.fresh_session(force) {
         Ok(receipt) => CommandResult::with_message_and_action(
