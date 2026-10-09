@@ -224,7 +224,7 @@ async fn full_access_permission_allow_runs_background_destructive_shell_without_
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .and(body_string_contains("destructive background/headless"))
+        .and(body_string_contains("call_bg"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
