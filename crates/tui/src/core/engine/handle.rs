@@ -318,13 +318,16 @@ impl EngineHandle {
                 );
             }
         } else {
-            let (status, _) =
-                crate::tools::goal::thread_goal_status_projection(goal.status.clone());
+            let (status, pause_reason) = crate::tools::goal::thread_goal_status_projection(
+                goal.status.clone(),
+                goal.pause_reason,
+            );
             if status != crate::tools::goal::GoalStatus::Active {
-                state.sync_from_host_status(
+                state.sync_from_host_status_with_reason(
                     current.objective.as_deref(),
                     current.token_budget,
                     status,
+                    pause_reason,
                 );
             }
         }
