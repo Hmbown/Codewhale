@@ -59,8 +59,14 @@
 
 .native-terminal-view .term-capture-scroll {
   max-width: 100%;
+  overflow-x: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--line-strong) transparent;
+}
+
+.native-terminal-view .term-capture {
+  width: max(100%, calc((var(--cols, 100) * 0.61 + 3.6) * var(--text-mono)));
+  font-size: max(var(--text-mono), calc(100cqi / (var(--cols, 100) * 0.61 + 3.6)));
 }
 
 .native-terminal-view .term-capture-scroll:focus-visible {
@@ -78,6 +84,7 @@
 }
 
 .native-terminal-scroll-hint {
+  display: none;
   color: var(--muted);
 }
 
@@ -93,7 +100,10 @@
   text-decoration: underline;
 }
 
-@media (max-width: 760px) {
+@media (max-width: 900px) {
+  .native-terminal-scroll-hint {
+    display: block;
+  }
   .native-terminal-controls {
     column-gap: var(--space-1);
     row-gap: var(--space-2);

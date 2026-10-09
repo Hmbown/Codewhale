@@ -30,6 +30,11 @@ const views = Object.keys(NATIVE_TERMINAL_VIEWS).flatMap((id) =>
   hasCapture(id) ? [{ id }] : [],
 );
 
+const PANEL_ROWS: Partial<Record<TerminalCaptureFrameId, readonly [number, number]>> = {
+  "workbar-fleet": [27, 32],
+  "provider-picker": [1, 13],
+};
+
 /** Website controls select real PTY captures; the terminal itself is unchanged. */
 export function NativeTerminalGallery({
   locale,
@@ -43,11 +48,14 @@ export function NativeTerminalGallery({
   regionLabel: string;
 }) {
   const [frame, setFrame] = useState<TerminalCaptureFrameId>(defaultFrame);
+  const [showFull, setShowFull] = useState(false);
   const captureId = useId();
   const selected = views.find((view) => view.id === frame) ?? views[0];
   if (!selected) return null;
   const copy = getNativeTerminalCopy(locale);
   const { label: viewLabel, description } = copy.views[selected.id];
+  const panelRows = PANEL_ROWS[selected.id];
+  const detail = Boolean(panelRows && !showFull);
 
   return (
     <div className="native-terminal-gallery">
@@ -61,6 +69,7 @@ export function NativeTerminalGallery({
             aria-controls={captureId}
             onClick={() => {
               setFrame(view.id);
+              setShowFull(false);
               // Only a reader's choice moves the whale; the page loads at rest.
               const cue = WHALE_CUES[view.id];
               if (cue) cueWhale(cue);
@@ -74,11 +83,18 @@ export function NativeTerminalGallery({
       <div className="native-terminal-view" id={captureId} dir="ltr">
         <TerminalCapture
           frame={selected.id}
-          label={selected.id === "home" ? label : `${viewLabel}. ${description}`}
+          label={selected.id === "home" ? label : `${viewLabel}. ${description}${detail ? ` ${copy.detailLabel}.` : ""}`}
           regionLabel={`${regionLabel} · ${viewLabel}`}
+          rows={detail ? panelRows : undefined}
         />
       </div>
       <div className="native-terminal-footer">
+        {panelRows ? (
+          <button type="button" className="btn btn-secondary btn-sm" aria-expanded={showFull} aria-controls={captureId} onClick={() => setShowFull(!showFull)}>
+            {showFull ? copy.showDetail : copy.showFull}
+          </button>
+        ) : null}
+        <span className="native-terminal-scroll-hint">{copy.scrollHint}</span>
         <Link href={`/${locale}/ratatui`} className="native-terminal-components-link">
           {copy.componentsLink}
           <Icon name="arrow-right" className="icon icon-flip" />

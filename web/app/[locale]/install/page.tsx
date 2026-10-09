@@ -19,7 +19,7 @@ export async function generateMetadata({ params }: { params: Promise<{ locale: s
 }
 
 /**
- * /install — the quick install plate first (the two one-line installs the
+ * /install — the quick install plate first (the install commands the
  * home page offers), then the reviewed checked-in guide for this language.
  * Both guides retain the actual historical scope of their installation receipts.
  */
@@ -34,7 +34,7 @@ export default async function InstallPage({ params }: { params: Promise<{ locale
         <div className="install-head-inner">
           <WhalePose pose="run" className="install-head-pose" priority />
           <div className="install-head-text">
-            <HeroInstall ariaLabel={home.heroInstallAria} copyLabel={home.copy} copiedLabel={home.copied} />
+            <HeroInstall locale={locale} ariaLabel={home.heroInstallAria} copyLabel={home.copy} copiedLabel={home.copied} />
             <p className="install-head-source">
               <Icon name="check" className="icon" />
               <a href={`https://github.com/codewhale-hq/CodeWhale/blob/main/docs/${sourcePath}`} className="link">
