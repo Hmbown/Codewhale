@@ -1,6 +1,6 @@
 ---
 name: cw-land
-description: "Use when turning verified Codewhale work into commits, branches, or a merge: choosing direct-main vs. PR vs. worktree vs. integration branch, preserving contributor credit, and honoring the gate artifact before merging."
+description: "Use when turning verified Codewhale work into commits, branches, or a merge: choosing direct-main vs. worktree vs. integration branch, preserving contributor credit, and honoring the gate artifact before merging."
 ---
 
 # cw-land
@@ -17,7 +17,7 @@ Stage 5 of the loop: [cw-orient](../cw-orient/SKILL.md) →
 
 ## When to use
 
-- The change is verified and needs to become a commit, branch, or PR.
+- The change is verified and needs to become a commit on `main`.
 - You are landing someone else's PR, harvesting a contributor's work, or
   resolving a conflict caused by `main` moving.
 - You are about to merge something behind a required gate.
@@ -31,8 +31,8 @@ Stage 5 of the loop: [cw-orient](../cw-orient/SKILL.md) →
      stage only your paths, and retry a commit that fails on `index.lock`.
      Local commit permission never implies push, merge, tag, release, or
      deploy permission.
-   - **A branch and PR** is the path when the change wants CI on all three
-     OSes before `main`, or another pair of eyes. One PR per coherent slice.
+   - **No maintainer PR branches** (`AGENTS.md`): verified slices land on
+     `main` directly and hosted CI runs there. PRs are for contributors.
    - **A worktree** is for a lane that genuinely conflicts with the dirt you
      found in [cw-orient](../cw-orient/SKILL.md), or an experiment you may
      throw away — not for parallel agents on the same lane.
@@ -117,7 +117,7 @@ Stage 5 of the loop: [cw-orient](../cw-orient/SKILL.md) →
 
 ## Output
 
-- The landing shape you chose and why (direct main / PR / worktree / integration).
+- The landing shape you chose and why (direct main / worktree / integration).
 - Commit SHAs, branch name, and whether the branch is local-only or pushed.
 - The credit trailers applied and to whom.
 - The gate artifact's literal verdict at merge time, if a gate applies.

@@ -62,6 +62,11 @@ base prompt". Two more corollaries earned here:
   A fresh worktree is for conflicting, dirty, stale, or independent lanes
   (see `cw-land`), not for parallel agents on the same lane. Local commit
   permission never implies push, merge, tag, release, or deploy permission.
+- **Maintainers do not open PR branches** (founder, 2026-10-08: more PRs means
+  more CI and slower work). Verified slices land directly on `main` and are
+  pushed: run the focused gate, put the real counts in the commit message,
+  fetch and rebase onto `origin/main` and retry on rejection. Never force-push
+  or rewrite a shared ref. Contributor PRs still merge as PRs.
 - When the task is local-only, stay fully offline: no browsing, GitHub or remote
   Git operations, downloads, dependency installation, provider calls, or
   source/diff transmission. Record the missing external receipt and keep working
