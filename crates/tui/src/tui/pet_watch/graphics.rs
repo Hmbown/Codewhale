@@ -150,10 +150,11 @@ impl Renderer {
                 cells[index] |= 1 << bit;
                 if alpha > strengths[index] {
                     strengths[index] = alpha;
-                    for k in 0..3 {
-                        self.colors[index][k] = (colour[k] * alpha
-                            + f64::from(self.appearance.background[k]) * (1.0 - alpha))
-                            as u8;
+                    for (output, (source, background)) in self.colors[index]
+                        .iter_mut()
+                        .zip(colour.iter().zip(self.appearance.background.iter()))
+                    {
+                        *output = (*source * alpha + f64::from(*background) * (1.0 - alpha)) as u8;
                     }
                 }
             }

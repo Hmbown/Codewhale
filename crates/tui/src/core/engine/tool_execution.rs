@@ -630,7 +630,7 @@ impl Engine {
             Some(_)
                 if matches!(
                     tool_name.as_str(),
-                    CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME | EXECUTE_TOOLS_TOOL_NAME
+                    CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME
                 ) =>
             {
                 Some(codewhale_protocol::engine_owner::OwnerActivityKind::Executing)
