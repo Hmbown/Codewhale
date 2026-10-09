@@ -8118,6 +8118,17 @@ pub(crate) use paths::{
     clipboard_images_dir, effective_home_dir, expand_path, home_config_path, is_home_config_path,
 };
 
+/// Activate facts only at accepted inference runtime settings boundaries.
+/// Identical settings preserve the shared ticket; readers track its generation.
+pub(crate) fn initialize_cloud_facts(config: &Config) {
+    let settings = config.cloud_facts_config().settings();
+    codewhale_cloud_facts::configure(&settings);
+    codewhale_cloud_facts::maybe_load_persisted_cache(&settings);
+    if tokio::runtime::Handle::try_current().is_ok() {
+        codewhale_cloud_facts::spawn_background_refresh(settings, None);
+    }
+}
+
 pub(crate) fn workspace_trust_config_candidate_paths() -> Vec<PathBuf> {
     #[cfg(test)]
     {

@@ -2908,7 +2908,7 @@ async fn apply_command_result_inner(
                             new_config,
                             &validated_route,
                         );
-                        crate::initialize_cloud_facts(config);
+                        crate::config::initialize_cloud_facts(config);
                         // Rebuild the engine with the new config so API key/model/base URL take effect.
                         let _ = engine_handle.send(Op::Shutdown).await;
                         let engine_config = build_engine_config(app, config);
@@ -4656,7 +4656,7 @@ pub(crate) fn apply_loaded_session_config_snapshot(
         );
     *config = next_config;
     app.configured_models = config.custom_models.clone().unwrap_or_default();
-    crate::initialize_cloud_facts(config);
+    crate::config::initialize_cloud_facts(config);
     app.refresh_notification_settings(config);
     Ok(respawn)
 }
