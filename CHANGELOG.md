@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- The bundled first-party catalog pins marketplace revision
+  `9b5f9d614ef69702be9944a61e89aeb3df14c047`; the 19 catalog entries are
+  unchanged, and installed bundles now come from a revision carrying the
+  reviewed Computer Use and bridge fixes and the MIT license.
+
 ## [0.10.2] - 2026-10-08
 
 Codewhale v0.10.2 adds an animated pet view (`/pet on`) and a live Terminal work
@@ -17,13 +22,19 @@ launcher guidance.
 
 ### Added
 
+- `codewhale auth claude` and `/auth claude` add Claude subscription sign-in
+  to the existing Anthropic route, with protected owned credentials, refresh
+  before requests, a provider-picker choice and local sign-out. API-key billing
+  remains an explicit separate choice. This is experimental: live subscription
+  grant and inference acceptance have not been qualified (#6932).
+
 - `/pet on` makes the animated GPUI whale the main terminal view, with the
   existing message box, queued messages and permission controls always available.
   F5 or `/pet inspect` opens streamed replies, errors and the current session's
   agents; Escape returns to the same pet view and draft. `/pet off` restores the
   ordinary shell. The selected view is remembered across launches, and the
   inspector can copy the last finished reply with c or its footer action.
-  Motion preferences and unknown usage stay truthful (#6920),
+  Motion preferences and unknown usage stay truthful (#6920, #6907),
   using the shared `codewhale-ratatui` components
   ([#23](https://github.com/codewhale-hq/codewhale-ratatui/pull/23), [#25](https://github.com/codewhale-hq/codewhale-ratatui/pull/25)).
 
@@ -238,6 +249,7 @@ launcher guidance.
 
 ### Contributors
 
+- **[@SparkofSpike](https://github.com/SparkofSpike)** — live network-policy updates and goal milestone hand-back ([#6928](https://github.com/codewhale-hq/Codewhale/pull/6928), [#6930](https://github.com/codewhale-hq/Codewhale/pull/6930)).
 - **[@dajiaohuang](https://github.com/dajiaohuang)** — cache-write token accounting ([#6913](https://github.com/codewhale-hq/Codewhale/pull/6913)).
 - **[@gaord](https://github.com/gaord)** — embedder telemetry surface support ([#6916](https://github.com/codewhale-hq/Codewhale/pull/6916)).
 - **[@Lstarsky0](https://github.com/Lstarsky0)** — localized profile replies ([#6919](https://github.com/codewhale-hq/Codewhale/pull/6919)).

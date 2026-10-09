@@ -100,6 +100,16 @@ pub struct ModelReferenceCard {
     /// Model family / series, when stated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_updated: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub fact_sources: std::collections::BTreeMap<String, CatalogSource>,
     /// Context-window tokens, when stated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
@@ -125,6 +135,11 @@ impl ModelReferenceCard {
             model_id: offering.wire_model_id.clone(),
             canonical_model: offering.canonical_model.clone(),
             family: offering.family.clone(),
+            display_name: offering.name.clone(),
+            description: offering.description.clone(),
+            max_input: offering.limit.as_ref().and_then(|limit| limit.input),
+            last_updated: offering.last_updated.clone(),
+            fact_sources: offering.fact_sources.clone(),
             context_window: offering.limit.as_ref().and_then(|limit| limit.context),
             max_output: offering.limit.as_ref().and_then(|limit| limit.output),
             modality: Modality::from_modalities(offering.modalities.as_ref()),
@@ -168,7 +183,14 @@ impl ModelReferenceCard {
         }
         let symbol = currency_symbol(&pricing.currency);
         let render = |value: Option<f64>| match value {
-            Some(rate) => format!("{symbol}{rate:.2}"),
+            Some(rate) => {
+                let rounded = format!("{rate:.2}");
+                if rounded.parse::<f64>().ok() == Some(rate) {
+                    format!("{symbol}{rounded}")
+                } else {
+                    format!("{symbol}{rate}")
+                }
+            }
             None => "?".to_string(),
         };
         let suffix = currency_suffix(&pricing.currency);
@@ -364,6 +386,7 @@ mod tests {
                 output: Some(1.2),
                 cache_read: Some(0.06),
                 cache_write: None,
+                ..Default::default()
             }),
             modalities: Some(ModelsDevModalities {
                 input: vec!["text".to_string()],
@@ -422,6 +445,7 @@ mod tests {
                 output: None,
                 cache_read: Some(0.05),
                 cache_write: None,
+                ..Default::default()
             }),
             ..offering("acme", "house-model")
         };
@@ -439,6 +463,7 @@ mod tests {
                 output: None,
                 cache_read: None,
                 cache_write: None,
+                ..Default::default()
             }),
             ..offering("openai", "gpt-5.5")
         };

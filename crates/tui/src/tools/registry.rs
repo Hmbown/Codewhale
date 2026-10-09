@@ -135,12 +135,19 @@ impl ToolRegistry {
         Ok(rich)
     }
 
-    pub(crate) async fn execute_rich_full_with_context(
+    pub(crate) async fn execute_rich_full_with_context<'a, F>(
         &self,
         name: &str,
         input: Value,
         context_override: Option<&ToolContext>,
-    ) -> Result<RichToolResult, ToolError> {
+        on_admitted: F,
+    ) -> Result<RichToolResult, ToolError>
+    where
+        F: FnOnce() -> Result<
+                Option<crate::core::engine::tool_execution::OperationSpanGuard<'a>>,
+                ToolError,
+            > + Send,
+    {
         let tool = self
             .get(name)
             .ok_or_else(|| ToolError::not_available(format!("tool '{name}' is not registered")))?;
@@ -150,9 +157,19 @@ impl ToolRegistry {
             .map_err(ToolError::not_available)?;
         let child = self.admit_child_call(name, &input, ctx).await?;
         enforce_tool_authority(name, &input, tool.as_ref(), ctx)?;
-        let mut rich = crate::image_attach::bound_rich_tool_result(
-            tool.execute_rich(input.clone(), ctx).await?,
-        );
+        let operation_span = on_admitted()?;
+        let outcome = tool.execute_rich(input.clone(), ctx).await;
+        if let Some(operation_span) = operation_span {
+            operation_span
+                .complete(super::activity::operation_outcome(
+                    &outcome,
+                    ctx.cancel_token
+                        .as_ref()
+                        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled),
+                ))
+                .await;
+        }
+        let mut rich = crate::image_attach::bound_rich_tool_result(outcome?);
         if rich.result.success
             && let Some((authority, writes)) = child
         {
@@ -1357,7 +1374,10 @@ impl ToolRegistryBuilder {
     #[must_use]
     pub fn with_fim_tool(self, client: Option<CodewhaleClient>, model: String) -> Self {
         use super::fim::FimEditTool;
-        self.with_tool(Arc::new(FimEditTool::new(client, model)))
+        let Some(client) = client.filter(CodewhaleClient::can_request_fim_completion) else {
+            return self;
+        };
+        self.with_tool(Arc::new(FimEditTool::new(Some(client), model)))
     }
 
     /// Include the `remember` tool — model-callable bullet-add into the

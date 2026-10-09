@@ -59,6 +59,8 @@ pub struct RuntimeCapabilities {
     pub client_token_intents: bool,
     #[serde(default)]
     pub account_session: bool,
+    #[serde(default)]
+    pub account_model_owner: bool,
     pub threads: bool,
     /// Explicit per-thread shell opt-in is checked against loaded policy and
     /// cannot broaden a conversation while it has an active turn.
@@ -435,6 +437,7 @@ mod tests {
             turn_output_token_limit: false,
             profile_constitution: false,
             account_session: true,
+            account_model_owner: false,
             threads: true,
             thread_shell_consent: true,
             turns: true,

@@ -29,7 +29,10 @@ for(const platform of ['linux','harmonyos']) {
       assert.equal(calls.length,0,'refusal must precede even capability probes');
     }
     for(const tool of ['list_windows','screenshot']) {
-      for(const app_ref of [...invalidRefs,{name:'Fixture'}]) await rejected(tool,{app_ref});
+      // Linux selects windows by exact app name, so {name:'Fixture'} is a
+      // valid selector there and only malformed selectors refuse. HarmonyOS
+      // rejects every explicit app selector.
+      for(const app_ref of platform==='harmonyos'?[...invalidRefs,{name:'Fixture'}]:invalidRefs) await rejected(tool,{app_ref});
       for(const window_id of [null,0,1,'0']) await rejected(tool,{window_id});
     }
     for(const app_ref of platform==='harmonyos'?[...invalidRefs,{name:'Fixture'}]:invalidRefs) {

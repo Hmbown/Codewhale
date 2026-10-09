@@ -353,7 +353,7 @@ New integrations should prefer `codewhale app-server`.")]
     )]
     Login(LoginArgs),
     /// Remove saved authentication state (every provider key, OAuth login,
-    /// the account session and the Daytona token). Asks before deleting.
+    /// the Codewhale account session). Asks before deleting.
     Logout(LogoutArgs),
     /// Manage authentication credentials and provider mode.
     Auth(AuthArgs),
@@ -1672,6 +1672,10 @@ enum AuthCommand {
     /// Revoke Codewhale-owned ChatGPT tokens. Codex CLI consent is unchanged.
     #[command(name = "chatgpt-revoke")]
     ChatgptRevoke,
+    #[command(name = "claude", alias = "anthropic")]
+    Claude,
+    #[command(name = "claude-revoke")]
+    ClaudeRevoke,
     /// Sign in to OrcaRouter with OAuth 2.0 + PKCE and store the issued key.
     ///
     /// Opens the OrcaRouter consent screen on a loopback callback and
@@ -2491,6 +2495,19 @@ fn run() -> Result<()> {
                     vec!["auth".to_string(), "xai-device".to_string()],
                 )
             }
+            command @ (AuthCommand::Claude | AuthCommand::ClaudeRevoke) => {
+                let route = if matches!(command, AuthCommand::Claude) {
+                    "claude"
+                } else {
+                    "claude-revoke"
+                };
+                let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+                run_tui_in_process(
+                    &cli,
+                    &resolved_runtime,
+                    vec!["auth".to_string(), route.to_string()],
+                )
+            }
             AuthCommand::Chatgpt => {
                 let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
                 run_tui_in_process(
@@ -2917,7 +2934,7 @@ fn reject_legacy_login_provider_args(args: &LoginArgs) -> Result<()> {
 }
 
 const LOGOUT_CONFIRM_PROMPT: &str = "This deletes every saved provider API key and OAuth login, \
-the Codewhale account session and the Daytona token. Type 'yes' to log out: ";
+the Codewhale account session. Type 'yes' to log out: ";
 
 /// `codewhale logout` wipes every provider credential at once, so it must not
 /// run on a stray keystroke. Non-interactive callers opt in with `--yes`.
@@ -2986,6 +3003,14 @@ fn run_logout_command_with_secrets_unlocked(
     let xai = store.config.providers.for_provider_mut(ProviderKind::Xai);
     xai.oauth_credential_generation = None;
     xai.auth_mode = None;
+    let anthropic = store
+        .config
+        .providers
+        .for_provider_mut(ProviderKind::Anthropic);
+    anthropic.oauth_credential_generation = None;
+    if anthropic.auth_mode.as_deref() == Some("oauth") {
+        anthropic.auth_mode = None;
+    }
     let openai_codex = store
         .config
         .providers
@@ -3008,6 +3033,9 @@ fn run_logout_command_with_secrets_unlocked(
     let mut keyring_failures = clear_all_provider_api_keys_from_keyring(secrets);
     // Already inside with_xai_oauth_revocation_transaction: the locked
     // variant must not re-enter the non-reentrant lifecycle mutex.
+    if let Err(error) = codewhale_config::clear_all_claude_oauth_credentials_locked() {
+        keyring_failures.push(format!("Claude sign-in: {error}"));
+    }
     if let Err(error) = codewhale_config::clear_all_chatgpt_oauth_credentials_locked() {
         keyring_failures.push(format!("chatgpt oauth: {error}"));
     }
@@ -4676,6 +4704,22 @@ fn run_auth_command_with_secrets_and_runtime(
                 1
             })
         }
+        command @ (AuthCommand::Claude | AuthCommand::ClaudeRevoke) => {
+            let route = if matches!(command, AuthCommand::Claude) {
+                "claude"
+            } else {
+                "claude-revoke"
+            };
+            let code = codewhale_tui::run(
+                codewhale_tui::RuntimeOptions::default(),
+                vec!["auth".to_string(), route.to_string()],
+            );
+            std::process::exit(if code == std::process::ExitCode::SUCCESS {
+                0
+            } else {
+                1
+            })
+        }
         AuthCommand::Chatgpt => {
             let argv = vec!["auth".to_string(), "chatgpt".to_string()];
             let code = codewhale_tui::run(codewhale_tui::RuntimeOptions::default(), argv);
@@ -5650,19 +5694,23 @@ fn run_model_command(
     top_level_provider: Option<ProviderKind>,
     resolved_runtime: &ResolvedRuntimeOptions,
 ) -> Result<()> {
-    let registry = ModelRegistry::default();
     match command {
         ModelCommand::List { provider } => {
             let filter = model_command_provider_hint(provider, top_level_provider);
-            for model in registry.list().into_iter().filter(|m| match filter {
-                Some(p) => m.provider == p,
-                None => true,
-            }) {
-                println!("{} ({})", model.id, model.provider.as_str());
+            codewhale_tui::maybe_load_persisted_cache();
+            let providers: &[ProviderKind] = match &filter {
+                Some(provider) => std::slice::from_ref(provider),
+                None => ProviderKind::all(),
+            };
+            for provider in providers {
+                for model in codewhale_tui::all_catalog_models_for_provider(*provider) {
+                    println!("{model} ({})", provider.as_str());
+                }
             }
             Ok(())
         }
         ModelCommand::Resolve { model, provider } => {
+            let registry = ModelRegistry::default();
             // Only `model resolve --provider X` is a hypothetical. The
             // top-level `--provider` is the route this process is actually on,
             // and it is already folded into `resolved_runtime` — treating it as

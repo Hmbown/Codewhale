@@ -1,17 +1,17 @@
 /**
- * The two one-line installs, shared by the install page and the homepage
- * hero. Code-owned shell, never translated.
+ * Installation commands shared by the install page and homepage hero.
+ * Code-owned shell, never translated.
  */
 export const INSTALL_COMMANDS = {
   shell: "curl -fsSL https://codewhale.net/install.sh | sh",
   npm: "npm install -g codewhale",
-  // winget-pkgs publishes `HunterBown.CodeWhale` (portable x64, `codewhale`
-  // command; checked 2026-10-04, latest 0.10.0). Scoop and the GitHub Release
-  // installer are the alternatives in the install guide.
-  windows: "winget install HunterBown.CodeWhale",
+  windows: "winget install --id HunterBown.CodeWhale --exact --source winget",
+  cargo: "cargo install codewhale-cli --locked",
 } as const;
 
 export const INSTALL_COPY = {
+  windowsNote: { en: "Windows x64. Winget updates can lag behind GitHub releases; npm is another option.", zh: "适用于 Windows x64。Winget 更新可能晚于 GitHub 发布；也可以通过 npm 安装。" },
+  cargoNote: { en: "Builds from source. Requires current stable Rust and build tools. The Cargo package can lag behind GitHub releases.", zh: "从源码构建，需要当前稳定版 Rust 和构建工具。Cargo 包可能晚于 GitHub 发布。" },
   metaTitle: { en: "Install · Codewhale", zh: "安装 · Codewhale" },
   metaDescription: { en: "Install Codewhale on macOS, Linux, or Windows, connect a model, and run your first task. Covers package managers and source builds.", zh: "在 macOS、Linux 或 Windows 上安装 Codewhale，连接模型并运行第一项任务。也介绍包管理器和源码构建。" },
   source: { en: "Read the verified guide on GitHub", zh: "查看 GitHub 上已验证的指南" },

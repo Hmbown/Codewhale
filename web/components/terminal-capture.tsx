@@ -24,8 +24,8 @@ function runStyle(style: TerminalCaptureStyle): CSSProperties {
  * scripts/render-terminal-capture.mjs), drawn as styled runs in the system
  * monospace font. Nothing is retouched or staged.
  *
- * The whole frame always fits: the type scales with the frame's width and the
- * grid's column count, like a screenshot, but stays live, selectable text.
+ * The frame or a contiguous detail scales with the frame's width and the
+ * grid's column count, staying live, selectable text.
  * Assistive technology gets one summary (`label`); the glyph-by-glyph grid
  * is presentation. Braille cells (the whale mark) are pinned to one column
  * each, because system monospace fonts draw them from a fallback font.
@@ -34,16 +34,21 @@ export function TerminalCapture({
   frame = "home",
   label,
   regionLabel,
+  rows,
 }: {
   frame?: TerminalCaptureFrameId;
   label: string;
   regionLabel: string;
+  rows?: readonly [number, number];
 }) {
   const data = TERMINAL_CAPTURE_FRAMES[frame];
+  const start = rows ? Math.max(0, Math.min(data.lines.length - 1, rows[0])) : 0;
+  const end = rows ? Math.max(start + 1, Math.min(data.lines.length, rows[1])) : data.lines.length;
+  const lines = data.lines.slice(start, end);
   const styles = data.styles as readonly TerminalCaptureStyle[];
   // The padding around the grid continues the frame's own top and bottom rows.
-  const top = styles[data.lines[0][0][1]].bg;
-  const bottom = styles[data.lines[data.lines.length - 1][0][1]].bg;
+  const top = styles[lines[0][0][1]].bg;
+  const bottom = styles[lines[lines.length - 1][0][1]].bg;
   return (
     <div className="term-capture-scroll" role="region" aria-label={regionLabel} tabIndex={0}>
       <pre
@@ -51,9 +56,11 @@ export function TerminalCapture({
         role="img"
         aria-label={label}
         data-capture-file={data.file}
+        data-capture-row-start={start + 1}
+        data-capture-row-end={end}
         style={{ background: `linear-gradient(${top}, ${bottom})`, ["--cols" as string]: data.cols } as CSSProperties}
       >
-        {data.lines.map((runs, row) => (
+        {lines.map((runs, row) => (
           <span key={row} className="term-capture-row">
             {runs.map(([text, index], run) => (
               <span key={run} style={runStyle(styles[index])}>

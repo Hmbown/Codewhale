@@ -706,6 +706,10 @@ fn write_workspace_file(
     bytes: &[u8],
     expected_revision: Option<&str>,
 ) -> Result<(StatusCode, Json<WorkspaceFileWriteResponse>), ApiError> {
+    static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _write_guard = WRITES
+        .lock()
+        .map_err(|_| ApiError::internal("workspace file write lock is unavailable"))?;
     let root = canonical_workspace(workspace)?;
     let created = precheck_file_target(&root, relative)?.is_none();
     match (created, expected_revision) {

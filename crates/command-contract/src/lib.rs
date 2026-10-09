@@ -1,12 +1,10 @@
-//! Prototype command boundary for the staged TUI command extraction.
+//! Portable command shapes and shared formatting for command implementations.
 //!
-//! FEAT-014 defines shapes only. It does not implement them for `App`, change
-//! production dispatch, move localization or shared TUI types, or move command
-//! files. Later FEATs first adopt these shapes inside `codewhale-tui` one group
-//! per PR; only after all groups are decoupled will they move to a commands
-//! crate, again one group per PR.
+//! Host registration and adapters remain with their clients. Decoupled command
+//! groups move into `codewhale-commands` with all consumers migrated per slice.
 
 pub mod config_policy;
+pub mod elapsed;
 pub mod facets;
 pub mod handler;
 pub mod metadata;

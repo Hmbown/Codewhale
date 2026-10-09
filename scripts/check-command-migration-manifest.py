@@ -718,7 +718,7 @@ def _split_top_level(text: str, sep: str) -> list[str]:
     return parts
 
 
-def _module_path_from_file(file: Path, root: Path) -> str:
+def _module_path_from_file(file: Path, root: Path, prefix: str = "crate::commands::groups::") -> str:
     """Derive the crate-relative module path for a file under the groups root.
 
     `mod.rs` resolves to its directory name; other files to
@@ -730,7 +730,7 @@ def _module_path_from_file(file: Path, root: Path) -> str:
         parts = parts[:-1]
     else:
         parts[-1] = parts[-1].removesuffix(".rs")
-    return "crate::commands::groups::" + "::".join(parts)
+    return prefix + "::".join(parts)
 
 
 def _first_param_type(fn_sig: str) -> str | None:
@@ -798,18 +798,21 @@ def parse_rust_file(file: Path, root: Path) -> list[RustItem]:
     module layout. It is deliberately narrow: it looks for function items with
     a first parameter typed `&mut App` (the concrete-App handler signature).
 
-    `root` is the *groups* root: module paths are derived from the file's
-    position under `crates/tui/src/commands/groups/`, not the repo root.
+    Module paths use the owning commands crate or TUI groups directory.
+    Hermetic fixtures may supply their own module root.
     """
     raw = file.read_text(encoding="utf-8")
     code = _strip_comments_and_strings(raw)
-    # Module paths derive from the file's position under the real groups root;
-    # hermetic tests use a synthetic root, in which case the passed root is the
-    # module-path base.
+    # Module paths derive from the source owner; hermetic tests use a synthetic
+    # root, in which case the passed root is the module-path base.
+    commands_root = root / "crates/commands/src"
     try:
-        module_path = _module_path_from_file(file, GROUPS_ROOT)
+        module_path = _module_path_from_file(file, commands_root, "crate::")
     except ValueError:
-        module_path = _module_path_from_file(file, root)
+        try:
+            module_path = _module_path_from_file(file, GROUPS_ROOT)
+        except ValueError:
+            module_path = _module_path_from_file(file, root)
     items: list[RustItem] = []
     lines = raw.splitlines()
 
@@ -1103,13 +1106,16 @@ def group_source_scope(group_name: str, node: dict, root: Path) -> list[str]:
     """Preserve the immutable historical topology and scan every debug source.
 
     Recursive discovery includes receipts, module roots, helpers, tests and new
-    nested files even when the historical manifest never listed them. Retaining
-    declared paths also preserves missing-file diagnostics; no scope is removed.
+    nested files even when the historical manifest never listed them. Relocating
+    declared debug paths preserves missing-file diagnostics after extraction.
     """
     scope = set(node.get("scope", []))
     if group_name == "debug":
-        directory = root / "crates/tui/src/commands/groups/debug"
-        scope.update(path.relative_to(root).as_posix() for path in directory.rglob("*.rs"))
+        scope = {path.replace("crates/tui/src/commands/groups/debug/",
+                              "crates/commands/src/debug/", 1) for path in scope}
+        for directory in (root / "crates/commands/src/debug",
+                          root / "crates/tui/src/commands/groups/debug"):
+            scope.update(path.relative_to(root).as_posix() for path in directory.rglob("*.rs"))
     return sorted(scope)
 
 

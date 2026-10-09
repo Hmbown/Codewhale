@@ -3,10 +3,10 @@
 //! `commands::debug_diagnostics` filter; mutation-only tests stay in the group.
 
 use super::debug_mutation_host_tests::{create_test_app, test_tool};
-use super::groups::debug::cache_format::format_tokens;
 use crate::client::CacheWarmupKey;
 use crate::tui::app::{App, AppAction, TurnCacheRecord};
 use crate::tui::history::HistoryCell;
+use codewhale_commands::debug::cache_format::format_tokens;
 use codewhale_models::Role;
 use codewhale_models::{ContentBlock, Message, SystemBlock, SystemPrompt};
 use std::time::Instant;
@@ -49,7 +49,7 @@ fn cache(app: &mut App, arg: Option<&str>) -> crate::commands::CommandResult {
 fn format_warmup_status(last: Option<&CacheWarmupKey>, current: &CacheWarmupKey) -> String {
     let previous = last.cloned().map(super::contract::project_debug_warmup_key);
     let projected = super::contract::project_debug_warmup_key(current.clone());
-    super::groups::debug::cache_format::format_warmup_status(
+    codewhale_commands::debug::cache_format::format_warmup_status(
         previous.as_ref(),
         &projected,
         last.map(CacheWarmupKey::hash_short).as_deref(),
@@ -1627,7 +1627,7 @@ mod cost_breakdown_tests {
         );
         // 0.07 + 0.14 accumulated in ring order equals the parent component's
         // accumulation, so the route line shows the whole parent spend.
-        let route_amount = crate::diagnostics_reports::format_cost_amount_precise(
+        let route_amount = codewhale_commands::diagnostics_reports::format_cost_amount_precise(
             components.parent_turns,
             crate::commands::contract::to_command_currency(
                 app.cost_display_currency(app.cost_currency),
@@ -1689,7 +1689,7 @@ mod route_tests {
             .pop()
             .unwrap();
         assert_eq!(
-            crate::commands::groups::debug::cache_format::format_turn_cache_route(&turn),
+            codewhale_commands::debug::cache_format::format_turn_cache_route(&turn),
             "lm-studio/local-code-..."
         );
     }

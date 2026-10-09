@@ -85,7 +85,9 @@ Sources to keep in sync:
   scoped selector aliases, completion references and pure transport metadata.
   The existing seed renderer embeds this reviewed supplement in Models.dev.
 - `crates/agent/src/lib.rs` - compatibility projection of those shared selector
-  rows for `codewhale model list` and `codewhale model resolve`.
+  rows, used by `codewhale model resolve` (and the `[model]` config surface).
+  `codewhale model list` reads the resolved provider lake instead, so a single
+  list shows bundled, live and configured rows together.
 - `config.example.toml` and `docs/CONFIGURATION.md` - user-facing config
   examples and environment variable reference.
 - `scripts/check-provider-registry.py` - drift check for canonical provider
@@ -303,7 +305,7 @@ the listed provider env vars.
 | `together` | `[providers.together]` | OpenAI Chat Completions | `TOGETHER_API_KEY` |
 | `qianfan` | `[providers.qianfan]` | OpenAI Chat Completions | `QIANFAN_API_KEY`, `BAIDU_QIANFAN_API_KEY` |
 | `openai-codex` | `[providers.openai_codex]` | OpenAI Responses | Official Sign in with ChatGPT (`codewhale auth chatgpt`) with a validated Codewhale-owned plan grant |
-| `anthropic` | `[providers.anthropic]` | Anthropic Messages | `ANTHROPIC_API_KEY` |
+| `anthropic` | `[providers.anthropic]` | Anthropic Messages | `ANTHROPIC_API_KEY` or `codewhale auth claude` |
 | `openmodel` | `[providers.openmodel]` | Anthropic Messages | `OPENMODEL_API_KEY` |
 | `zai` | `[providers.zai]` | OpenAI Chat Completions | `ZAI_API_KEY`, `Z_AI_API_KEY` |
 | `stepfun` | `[providers.stepfun]` | OpenAI Chat Completions | `STEPFUN_API_KEY`, `STEP_API_KEY` |
@@ -1117,8 +1119,11 @@ price. Flash ships the published $0.15/$0.50 list. A live call can still
 
 ## Static Model Registry
 
-`codewhale model list` and `codewhale model resolve` project the reviewed
-`selections` in `crates/config/assets/catalog_corrections.json` through
+This table describes the static registry, which `codewhale model resolve` (and
+the `[model]` config surface) still use to resolve selector aliases.
+
+`codewhale model resolve` projects the reviewed `selections` in
+`crates/config/assets/catalog_corrections.json` through
 `crates/agent/src/lib.rs`. There is no independent Rust model roster. These
 ordered aliases and flags are compatibility metadata, not account availability
 or executable route permission. This differs from live `/models` discovery.
@@ -1405,3 +1410,28 @@ provider docs work, but they are not native shipped behavior in this checkout:
 - Hugging Face model passport metadata in the picker, including license, base
   model, context length, chat template, tool-call support, reasoning support,
   and gated/private status.
+
+## Sign in with Claude
+
+Run `codewhale auth claude` (or `/auth claude` in a running session), open the
+printed Claude sign-in URL, and paste the complete `code#state` callback.
+`/provider setup anthropic` also offers API-key and Claude Pro / Max choices.
+Then select `anthropic` or its `claude` alias. API keys continue to use separate
+Anthropic API billing; selecting subscription sign-in never falls back to one.
+
+Codewhale stores the grant in its private credentials directory, commits the
+provider's credential pointer atomically, and refreshes it before requests on a
+worker. Subscription tokens go only to `https://api.anthropic.com`; a custom
+endpoint is rejected. Each request keeps the existing Messages adapter, tool
+protocol, cache prefix, and Codewhale client identity. No Claude Code credential
+file or keychain entry is read or modified.
+
+`codewhale auth claude-revoke` (or `/auth claude-revoke`) removes the owned local
+grant. End remote access separately in your Claude account settings. The
+subscription route then needs another login; select API-key billing explicitly
+to use an API key. Login and inference follow Anthropic's provider-side
+availability; local checks do not
+establish that an account is eligible or that live subscription inference works.
+
+The callback and JSON token exchange follow the interoperable flow used by
+[pi's Anthropic OAuth adapter](https://github.com/fivewillow/badlogic-pi-mono/blob/main/packages/ai/src/utils/oauth/anthropic.ts).

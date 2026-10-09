@@ -15,12 +15,11 @@ use std::time::Duration;
 use crate::commands;
 #[cfg(test)]
 use crate::config::ProviderKind;
+use crate::core::authority::{RiskLevel, ToolCategory};
 #[cfg(test)]
 use crate::provider_lake::all_catalog_models_for_provider;
 use crate::tui::app::{App, ComposerDensity, ViewportState};
-use crate::tui::approval::{
-    ApprovalRequest, ApprovalView, ElevationOption, ElevationRequest, RiskLevel, ToolCategory,
-};
+use crate::tui::approval::{ApprovalRequest, ApprovalView, ElevationOption, ElevationRequest};
 use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolRun, ToolStatus};
 use crate::tui::menu_style;
 use crate::tui::scrolling::TranscriptLineMeta;

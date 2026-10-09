@@ -1,0 +1,15 @@
+[package]
+name = "codewhale-commands"
+description = "Portable command handlers and diagnostic reports for Codewhale"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+codewhale-command-contract = { path = "../command-contract", version = "0.10.2" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

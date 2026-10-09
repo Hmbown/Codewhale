@@ -23,6 +23,7 @@ use codewhale_models::{ContentBlock, Message};
 
 use crate::{
     core::events::{Event as EngineEvent, TurnOutcomeStatus},
+    git_status::normalize_observed_git_repo,
     runtime_chat_relay::{
         RuntimeChatControlScope, RuntimeChatProjection, RuntimeChatPrompt, RuntimeChatRelayHost,
     },
@@ -4052,77 +4053,6 @@ fn connect_runner_body(enrollment: &LiveEnrollment, start: &RemoteStart) -> Valu
         body["gitRemote"] = json!(repo);
     }
     body
-}
-
-/// Collapse a git remote to `owner/name`. Paths, credentials, and unknown
-/// hosts are dropped so the control plane never receives a folder identity.
-pub fn normalize_observed_git_repo(input: &str) -> Option<String> {
-    let raw = input.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let allowed_host = |host: &str| {
-        matches!(
-            host.to_ascii_lowercase().as_str(),
-            "github.com" | "www.github.com" | "gitee.com" | "cnb.cool"
-        )
-    };
-    let path = if let Some((authority, path)) = raw.split_once(':')
-        && !raw.contains("://")
-        && authority.starts_with("git@")
-        && allowed_host(authority.trim_start_matches("git@"))
-    {
-        path.to_string()
-    } else {
-        let url = Url::parse(raw).ok()?;
-        if url.scheme() != "https"
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.port().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-            || !allowed_host(url.host_str()?)
-        {
-            return None;
-        }
-        url.path().trim_start_matches('/').to_string()
-    };
-    let path = path.trim_end_matches('/').trim_end_matches(".git");
-    let mut parts = path.split('/');
-    let owner = parts.next()?;
-    let name = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    if owner.len() > 80 || name.len() > 80 {
-        return None;
-    }
-    if !owner
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
-        || !name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
-    {
-        return None;
-    }
-    if matches!(owner, "." | "..") || matches!(name, "." | "..") {
-        return None;
-    }
-    Some(format!("{owner}/{name}"))
-}
-
-pub fn observed_git_repo(workspace: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(workspace)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    normalize_observed_git_repo(std::str::from_utf8(&output.stdout).ok()?)
 }
 
 fn parse_runner_connection(

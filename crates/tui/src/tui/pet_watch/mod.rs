@@ -259,7 +259,7 @@ impl PetWatch {
 /// Existing protocol projection defines the variant names. This allowlist
 /// removes payloads before the bounded worker queue; no model text escapes.
 fn metadata(event: &Event, turn_id: Option<&str>) -> Option<String> {
-    let value = match event {
+    let mut value = match event {
         Event::TurnStarted { turn_id, .. } => json!({"event":"turn_started","turn_id":turn_id}),
         Event::TurnComplete { status, .. } => {
             let mut value = json!({
@@ -290,18 +290,22 @@ fn metadata(event: &Event, turn_id: Option<&str>) -> Option<String> {
         Event::OperationActivityStarted {
             span_id,
             activity_kind,
+            action_id,
         } => json!({
             "event":"operation_activity_started",
             "span_id":span_id,
+            "action_id":action_id,
             "activity_kind":activity_kind
         }),
         Event::OperationActivityCompleted {
             span_id,
             activity_kind,
+            action_id,
             outcome,
         } => json!({
             "event":"operation_activity_completed",
             "span_id":span_id,
+            "action_id":action_id,
             "activity_kind":activity_kind,
             "outcome":outcome
         }),
@@ -338,6 +342,12 @@ fn metadata(event: &Event, turn_id: Option<&str>) -> Option<String> {
         }),
         _ => return None,
     };
+    if value
+        .get("action_id")
+        .is_some_and(serde_json::Value::is_null)
+    {
+        value.as_object_mut()?.remove("action_id");
+    }
     let json = serde_json::to_string(&value).ok()?;
     (json.len() <= 16_384).then_some(json)
 }
@@ -590,7 +600,9 @@ fn render_tank(frame: &mut Frame, area: Rect, app: &mut App) {
                 && activity.freshness == codewhale_protocol::engine_owner::OwnerFreshness::Fresh
                 && r.frame_changed.elapsed().as_millis() < 800
             {
-                if let Some(kind) = activity.activity_kind {
+                if let Some(action) = activity.action_id.as_deref() {
+                    text = format!("{action} · {text}");
+                } else if let Some(kind) = activity.activity_kind {
                     text = format!("{} · {}", kind.as_str(), text);
                 }
                 if activity.parallel_agent_count > 0 {
@@ -691,6 +703,23 @@ fn render_tank(frame: &mut Frame, area: Rect, app: &mut App) {
             &label,
             Style::default().fg(ink),
         );
+        if let Some(raster) = raster.filter(|r| r.width == area.width && r.height == tank.height)
+            && area.height >= 4
+            && unicode_width::UnicodeWidthStr::width(label.as_str()) <= usize::from(area.width)
+        {
+            for y in tank.y..tank.bottom() {
+                for x in tank.x..tank.right() {
+                    let index =
+                        usize::from(y - tank.y) * usize::from(tank.width) + usize::from(x - tank.x);
+                    if raster.cells.get(index).is_some_and(|bits| *bits != 0)
+                        && let Some(rgb) = raster.colors.get(index)
+                        && let Some(cell) = frame.buffer_mut().cell_mut((x, y))
+                    {
+                        cell.set_fg(Color::Rgb(rgb[0], rgb[1], rgb[2]));
+                    }
+                }
+            }
+        }
         if raster.is_none() {
             paint_resting_whale(frame, area, Style::default().fg(ink));
         }
@@ -1023,6 +1052,7 @@ mod tests {
             &Event::OperationActivityStarted {
                 span_id: "private-internal-span".into(),
                 activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind::Computer,
+                action_id: Some("mcp_computer_use_click".into()),
             },
             None,
         )
@@ -1032,13 +1062,15 @@ mod tests {
             json!({
                 "event":"operation_activity_started",
                 "span_id":"private-internal-span",
-                "activity_kind":"computer"
+                "activity_kind":"computer",
+                "action_id":"mcp_computer_use_click"
             })
         );
         let completed = metadata(
             &Event::OperationActivityCompleted {
                 span_id: "private-internal-span".into(),
                 activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind::Editing,
+                action_id: Some("edit_file".into()),
                 outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome::Denied,
             },
             None,
@@ -1050,6 +1082,7 @@ mod tests {
                 "event":"operation_activity_completed",
                 "span_id":"private-internal-span",
                 "activity_kind":"editing",
+                "action_id":"edit_file",
                 "outcome":"denied"
             })
         );

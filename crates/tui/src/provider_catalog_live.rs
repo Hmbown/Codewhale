@@ -407,6 +407,7 @@ impl ProviderLivePricingQuote {
             output: output_per_million,
             cache_read: cache_read_per_million,
             cache_write: cache_write_per_million,
+            ..Default::default()
         };
         if !codewhale_config::pricing::catalog_cost_is_valid(&cost) {
             return None;

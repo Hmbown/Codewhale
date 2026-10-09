@@ -186,7 +186,7 @@ pub(super) fn reasoning_timeline_text(
         };
         if let Some(duration_secs) = duration_secs {
             status.push_str(" · ");
-            status.push_str(&crate::elapsed::format_elapsed_ms(
+            status.push_str(&codewhale_command_contract::elapsed::format_elapsed_ms(
                 (duration_secs * 1000.0) as u64,
             ));
         }
@@ -1160,8 +1160,9 @@ fn turn_timeline_lines(app: &App, start: usize, end: usize) -> Vec<String> {
             } => {
                 let summary = one_line_summary(content, 88);
                 let status = streaming.then_some("running").unwrap_or("done");
-                let duration = duration_secs
-                    .map(|secs| crate::elapsed::format_elapsed_ms((secs * 1000.0) as u64));
+                let duration = duration_secs.map(|secs| {
+                    codewhale_command_contract::elapsed::format_elapsed_ms((secs * 1000.0) as u64)
+                });
                 let actions = timeline_cell_actions(app, idx, cell);
                 rows.push(timeline_row(
                     "reasoning",
@@ -1173,8 +1174,8 @@ fn turn_timeline_lines(app: &App, start: usize, end: usize) -> Vec<String> {
             }
             HistoryCell::Tool(tool) => {
                 let (kind, summary) = timeline_tool_summary(app, idx, tool);
-                let duration =
-                    tool_duration_for_activity(tool).map(crate::elapsed::format_elapsed_ms);
+                let duration = tool_duration_for_activity(tool)
+                    .map(codewhale_command_contract::elapsed::format_elapsed_ms);
                 let status = tool.status().map(activity_status_label);
                 let actions = timeline_cell_actions(app, idx, cell);
                 rows.push(timeline_row(

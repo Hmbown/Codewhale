@@ -20,7 +20,7 @@ use codewhale_command_contract::metadata::{
     CommandInfo as ContractInfo, RegisterCommand as ContractRegisterCommand,
 };
 
-pub(in crate::commands) struct CacheCmd;
+pub struct CacheCmd;
 
 const CONTRACT_INFO: ContractInfo = ContractInfo {
     name: "cache",

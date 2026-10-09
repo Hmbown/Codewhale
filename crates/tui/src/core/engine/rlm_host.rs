@@ -4,9 +4,9 @@
 //! driver is Engine::run_turn; the RPC adapter owns its bounded invocation.
 use super::turn_loop::usage_has_reported_data;
 use super::*;
+use crate::core::authority::auto_review::AutoReviewPolicy;
 use crate::rlm::bridge::{RlmUsageAccumulator, RlmUsageReservation};
 use crate::rlm::turn::{RlmRoundTrace, RlmTermination, RlmTurnResult};
-use crate::tui::auto_review::AutoReviewPolicy;
 use anyhow::anyhow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

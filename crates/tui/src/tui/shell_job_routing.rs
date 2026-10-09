@@ -37,7 +37,7 @@ pub(super) fn format_shell_job_list(jobs: &[ShellJobSnapshot]) -> String {
             "{}  {:8}  {}  exit={:?}{}",
             job.id,
             status_label(&job.status, job.stale),
-            crate::elapsed::format_elapsed_ms(job.elapsed_ms),
+            codewhale_command_contract::elapsed::format_elapsed_ms(job.elapsed_ms),
             job.exit_code,
             task
         ));
@@ -66,7 +66,7 @@ pub(super) fn format_shell_poll(result: &ShellResult) -> String {
             result.task_id.as_deref().unwrap_or("(unknown)"),
             status_label(&result.status, false),
             result.exit_code,
-            crate::elapsed::format_elapsed_ms(result.duration_ms)
+            codewhale_command_contract::elapsed::format_elapsed_ms(result.duration_ms)
         ),
         String::new(),
     ];
@@ -108,7 +108,7 @@ fn format_shell_job_detail(detail: &ShellJobDetail) -> String {
         format!("Cwd: {}", crate::utils::display_path(&job.cwd)),
         format!(
             "Elapsed: {}",
-            crate::elapsed::format_elapsed_ms(job.elapsed_ms)
+            codewhale_command_contract::elapsed::format_elapsed_ms(job.elapsed_ms)
         ),
         format!("Exit Code: {:?}", job.exit_code),
         format!("Stdin Available: {}", job.stdin_available),

@@ -18,7 +18,6 @@ pub(crate) mod agent_roster;
 pub mod ambient_life;
 pub mod app;
 pub mod approval;
-pub mod auto_review;
 pub mod auto_router;
 pub mod automation_panel;
 mod automation_routing;
@@ -53,7 +52,6 @@ pub mod format_helpers;
 pub mod frame_rate_limiter;
 pub mod gate_receipts;
 pub mod git_mention;
-pub mod git_status;
 pub mod glyphs;
 #[cfg(test)]
 pub(crate) mod golden_harness;

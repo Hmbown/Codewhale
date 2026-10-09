@@ -1068,12 +1068,14 @@ impl WorkflowPanel {
         // timestamps) which would otherwise render multi-year elapsed times.
         if self.started_at_ms == 0 {
             if let Some(completed) = self.completed_at_ms {
-                return crate::elapsed::format_elapsed_ms(completed);
+                return codewhale_command_contract::elapsed::format_elapsed_ms(completed);
             }
             return "0s".to_string();
         }
         let end = self.completed_at_ms.unwrap_or_else(now_ms);
-        crate::elapsed::format_elapsed_ms(end.saturating_sub(self.started_at_ms))
+        codewhale_command_contract::elapsed::format_elapsed_ms(
+            end.saturating_sub(self.started_at_ms),
+        )
     }
 
     /// Expanded history-card body lines (phase/child summaries, links,
@@ -1174,7 +1176,9 @@ impl WorkflowPanel {
                         mark = role_mark(row.profile.as_deref()),
                         label = short_label(&row.label, 14),
                         track = lane_track(row, max_elapsed, 16, now_ms()),
-                        elapsed = crate::elapsed::format_elapsed_ms(row_elapsed_ms(row, now_ms())),
+                        elapsed = codewhale_command_contract::elapsed::format_elapsed_ms(
+                            row_elapsed_ms(row, now_ms())
+                        ),
                         status = row.status.display_label(self.locale),
                     ),
                     content_width,
@@ -2194,9 +2198,10 @@ fn receipt_parts(row: &WorkflowPanelRow, locale: Locale) -> Vec<String> {
         let tools = usage
             .tool_calls
             .map_or_else(|| unknown.clone(), |calls| calls.to_string());
-        let duration = usage
-            .duration_ms
-            .map_or_else(|| unknown.clone(), crate::elapsed::format_elapsed_ms);
+        let duration = usage.duration_ms.map_or_else(
+            || unknown.clone(),
+            codewhale_command_contract::elapsed::format_elapsed_ms,
+        );
         parts.extend([
             localized_field(locale, MessageId::WorkflowReceiptTokens, &tokens),
             localized_field(locale, MessageId::WorkflowReceiptTools, &tools),

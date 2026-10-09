@@ -3,7 +3,7 @@
 
 use codewhale_command_contract::facets::debug_receipts::*;
 
-pub(crate) fn bounded(text: &str, max: usize) -> String {
+pub fn bounded(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
     }
@@ -125,7 +125,7 @@ pub fn totals_line(receipt: &Receipt) -> String {
     line
 }
 
-pub(crate) fn plural(count: usize, one: &str, many: &str) -> String {
+pub fn plural(count: usize, one: &str, many: &str) -> String {
     if count == 1 {
         format!("1 {one}")
     } else {
@@ -210,7 +210,7 @@ fn one_line(text: &str) -> String {
 
 /// Inline code that survives backticks in the text: the fence is one
 /// backtick longer than the longest run inside it.
-pub(crate) fn code_span(text: &str) -> String {
+pub fn code_span(text: &str) -> String {
     let longest = text.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(longest + 1);
     let pad = if text.starts_with('`') || text.ends_with('`') {
