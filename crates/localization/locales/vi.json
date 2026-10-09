@@ -630,7 +630,7 @@
   "CmdUpdateDescription": "Kiểm tra và cài đặt bản phát hành Codewhale mới",
   "CmdNoteDescription": "Thêm, liệt kê, sửa hoặc xóa ghi chú trong không gian làm việc",
   "CmdThemeDescription": "Chuyển đổi giao diện hoặc mở bảng chọn giao diện",
-  "CmdProviderDescription": "Chuyển đổi hoặc xem backend LLM đang hoạt động (deepseek | nvidia-nim | ollama)",
+  "CmdProviderDescription": "Chuyển nhà cung cấp hoặc mô hình",
   "CmdAuthDescription": "Quản lý quy trình xác thực nhà cung cấp",
   "CmdLoginDescription": "Đăng nhập Codewhale hoặc lưu khóa nhà cung cấp",
   "CmdQueueDescription": "Xem hoặc chỉnh sửa các tin nhắn đang chờ xử lý",

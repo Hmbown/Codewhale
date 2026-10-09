@@ -630,7 +630,7 @@
   "CmdUpdateDescription": "检查并安装新的 Codewhale 版本",
   "CmdNoteDescription": "添加、列出、编辑或删除工作区笔记",
   "CmdThemeDescription": "切换主题或打开主题选择器",
-  "CmdProviderDescription": "切换当前提供商 和/或 模型（deepseek | nvidia-nim | ollama）",
+  "CmdProviderDescription": "切换提供商或模型",
   "CmdAuthDescription": "管理提供商身份验证流程",
   "CmdLoginDescription": "登录 Codewhale 或保存提供商密钥",
   "CmdQueueDescription": "查看或编辑已排队的消息",

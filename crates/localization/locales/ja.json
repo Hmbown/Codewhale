@@ -630,7 +630,7 @@
   "CmdUpdateDescription": "新しい Codewhale リリースを確認してインストールします",
   "CmdNoteDescription": "ワークスペースノートの追加、一覧、編集、削除",
   "CmdThemeDescription": "テーマを切り替え（ダーク/ライト/グレースケール/システム）",
-  "CmdProviderDescription": "現在の LLM バックエンドを切り替え・確認（deepseek | nvidia-nim | ollama）",
+  "CmdProviderDescription": "プロバイダまたはモデルを切り替え",
   "CmdAuthDescription": "プロバイダー認証フローを管理",
   "CmdLoginDescription": "Codewhaleにサインインするか、プロバイダーキーを保存",
   "CmdQueueDescription": "キューされたメッセージを確認・編集",
