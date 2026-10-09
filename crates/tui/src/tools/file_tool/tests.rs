@@ -191,9 +191,15 @@ fn fuzz_is_advertised_only_for_patch() {
 /// (#3979) — a new parameter on three actions, kept to instruction-only
 /// text. That is a decision, not drift: the budget exists to price schema
 /// bytes, not to forbid new capability.
+///
+/// Raised 3100 → 3200 in v0.10.2 for the file-search repair's `exclude`
+/// parameter (#6934): the same decision, one new parameter, borrowed here
+/// the same way the others are. `exclude` carries its glob examples as
+/// instruction rather than explanation — without them the parameter's
+/// replacement semantics are guessable only by reading the source.
 #[test]
 fn schema_stays_within_its_catalog_byte_budget() {
-    const BUDGET_BYTES: usize = 3_100;
+    const BUDGET_BYTES: usize = 3_200;
 
     let schema = FileTool::with_patch("File").input_schema();
     let mut rows: Vec<(usize, String)> = schema["properties"]
