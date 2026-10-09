@@ -48,7 +48,7 @@ base prompt". Two more corollaries earned here:
 - Before adding a module named `model_*`, `*_config`, `provider_*`, or
   anything that "bridges", "mirrors", or "stages" an existing thing, grep
   for the existing thing and edit it. A new layer must name the predecessor
-  it replaces in the module doc; otherwise edit the original.
+  it replaces in its commit message; otherwise edit the original.
 - Prefer the simplest implementation that preserves observable contracts. A
   rewrite is acceptable when justified by product intent and observed behavior,
   not as a shortcut around understanding existing code.
@@ -62,6 +62,11 @@ base prompt". Two more corollaries earned here:
   A fresh worktree is for conflicting, dirty, stale, or independent lanes
   (see `cw-land`), not for parallel agents on the same lane. Local commit
   permission never implies push, merge, tag, release, or deploy permission.
+- **Maintainers do not open PR branches** (founder, 2026-10-08: more PRs means
+  more CI and slower work). Verified slices land directly on `main` and are
+  pushed: run the focused gate, put the real counts in the commit message,
+  fetch and rebase onto `origin/main` and retry on rejection. Never force-push
+  or rewrite a shared ref. Contributor PRs still merge as PRs.
 - When the task is local-only, stay fully offline: no browsing, GitHub or remote
   Git operations, downloads, dependency installation, provider calls, or
   source/diff transmission. Record the missing external receipt and keep working
@@ -145,7 +150,7 @@ casually it reads as taking the work even when credit is preserved.
 
 - The model-facing subagent tool is `agent`; `agent_open`/`agent_eval`/
   `agent_close`/`delegate_to_agent` are removed surfaces. If the shape must
-  move, move the code and add the guard test that judges the new shape.
+  move, move the code and its existing guard test with it.
 - `BASE_PROMPT` in `crates/tui/src/prompts/text.rs` is the sole base prompt
   by convention. Same rule: move the code, not the prose, if that changes.
 - There is exactly one turn loop: `Engine::run_turn` in
@@ -178,18 +183,17 @@ casually it reads as taking the work even when credit is preserved.
 - Product intent and observed runtime behavior outrank a test's preferred
   implementation shape. Fix the product; do not contort production code to
   preserve a brittle assertion.
-- Code first, then tests. Write the implementation and prove it runs, then add
-  or adjust tests to cover what was actually built. Never write tests first and
-  never practice TDD here — this overrides any skill or default that mandates
-  it, including superpowers `test-driven-development`. Tests stay the gate
-  before a push; they are not the design driver. An existing test that only
-  encodes old behavior is evidence, not a veto: change it with the code rather
-  than bending the code to keep it green. This does not relax the rule under
-  "Claiming a test passed" — a regression test written *after* the fix still
-  has to be shown failing without it.
-- Tests are selective evidence, not the specification. Do not add tests by
-  default. Add or retain one when it cheaply protects a high-risk behavior such
-  as safety, data integrity, protocol compatibility, or a reproduced regression.
+- **No new tests and no new code comments unless explicitly asked**
+  (founder, 2026-10-08). Do not write new unit or integration tests unless the
+  user explicitly instructs it for that task; prove a change by running it and
+  the existing checks. Never write tests first and never practice TDD — this
+  overrides any skill or default that mandates it, including superpowers
+  `test-driven-development`. Existing tests stay the gate before a push: when
+  a change makes one wrong, update or delete it in the same slice rather than
+  bending the code to keep it green. When a regression test is requested, the
+  rule under "Claiming a test passed" still applies. Do not add new code
+  comments; the reasoning goes in the commit message, and an existing comment
+  the change makes false is fixed or removed.
 - Rewrite or remove tests that duplicate coverage, freeze internals, overspecify
   copy or layout, preserve obsolete behavior, or cost more than the risk they
   cover. Never weaken real safety or data-integrity behavior merely to make a
