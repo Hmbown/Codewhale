@@ -198,6 +198,67 @@ pub fn default_socket_path() -> Result<PathBuf, DaemonSocketError> {
     resolve_socket_path(&SocketPathInputs::from_environment(None)?)
 }
 
+/// Digest bytes that name a derived socket. Six bytes (twelve hex characters,
+/// the same digest length the runtime-boundary id uses) make the basename a
+/// fixed 23 bytes with the `store-` prefix and the `.sock` suffix, which keeps
+/// the hard kernel path limit reachable only for an already-close default
+/// endpoint instead of consuming the remaining headroom.
+#[cfg(unix)]
+const DERIVED_STORE_HASH_BYTES: usize = 6;
+
+/// The control endpoint for a selected runtime store: the well-known default
+/// socket when the store is the default selection, and a private sibling
+/// derived from the store root otherwise.
+///
+/// One control endpoint per runtime store, as a pure function of the store
+/// selection. A client that selects a non-default store (`CODEWHALE_RUNTIME_DIR`,
+/// e.g. the VS Code extension's per-workspace store) elects its own owner
+/// instead of colliding with the default store's owner on the shared socket;
+/// the default store keeps the historical path, so discovery, `doctor` and
+/// single-engine setups are unchanged.
+///
+/// `store_root` is the canonicalized runtime store root the caller selected;
+/// `None` means "the default selection" (no override in effect).
+///
+/// Unix only: a Windows owner endpoint is a named pipe, and its derived-name
+/// form is follow-up work. Windows keeps the well-known endpoint it has today.
+#[cfg(unix)]
+pub fn store_selected_socket_path(
+    store_root: Option<&Path>,
+    inputs: &SocketPathInputs,
+) -> Result<PathBuf, DaemonSocketError> {
+    use anyhow::Context as _;
+    use sha2::Digest as _;
+
+    let base = resolve_socket_path(inputs)?;
+    let Some(store_root) = store_root else {
+        return Ok(base);
+    };
+    let mut digest = sha2::Sha256::new();
+    // The tag keeps this name from colliding with any other use of the store
+    // root's digest in the same directory.
+    digest.update(b"Codewhale/store-socket/v1\0");
+    digest.update(store_root.as_os_str().as_encoded_bytes());
+    let suffix: String = digest.finalize()[..DERIVED_STORE_HASH_BYTES]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let parent = base
+        .parent()
+        .context("default daemon socket has no parent directory")
+        .map_err(DaemonSocketError::State)?;
+    let derived = parent.join(format!("store-{suffix}.sock"));
+    let len = derived.as_os_str().len();
+    if len > MAX_SOCKET_PATH_BYTES {
+        return Err(DaemonSocketError::PathTooLong {
+            path: derived,
+            len,
+            max: MAX_SOCKET_PATH_BYTES,
+        });
+    }
+    Ok(derived)
+}
+
 /// The socket path this host would use with no explicit override.
 #[cfg(not(any(unix, windows)))]
 pub fn default_socket_path() -> Result<PathBuf, DaemonSocketError> {
@@ -1795,6 +1856,68 @@ mod tests {
             resolved,
             PathBuf::from("/home/whale/.codewhale/run/daemon.sock")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_store_keeps_the_well_known_socket() {
+        let resolved = store_selected_socket_path(None, &inputs()).expect("resolve");
+        assert_eq!(
+            resolved,
+            PathBuf::from("/home/whale/.codewhale/run/daemon.sock")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn distinct_stores_derive_distinct_sibling_sockets() {
+        let one = store_selected_socket_path(
+            Some(Path::new("/home/whale/.local/state/one/runtime")),
+            &inputs(),
+        )
+        .expect("resolve");
+        let two = store_selected_socket_path(
+            Some(Path::new("/home/whale/.local/state/two/runtime")),
+            &inputs(),
+        )
+        .expect("resolve");
+        assert_eq!(
+            one.parent().unwrap(),
+            Path::new("/home/whale/.codewhale/run")
+        );
+        assert_eq!(one.parent().unwrap(), two.parent().unwrap());
+        assert_ne!(one, two);
+        let name = one.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("store-"), "derived name: {name}");
+        assert!(name.ends_with(".sock"), "derived name: {name}");
+        assert_eq!(name.len(), 23, "derived name: {name}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_derived_socket_is_a_pure_function_of_the_store_root() {
+        let store = Path::new("/home/whale/.local/state/one/runtime");
+        let first = store_selected_socket_path(Some(store), &inputs()).expect("resolve");
+        let second = store_selected_socket_path(Some(store), &inputs()).expect("resolve");
+        assert_eq!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_sockets_stay_within_the_kernel_path_budget() {
+        // The longest realistic parent (macOS app support) plus a long store
+        // path must still resolve: the derived name is a fixed 23 bytes.
+        let macos = SocketPathInputs {
+            user_home: Some(PathBuf::from("/Users/whale")),
+            macos: true,
+            ..inputs()
+        };
+        let store = PathBuf::from(format!(
+            "/Users/whale/Library/Application Support/Code/User/globalStorage/ext/runtime/ws-{}",
+            "a".repeat(16)
+        ));
+        let resolved = store_selected_socket_path(Some(&store), &macos).expect("resolve");
+        assert!(resolved.as_os_str().len() <= MAX_SOCKET_PATH_BYTES);
     }
 
     #[test]

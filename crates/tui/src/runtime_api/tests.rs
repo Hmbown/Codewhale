@@ -15,6 +15,8 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 mod command_catalog;
+#[cfg(unix)]
+mod control_socket_selection;
 mod headless_catalog;
 #[cfg(unix)]
 mod owner_bootstrap;

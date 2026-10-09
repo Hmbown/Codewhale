@@ -68,7 +68,7 @@ pub fn ensure_snapshot_dir(workspace: &Path) -> io::Result<PathBuf> {
 /// Strip a trailing `.worktrees/<name>` segment so all worktrees of the
 /// same checkout share a `project_hash`. If the path doesn't look like a
 /// worktree it's returned unchanged.
-fn strip_worktree_suffix(path: &Path) -> PathBuf {
+pub(crate) fn strip_worktree_suffix(path: &Path) -> PathBuf {
     let mut components: Vec<_> = path.components().collect();
     if components.len() >= 2
         && let Some(parent) = components.get(components.len() - 2)
@@ -86,7 +86,11 @@ fn strip_worktree_suffix(path: &Path) -> PathBuf {
 
 /// Hex-encoded deterministic FNV-1a digest. This is only a directory tag, not
 /// a security boundary, but it must remain stable across process launches.
-fn stable_hex(path: &Path) -> String {
+///
+/// `pub(crate)` because the workspace drive lease derives its own file layout
+/// from the same project/worktree split (`workspace_lease::WorkspaceDriveLease::lease_path`),
+/// and two copies of this hash would be two things to keep in step.
+pub(crate) fn stable_hex(path: &Path) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in path.to_string_lossy().as_bytes() {
         hash ^= u64::from(*byte);
