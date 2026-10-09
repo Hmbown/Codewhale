@@ -83,15 +83,15 @@ impl WorkspaceFile {
 
     /// Open under a root that may itself be reached through user-owned links:
     /// the application's own state directory, which a user may have relocated
-    /// behind a symlink or junction. The root is resolved once; the path below
-    /// it is still link-refusing. Not for a caller-supplied workspace root.
+    /// behind a symlink. The Unix opener already resolves the root and still
+    /// refuses every link below it, so this is the same call under a name that
+    /// says why a caller wants it. Not for a caller-supplied workspace root.
     pub(crate) fn open_resolved_root(
         workspace: &Path,
         relative: &Path,
         create: bool,
     ) -> io::Result<Self> {
-        let resolved = workspace.canonicalize()?;
-        Self::open(&resolved, relative, create)
+        Self::open(workspace, relative, create)
     }
 
     fn open_confined(

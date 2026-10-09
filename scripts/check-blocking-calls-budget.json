@@ -179,7 +179,7 @@
     "std_fs": 1
   },
   "crates/tui/src/fleet/files.rs": {
-    "path_canonicalize": 1,
+    "path_canonicalize": 2,
     "std_fs": 6,
     "thread_sleep": 1
   },
