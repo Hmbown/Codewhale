@@ -122,6 +122,11 @@ pub(crate) fn set_test_artifact_sessions_root(root: Option<PathBuf>) -> Option<P
     std::mem::replace(&mut *guard, root)
 }
 
+/// The recorded spelling of a session artifact path: for receipts, metadata
+/// and display, not for opening. It is built from the state root as spelled
+/// (a user may have relocated that root behind a link), so an opener must go
+/// through `open_session_relative` instead of this value; readers that do
+/// consume it compare canonicalized forms.
 #[must_use]
 pub fn session_artifact_absolute_path(session_id: &str, relative_path: &Path) -> Option<PathBuf> {
     if !is_valid_session_id(session_id) {
