@@ -24507,6 +24507,8 @@ mod child_permission_gate {
                         "{err}"
                     );
                     if by == ApprovalDecider::User {
+                        // Match the typed message: Display prefixes
+                        // "Failed to authorize tool execution: ".
                         assert!(
                             matches!(err.downcast_ref::<ToolError>(),
                                 Some(ToolError::PermissionDenied { message })
