@@ -11667,6 +11667,60 @@ fn state_path_accepts_a_state_root_relocated_behind_a_junction() {
     );
 }
 
+/// The guards that run after `checked_subagent_state_path` must reach the same
+/// root decision it did. Before they did, the containment check passed and the
+/// write still failed with the same message on the child's first step.
+#[cfg(windows)]
+#[test]
+fn state_writes_follow_a_relocated_state_root() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().join("workspace");
+    let relocated = tmp.path().join("relocated-state");
+    std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+    std::fs::create_dir_all(&relocated).expect("mkdir relocated");
+    let link = workspace.join(".codewhale");
+    let output = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&relocated)
+        .output()
+        .expect("invoke Windows junction creation");
+    assert!(
+        output.status.success(),
+        "failed to create junction: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The manager state file: write_json_atomic and read_subagent_state_file.
+    let mut manager = SubAgentManager::new(workspace.clone(), 1);
+    manager
+        .persist_state()
+        .expect("persist under a relocated state root");
+    manager
+        .load_state()
+        .expect("load under a relocated state root");
+
+    // The child's transcript: the pre-create and append guards.
+    let state_root = normalize_subagent_workspace(&workspace);
+    let writer = SubAgentTranscriptArtifactWriter::create(&state_root, "agent_relocated")
+        .expect("transcript create under a relocated state root");
+    append_private_subagent_transcript(
+        &state_root,
+        &writer.path,
+        b"{\"kind\":\"message\"}\n",
+        true,
+    )
+    .expect("transcript append under a relocated state root");
+
+    let resolved_target = relocated.canonicalize().expect("canonical target");
+    assert!(
+        writer.path.starts_with(&resolved_target),
+        "the transcript must land in the junction target {}: {}",
+        resolved_target.display(),
+        writer.path.display()
+    );
+}
+
 /// The same workspace without the link keeps its state inside the workspace.
 #[test]
 fn state_path_stays_in_the_workspace_without_a_link() {

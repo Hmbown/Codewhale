@@ -10394,7 +10394,7 @@ pub fn load_subagent_transcript_artifact(
 fn remove_subagent_transcript_artifact(state_root: &Path, agent_id: &str) -> Result<bool> {
     let state_root = normalize_subagent_workspace(state_root);
     let path = checked_subagent_transcript_artifact_path(&state_root, agent_id)?;
-    reject_root_relative_symlinks(&state_root, &path)?;
+    reject_state_path_symlinks(&state_root, &path)?;
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -10494,6 +10494,16 @@ fn effective_state_root(state_root: &Path, state_path: &Path) -> PathBuf {
         Ok(resolved) if path_is_within_state_root(state_path, &resolved) => resolved,
         _ => state_root.to_path_buf(),
     }
+}
+
+/// [`reject_root_relative_symlinks`] for a path that may sit under a state
+/// root the user relocated behind a link. Every guard that runs after
+/// `checked_subagent_state_path` must reach the same root decision it did, or
+/// a relocated root passes that check and fails the write; roots outside this
+/// module's state layout come back unchanged from [`effective_state_root`].
+fn reject_state_path_symlinks(state_root: &Path, path: &Path) -> Result<()> {
+    let root = effective_state_root(state_root, path);
+    reject_root_relative_symlinks(&root, path)
 }
 
 /// Canonicalize `path` when it exists; otherwise canonicalize the deepest
@@ -10739,7 +10749,7 @@ const MAX_SUBAGENT_STATE_BYTES: u64 = 16 * 1024 * 1024;
 
 fn read_subagent_state_file(state_root: &Path, path: &Path) -> Result<String> {
     let state_root = normalize_subagent_workspace(state_root);
-    reject_root_relative_symlinks(&state_root, path)?;
+    reject_state_path_symlinks(&state_root, path)?;
     let metadata = fs::symlink_metadata(path)?;
     let file_type = metadata.file_type();
     if file_type.is_symlink() || !file_type.is_file() {
@@ -10779,14 +10789,14 @@ fn open_subagent_state_file(path: &Path) -> Result<fs::File> {
 }
 
 fn prepare_subagent_transcript_parent(state_root: &Path, path: &Path) -> Result<()> {
-    reject_root_relative_symlinks(state_root, path)?;
+    reject_state_path_symlinks(state_root, path)?;
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("sub-agent transcript artifact must have a parent directory"))?;
     fs::create_dir_all(parent)?;
     // Re-check after creation so a pre-existing component cannot redirect the
     // private transcript outside the state root.
-    reject_root_relative_symlinks(state_root, path)?;
+    reject_state_path_symlinks(state_root, path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -10809,7 +10819,7 @@ fn append_private_subagent_transcript(
     bytes: &[u8],
     durable: bool,
 ) -> Result<()> {
-    reject_root_relative_symlinks(state_root, path)?;
+    reject_state_path_symlinks(state_root, path)?;
     let mut file = open_private_subagent_transcript(path, true)?;
     if !bytes.is_empty() {
         file.write_all(bytes)?;
@@ -10880,7 +10890,7 @@ static STATE_PUBLISH_SEQUENCES: std::sync::OnceLock<parking_lot::Mutex<HashMap<P
 
 fn write_json_atomic(state_root: &Path, path: &Path, value: &PersistedSubAgentState) -> Result<()> {
     let state_root = normalize_subagent_workspace(state_root);
-    reject_root_relative_symlinks(&state_root, path)?;
+    reject_state_path_symlinks(&state_root, path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
