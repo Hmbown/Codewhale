@@ -19,10 +19,10 @@ use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
 use crate::tui::widgets::{ApprovalWidget, Renderable};
 use codewhale_localization::{Locale, MessageId, tr};
 
-#[cfg(test)]
-use super::RiskLevel;
 use super::previews::exact_edit_file_preview_lines;
 use super::{ApprovalRequest, ReviewDecision};
+#[cfg(test)]
+use crate::core::authority::RiskLevel;
 
 /// Indices into the option list shared by both variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

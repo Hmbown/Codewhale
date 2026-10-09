@@ -15397,7 +15397,7 @@ pub(crate) fn stub_runtime() -> SubAgentRuntime {
         fork_context: None,
         parent_mode: AppMode::Agent,
         auto_review_policy: std::sync::Arc::new(
-            crate::tui::auto_review::AutoReviewPolicy::default(),
+            crate::core::authority::auto_review::AutoReviewPolicy::default(),
         ),
         parent_can_prompt: false,
         approval_receipt_store: Some(Ok(crate::approval_log::ApprovalReceiptStore::new(
@@ -23938,7 +23938,7 @@ mod child_permission_gate {
             crate::approval_log::ApprovalReceiptStore::new(tmp.path().join("sessions")),
         ));
         runtime = runtime.with_permission_posture(
-            std::sync::Arc::new(crate::tui::auto_review::AutoReviewPolicy::default()),
+            std::sync::Arc::new(crate::core::authority::auto_review::AutoReviewPolicy::default()),
             parent_can_prompt,
         );
         let manager = Arc::clone(&runtime.manager);
@@ -25460,7 +25460,7 @@ mod child_permission_gate {
             "rm -rf {}",
             shlex::try_quote(&build.to_string_lossy()).unwrap()
         );
-        // Parent classification is covered in tui::auto_review; this runtime
+        // Parent classification is covered in core::authority::auto_review; this runtime
         // test proves the child actually executes and preserves the gate receipt.
         registry
             .execute("agent_gate", "bash", json!({"command": command}))

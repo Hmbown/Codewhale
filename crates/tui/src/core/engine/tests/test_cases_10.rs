@@ -559,6 +559,7 @@ async fn runtime_contract_tool_metric_uses_canonical_mode_surfaces() {
         "get_goal",
         "update_goal",
         "edit",
+        "file_search",
         "read",
         "todo_write",
         "tool_search",

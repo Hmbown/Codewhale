@@ -35,7 +35,8 @@ forms; consumers fit that envelope rather than fitting each changing shape.
 
 The presentation samples 980 interior points from the existing filled pet mark,
 preserving its eye, mouth and curled negative space at home. During activity,
-all 980 points become one centered character at the whale's full footprint.
+all 980 points become the prepared activity character at the whale's full
+footprint; tool use is the two-character `工具`.
 Every occupied glyph-mask pixel receives a particle, preserving stroke detail
 in compact views. No separate tool icon overlays the character.
 
@@ -49,8 +50,8 @@ the filled whale at rest, without the cycle or swim.
 `build-dot-glyphs.py --whale-body` reproducibly derives the
 interior sampling from the pinned alpha mask in `pet/public/whale.png`.
 
-The glyphs are `读 写 搜 试 行 览 控 记 用 思 答 协 待 成`: reading, editing,
-searching, testing, executing, browsing, computer use, memory, generic tool use,
+The glyphs are `读 写 搜 试 行 览 控 记 工具 思 答 协 待 成`: reading, editing,
+searching, testing, executing, browsing, computer use, memory, tool,
 thinking, responding, delegating, waiting and completion. Flowing ink and light
 express the action within the character: reading scans rows, searching moves a
 spotlight, writing traces across strokes, memory draws light inward and

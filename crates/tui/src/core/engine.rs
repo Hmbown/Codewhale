@@ -104,11 +104,12 @@ const GOAL_CONTINUATION_FAILURE_DETAIL_MAX_BYTES: usize = 512;
 const PLAN_SHELL_NETWORK_DENIED_HINT: &str = "Shell command blocked: in Plan mode shell commands run in a read-only sandbox with no writes and no network access. The user can change modes with /mode.";
 
 fn context_pressure_message(usage_percent: f64) -> Option<&'static str> {
-    if usage_percent >= crate::tui::context_inspector::CONTEXT_CRITICAL_THRESHOLD_PERCENT {
+    if usage_percent >= codewhale_runtime::context_budget::CONTEXT_CRITICAL_THRESHOLD_PERCENT {
         Some(
             "Context pressure: critical — CRITICAL: stop expanding scope; run /compact immediately or finish the current task",
         )
-    } else if usage_percent >= crate::tui::context_inspector::CONTEXT_WARNING_THRESHOLD_PERCENT {
+    } else if usage_percent >= codewhale_runtime::context_budget::CONTEXT_WARNING_THRESHOLD_PERCENT
+    {
         Some(
             "Context pressure: warning — ESCALATED: prefer /compact, narrow scope, or finish the current task",
         )
@@ -355,7 +356,7 @@ pub struct EngineConfig {
     /// Feature flags controlling tool availability.
     pub features: Features,
     /// Deterministic auto-review policy for tool calls.
-    pub auto_review_policy: crate::tui::auto_review::AutoReviewPolicy,
+    pub auto_review_policy: crate::core::authority::auto_review::AutoReviewPolicy,
     /// Auto-compaction settings for long conversations.
     pub compaction: CompactionConfig,
     /// Shared Todo list state.
@@ -604,7 +605,7 @@ impl Default for EngineConfig {
             launch_concurrency: DEFAULT_MAX_SUBAGENTS,
             subagents_enabled: true,
             features: Features::with_defaults(),
-            auto_review_policy: crate::tui::auto_review::AutoReviewPolicy::default(),
+            auto_review_policy: crate::core::authority::auto_review::AutoReviewPolicy::default(),
             compaction: CompactionConfig::default(),
             todos: new_shared_todo_list(),
             plan_state: new_shared_plan_state(),
@@ -909,7 +910,7 @@ pub struct Engine {
     subagent_manager: SharedSubAgentManager,
     /// The deterministic Auto-Review policy shared with every child runtime
     /// so children are gated by the same rules as the parent turn.
-    shared_auto_review_policy: Arc<crate::tui::auto_review::AutoReviewPolicy>,
+    shared_auto_review_policy: Arc<crate::core::authority::auto_review::AutoReviewPolicy>,
     shell_manager: SharedShellManager,
     /// Read-before-edit snapshots live for the session, not for one turn's
     /// transient `ToolContext` (#4475).
@@ -4610,7 +4611,7 @@ impl Engine {
         // Emit it only when the snapshot actually changed since the last
         // emitted block; the model can always run `git status` for a fresh
         // read.
-        if let Some(git_snapshot) = crate::tui::workspace_context::collect(&self.config.workspace) {
+        if let Some(git_snapshot) = crate::git_status::collect(&self.config.workspace) {
             let mut last = self
                 .last_turn_meta_git_snapshot
                 .lock()
@@ -7254,8 +7255,7 @@ impl Engine {
         }
         let trusted = crate::workspace_trust::WorkspaceTrust::load_for(&self.session.workspace);
         let mut trusted_external_paths = trusted.paths().to_vec();
-        let clipboard_images_dir =
-            crate::tui::clipboard::clipboard_images_dir(&self.session.workspace);
+        let clipboard_images_dir = crate::config::clipboard_images_dir(&self.session.workspace);
         if !trusted_external_paths
             .iter()
             .any(|path| path == &clipboard_images_dir)
@@ -8945,8 +8945,8 @@ pub(crate) fn auto_review_run_origin_for_plan(detached_start: bool) -> RunOrigin
 }
 
 pub(crate) fn auto_review_plan_decision_for_context(
-    policy: &crate::tui::auto_review::AutoReviewPolicy,
-    context: &crate::tui::auto_review::AutoReviewContext<'_>,
+    policy: &crate::core::authority::auto_review::AutoReviewPolicy,
+    context: &crate::core::authority::auto_review::AutoReviewContext<'_>,
 ) -> (AutoReviewPlanDecision, Value) {
     let decision = policy.evaluate(context);
     let audit_event = policy.audit_event(context, &decision);
@@ -8959,13 +8959,17 @@ pub(crate) fn auto_review_plan_decision_for_context(
         AutoReviewPlanDecision::Allow
     } else {
         match decision.action {
-            crate::tui::auto_review::AutoReviewAction::Allow
+            crate::core::authority::auto_review::AutoReviewAction::Allow
                 if context.approval_mode == ApprovalMode::Auto =>
             {
                 AutoReviewPlanDecision::Allow
             }
-            crate::tui::auto_review::AutoReviewAction::Allow => AutoReviewPlanDecision::NoChange,
-            crate::tui::auto_review::AutoReviewAction::AskUser if decision.built_in_safety_gate => {
+            crate::core::authority::auto_review::AutoReviewAction::Allow => {
+                AutoReviewPlanDecision::NoChange
+            }
+            crate::core::authority::auto_review::AutoReviewAction::AskUser
+                if decision.built_in_safety_gate =>
+            {
                 // Name the built-in gate honestly.
                 let reason = format!(
                     "Built-in safety gate requires approval: {}",
@@ -8983,13 +8987,15 @@ pub(crate) fn auto_review_plan_decision_for_context(
                     AutoReviewPlanDecision::ForcePrompt(reason)
                 }
             }
-            crate::tui::auto_review::AutoReviewAction::AskUser
+            crate::core::authority::auto_review::AutoReviewAction::AskUser
                 if context.approval_mode == ApprovalMode::Auto =>
             {
                 AutoReviewPlanDecision::ConsultReviewer(decision.reason.clone())
             }
-            crate::tui::auto_review::AutoReviewAction::AskUser => AutoReviewPlanDecision::NoChange,
-            crate::tui::auto_review::AutoReviewAction::Block => {
+            crate::core::authority::auto_review::AutoReviewAction::AskUser => {
+                AutoReviewPlanDecision::NoChange
+            }
+            crate::core::authority::auto_review::AutoReviewAction::Block => {
                 AutoReviewPlanDecision::Block(format!(
                     "Auto-review policy blocked tool '{}': {}",
                     context.tool_name, decision.reason
