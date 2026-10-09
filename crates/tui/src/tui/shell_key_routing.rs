@@ -1103,4 +1103,43 @@ mod tests {
             assert_ne!(binding.footer_chord, "v");
         }
     }
+
+    #[test]
+    fn shell_binding_source_matches_help_catalog_chords() {
+        assert_eq!(binding(ShellBindingId::ToolDetails).catalog_chord, "Alt+V");
+        assert_eq!(
+            binding(ShellBindingId::ContextInspector).catalog_chord,
+            "/context"
+        );
+        assert_eq!(
+            binding(ShellBindingId::ProviderRoute).catalog_chord,
+            "F3 / /provider"
+        );
+        assert_eq!(binding(ShellBindingId::Help).catalog_chord, "F1 / Ctrl+/");
+        // Every ordinary shell binding: exclusive redaction choices are
+        // advertised only by their consent screen, never as global shortcuts.
+        // The two that were
+        // not covered had already drifted (the view-cycle chord read
+        // "Ctrl+] / Ctrl+Tab" here and "Ctrl+Tab / Ctrl+]" at the source),
+        // which is exactly the rot this module's doc comment warns about.
+        for id in [
+            ShellBindingId::ToolDetails,
+            ShellBindingId::ContextInspector,
+            ShellBindingId::ProviderRoute,
+            ShellBindingId::Help,
+            ShellBindingId::Settings,
+            ShellBindingId::ModeCycle,
+            ShellBindingId::PermissionCycle,
+            ShellBindingId::ViewCycle,
+            ShellBindingId::ViewCycleBack,
+        ] {
+            let chord = binding(id).catalog_chord;
+            assert!(
+                crate::keybinding_table::KEYBINDINGS
+                    .iter()
+                    .any(|entry| entry.chord == chord || entry.chord.contains(chord)),
+                "shell binding {id:?} chord missing from help catalog: {chord}"
+            );
+        }
+    }
 }

@@ -477,7 +477,7 @@ owner = "crates/tui/src/lsp"
 [[feature]]
 id = "runtime-api"
 name = "Runtime API"
-summary = "Local HTTP API for threads, events and approvals, with scoped watch/drive device tokens."
+summary = "Local HTTP API for threads, events and approvals, with scoped watch/drive device tokens and account-bound model turns."
 status = "stable"
 surfaces = { api = "stable" }
 docs = "docs/RUNTIME_API.md"
@@ -519,7 +519,7 @@ summary = "Terminal key bindings, documented from the keybinding catalog."
 status = "stable"
 surfaces = { tui = "stable" }
 docs = "docs/KEYBINDINGS.md"
-owner = "crates/tui/src/tui/keybindings.rs"
+owner = "crates/tui/src/keybinding_table.rs"
 
 [[feature]]
 id = "settings"
@@ -580,6 +580,15 @@ summary = "/login signs in to Codewhale or stores provider keys."
 status = "stable"
 surfaces = { tui = "stable" }
 owner = "crates/tui/src/commands/groups/config/config.rs"
+
+[[feature]]
+id = "account-computer-files"
+name = "Account computer files"
+summary = "Save computer files as account versions, restore with revision checks, and download verified bytes."
+status = "experimental"
+surfaces = { tui = "preview" }
+since = "unreleased"
+owner = "crates/cli/src/cloud.rs"
 
 [[feature]]
 id = "context-anchors"

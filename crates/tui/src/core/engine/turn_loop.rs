@@ -1296,14 +1296,17 @@ impl Engine {
     async fn consult_auto_review_guardian(
         &self,
         client: &dyn crate::core::model_client::ModelClient,
-        context: &crate::tui::auto_review::AutoReviewContext<'_>,
+        context: &crate::core::authority::auto_review::AutoReviewContext<'_>,
         tool_input: &Value,
         held_reason: &str,
         tool_id: &str,
         turn: &mut TurnContext,
     ) -> Result<(), ToolError> {
-        let context_text =
-            crate::tui::auto_review::build_reviewer_context(context, held_reason, tool_input);
+        let context_text = crate::core::authority::auto_review::build_reviewer_context(
+            context,
+            held_reason,
+            tool_input,
+        );
         let _ = self
             .send_event(Event::status(format!(
                 "Auto-Review checking '{}'",
@@ -1428,8 +1431,7 @@ impl Engine {
             .terminal_chrome_enabled
             .then(crate::sleep_guard::SleepGuard::hold);
         if self.config.terminal_chrome_enabled {
-            crate::tui::notifications::set_taskbar_progress_busy();
-            crate::tui::notifications::start_title_animation("codewhale");
+            crate::host_terminal::host().begin_turn_chrome();
         }
 
         let client = self
@@ -2150,7 +2152,7 @@ impl Engine {
 
             if blocked_error.is_none() {
                 let review_context =
-                    crate::tui::auto_review::AutoReviewContext::from_tool_call_async(
+                    crate::core::authority::auto_review::AutoReviewContext::from_tool_call_async(
                         &tool_name,
                         &tool_input,
                         if self.is_acp_turn() {
@@ -2190,10 +2192,10 @@ impl Engine {
                                 }
                             }
                             AutoReviewPlanDecision::ForcePrompt(reason) => {
-                                // The built-in safety floor is deliberately
-                                // non-bypassable. Ask/Auto-Review surface the hold;
-                                // Full Access turns this disposition into a hard
-                                // block below, without opening a modal.
+                                // The built-in safety floor holds outside Full
+                                // Access. Ask surfaces the hold as a real
+                                // decision; the non-interactive postures turn
+                                // this disposition into a hard block below.
                                 approval_required = true;
                                 approval_description = reason;
                                 approval_force_prompt = true;
@@ -2977,6 +2979,15 @@ impl Engine {
 
                     if is_tool_search_tool(&tool_name) {
                         let started_at = Instant::now();
+                        let activity_tx = self.tx_event.clone();
+                        let activity = super::tool_execution::OperationSpanGuard::start(
+                            &activity_tx,
+                            &tool_id,
+                            codewhale_protocol::engine_owner::OwnerActivityKind::Searching,
+                            Some(crate::tools::activity::action_id(&tool_name, &tool_input)),
+                            Some(self.cancel_token.clone()),
+                        )
+                        .await;
                         // Tool-search activation changes the request-visible
                         // catalog for the rest of the turn; declare it so the
                         // next request re-pins under `change:tool_surface`
@@ -3000,6 +3011,12 @@ impl Engine {
                                 &mut self.session.tool_activation_cache,
                             )
                         });
+                        activity
+                            .complete(crate::tools::activity::operation_outcome(
+                                &result.clone().map(RichToolResult::plain),
+                                self.cancel_token.is_cancelled(),
+                            ))
+                            .await;
                         if *active_tool_names != active_before_search {
                             self.session.pending_prefix_change_reason =
                                 Some("tool_surface".to_string());
@@ -3034,12 +3051,31 @@ impl Engine {
                             &tool_input,
                             self.config.user_input_limits,
                         ) {
-                            Ok(request) => self.await_user_input(&tool_id, request).await.and_then(
-                                |response| {
-                                    ToolResult::json(&response)
-                                        .map_err(|e| ToolError::execution_failed(e.to_string()))
-                                },
-                            ),
+                            Ok(request) => {
+                                let activity_tx = self.tx_event.clone();
+                                let activity = super::tool_execution::OperationSpanGuard::start(
+                                    &activity_tx,
+                                    &tool_id,
+                                    codewhale_protocol::engine_owner::OwnerActivityKind::Tool,
+                                    Some("request_user_input".into()),
+                                    Some(self.cancel_token.clone()),
+                                )
+                                .await;
+                                let result = self
+                                    .await_user_input(&tool_id, request)
+                                    .await
+                                    .and_then(|response| {
+                                        ToolResult::json(&response)
+                                            .map_err(|e| ToolError::execution_failed(e.to_string()))
+                                    });
+                                activity
+                                    .complete(crate::tools::activity::operation_outcome(
+                                        &result.clone().map(RichToolResult::plain),
+                                        self.cancel_token.is_cancelled(),
+                                    ))
+                                    .await;
+                                result
+                            }
                             Err(err) => Err(err),
                         };
 
@@ -3915,6 +3951,15 @@ impl Engine {
         // nothing is activated, so the session-pinned tool array and prefix
         // never change.
         if is_tool_search_tool(&plan.name) {
+            let activity_tx = self.tx_event.clone();
+            let activity = super::tool_execution::OperationSpanGuard::start(
+                &activity_tx,
+                &nested_id,
+                codewhale_protocol::engine_owner::OwnerActivityKind::Searching,
+                Some(crate::tools::activity::action_id(&plan.name, &plan.input)),
+                Some(self.cancel_token.clone()),
+            )
+            .await;
             if let Err(error) = self
                 .discover_mcp_for_tool_search(
                     (&plan.name, &plan.input),
@@ -3925,13 +3970,25 @@ impl Engine {
                 )
                 .await
             {
+                activity
+                    .complete(crate::tools::activity::operation_outcome(
+                        &Err(error.clone()),
+                        self.cancel_token.is_cancelled(),
+                    ))
+                    .await;
                 return NestedCallVerdict::Refused {
                     error,
                     decision: NestedDecision::Refused,
                 };
             }
-            return match super::tool_catalog::describe_tools_for_program(&plan.input, tool_catalog)
-            {
+            let result = super::tool_catalog::describe_tools_for_program(&plan.input, tool_catalog);
+            activity
+                .complete(crate::tools::activity::operation_outcome(
+                    &result.clone().map(RichToolResult::plain),
+                    self.cancel_token.is_cancelled(),
+                ))
+                .await;
+            return match result {
                 Ok(result) => NestedCallVerdict::Answered {
                     result,
                     hook_context,

@@ -9,12 +9,12 @@ import type { ConstitutionDict } from "../types";
 export const constitution: ConstitutionDict = {
   metaTitle: "Three layers of law · Codewhale",
   metaDescription:
-    "Codewhale's nested constitution: bundled base law, your standing law (/constitution), and your repo's law (.codewhale/constitution.json). Rank is enforced in the harness and survives a model swap.",
+    "Codewhale's nested constitution: bundled base law, your standing law (/constitution), and your repo's law (.codewhale/constitution.json). Rank is enforced in code and survives a model swap.",
   kicker: "The thesis",
   title: "Three layers of law",
   titleAside: "三层法",
   titleAsideLang: "zh",
-  lede: "As a project ages, instructions pile up and conflict: the original spec, a refactor that contradicts it, stale memory, a previous agent's handoff, your current request, fresh test output that doesn't match what the handoff claimed. A flat system prompt makes the model resolve that by guess. Codewhale uses a nested constitution with a defined rank. The harness enforces the order, tests assert it can't drift, and it stays intact when you swap models.",
+  lede: "As a project ages, instructions pile up and conflict: the original spec, a refactor that contradicts it, stale memory, a previous agent's handoff, your current request, fresh test output that doesn't match what the handoff claimed. A flat system prompt makes the model resolve that by guess. Codewhale uses a nested constitution with a defined rank. The order is enforced in code, tests assert it can't drift, and it stays intact when you swap models.",
   since: "Since v0.9.0",
   sinceBody:
     "Constitution-first setup — first launch walks language, model, posture, and your constitution; /setup any time. The model can draft it. You ratify it.",

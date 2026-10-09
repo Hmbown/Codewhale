@@ -8016,7 +8016,6 @@ fn every_named_role_has_one_complete_capability_based_surface() {
         "diagnostics",
         "edit",
         "file_search",
-        "fim_edit",
         "finance",
         "get_goal",
         "github",
@@ -8361,6 +8360,7 @@ fn small_surface_starts_with_core_tools_and_read_only_goal_control() {
             "agent",
             "bash",
             "edit",
+            "file_search",
             "get_goal",
             "load_skill",
             "read",
@@ -8743,6 +8743,7 @@ fn small_surface_depth_cap_removes_only_agent() {
         [
             "bash",
             "edit",
+            "file_search",
             "get_goal",
             "load_skill",
             "read",
@@ -9659,7 +9660,7 @@ async fn scout_shell_respects_parent_shell_and_network_ceilings() {
 }
 
 #[test]
-fn implementer_catalog_inherits_patch_and_fim_when_enabled() {
+fn implementer_catalog_hides_fim_on_unsupported_route() {
     let tmp = tempdir().expect("tempdir");
     let mut runtime =
         stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
@@ -9674,12 +9675,16 @@ fn implementer_catalog_inherits_patch_and_fim_when_enabled() {
 
     let tools = registry.tools_for_model(&FleetRole::Builder);
     let names = tool_names(tools.clone());
-    for name in ["read", "write", "edit", "fim_edit"] {
+    for name in ["read", "write", "edit"] {
         assert!(
             names.contains(name),
             "Implementer should inherit write-capable tool {name}"
         );
     }
+    assert!(
+        !names.contains("fim_edit"),
+        "Implementer must not advertise FIM on its unsupported route"
+    );
     // The lowercase write/edit primitives carry their own path-bound schemas;
     // the legacy action-enum File family stays registered for transcripts.
     for name in ["write", "edit"] {
@@ -15392,7 +15397,7 @@ pub(crate) fn stub_runtime() -> SubAgentRuntime {
         fork_context: None,
         parent_mode: AppMode::Agent,
         auto_review_policy: std::sync::Arc::new(
-            crate::tui::auto_review::AutoReviewPolicy::default(),
+            crate::core::authority::auto_review::AutoReviewPolicy::default(),
         ),
         parent_can_prompt: false,
         approval_receipt_store: Some(Ok(crate::approval_log::ApprovalReceiptStore::new(
@@ -23933,7 +23938,7 @@ mod child_permission_gate {
             crate::approval_log::ApprovalReceiptStore::new(tmp.path().join("sessions")),
         ));
         runtime = runtime.with_permission_posture(
-            std::sync::Arc::new(crate::tui::auto_review::AutoReviewPolicy::default()),
+            std::sync::Arc::new(crate::core::authority::auto_review::AutoReviewPolicy::default()),
             parent_can_prompt,
         );
         let manager = Arc::clone(&runtime.manager);
@@ -25455,7 +25460,7 @@ mod child_permission_gate {
             "rm -rf {}",
             shlex::try_quote(&build.to_string_lossy()).unwrap()
         );
-        // Parent classification is covered in tui::auto_review; this runtime
+        // Parent classification is covered in core::authority::auto_review; this runtime
         // test proves the child actually executes and preserves the gate receipt.
         registry
             .execute("agent_gate", "bash", json!({"command": command}))
@@ -25467,21 +25472,18 @@ mod child_permission_gate {
 
     /// Review finding on d1655c424: judging agent calls as foreground let a
     /// detached agent run catastrophic work. Nobody watches a detached agent,
-    /// so the floor holds for it in every posture, Full Access included.
+    /// so the floor holds for it in the reviewing postures. Full Access
+    /// judges the call exactly as the parent turn does and does not apply
+    /// the floor.
     #[tokio::test]
-    async fn a_detached_agents_catastrophic_shell_is_held_in_every_posture() {
+    async fn a_detached_agents_catastrophic_shell_is_held_in_the_reviewing_postures() {
         for mode in [
-            ApprovalMode::Bypass,
             ApprovalMode::Auto,
             ApprovalMode::Suggest,
             ApprovalMode::Never,
         ] {
-            let (registry, mut rx, manager) = worker_registry(
-                mode,
-                mode == ApprovalMode::Bypass,
-                false,
-                Some(unreachable_client()),
-            );
+            let (registry, mut rx, manager) =
+                worker_registry(mode, false, false, Some(unreachable_client()));
             assert!(registry.gate_runtime.foreground_children.is_none());
             let (receipt_store, session_id) = receipt_context(&registry);
             for (index, command) in [
@@ -25546,6 +25548,22 @@ mod child_permission_gate {
                 }),
                 "{mode:?}: the floor never reaches a guardian: {receipts:?}"
             );
+        }
+
+        // Full Access: the detached call runs — only the harmless fixture is
+        // dispatched, so a regression can never touch a real system path.
+        {
+            let (registry, mut rx, _) = worker_registry(ApprovalMode::Bypass, true, false, None);
+            assert!(registry.gate_runtime.foreground_children.is_none());
+            registry
+                .execute(
+                    "agent_gate",
+                    "bash",
+                    json!({ "command": "dd if=/dev/zero of=/dev/null count=0" }),
+                )
+                .await
+                .expect("Full Access runs a detached destructive call");
+            assert!(drain_gate_receipts(&mut rx).is_empty());
         }
     }
 
@@ -25618,7 +25636,7 @@ mod child_permission_gate {
     }
 
     #[tokio::test]
-    async fn full_access_runs_ordinary_shell_but_still_hard_blocks_the_safety_floor() {
+    async fn full_access_runs_ordinary_and_destructive_shell_without_a_prompt() {
         let (registry, mut rx, _) = worker_registry(ApprovalMode::Bypass, true, true, None);
         let output = registry
             .execute("agent_gate", "bash", json!({"command": "echo full-access"}))
@@ -25626,21 +25644,28 @@ mod child_permission_gate {
             .expect("Full Access runs ordinary shell without a prompt");
         assert!(output.contains("full-access"), "{output}");
         assert!(drain_gate_receipts(&mut rx).is_empty());
-        // This harness agent is detached (no foreground turn owns it), and
-        // destructive detached work holds in every posture, exactly as it
-        // does for a detached parent start: Full Access fails closed here.
-        let err = registry
-            .execute("agent_gate", "bash", json!({"command": "rm -rf /usr"}))
-            .await
-            .expect_err("destructive background shell stays blocked in Full Access");
-        assert!(
-            err.to_string().to_lowercase().contains("destructive")
-                || err.to_string().to_lowercase().contains("safety"),
-            "{err}"
+        // A forced recursive delete is a destructive action kind, and this
+        // harness agent is detached (no foreground turn owns it). Full Access
+        // still runs it: the floor guards the reviewing postures, not Bypass.
+        let workspace = registry.gate_runtime.context.workspace.clone();
+        let doomed = workspace.join("full-access-doomed");
+        std::fs::create_dir_all(&doomed).unwrap();
+        #[cfg(windows)]
+        let command = format!(
+            "Remove-Item -LiteralPath '{}' -Recurse -Force",
+            doomed.to_string_lossy().replace('\'', "''")
         );
-        let receipts = drain_gate_receipts(&mut rx);
-        assert_eq!(receipts.len(), 1, "{receipts:?}");
-        assert_eq!(receipts[0].1, ToolGateVerdict::Denied);
+        #[cfg(not(windows))]
+        let command = format!(
+            "rm -rf {}",
+            shlex::try_quote(&doomed.to_string_lossy()).unwrap()
+        );
+        registry
+            .execute("agent_gate", "bash", json!({ "command": command }))
+            .await
+            .expect("Full Access runs a detached destructive call");
+        assert!(!doomed.exists(), "the cleanup actually ran");
+        assert!(drain_gate_receipts(&mut rx).is_empty());
     }
 }
 

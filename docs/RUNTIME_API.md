@@ -1220,6 +1220,19 @@ Without `model`, the turn uses that provider's default model (an `auto` thread
 stays `auto`). The override is always preflighted and is part of the
 `operation_key` fingerprint.
 
+Account-owned model turns require `capabilities.account_model_owner: true` before
+submission. Set `account_model_owner` to the signed-in account ID, both
+`model_provider` and `model_provider_id` to `codewhale`, and `model` to the exact
+`provider/model` account route. The Runtime requires current model access for
+that same secure account session and uses only that account credential; missing,
+expired or revoked access is refused. Local keys and other configured routes are
+not substitutes. A supplied profile constitution must belong to the same account.
+The owner participates in the durable operation fingerprint; replay of an
+already completed exact operation returns its receipt before fresh credential
+admission. The account gateway resolves the selected provider's current saved
+API key at use. Ordinary turns and saved Chat defaults retain their existing
+behavior. The Runtime Chat relay carries the same assertion as `accountModelOwner`.
+
 Resolution is deterministic: a turn override wins over the thread default,
 which wins over the Runtime's normal configuration. For tools, reaching normal
 configuration means the ordinary configured catalog; `[]` is never treated as

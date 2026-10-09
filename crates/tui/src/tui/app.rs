@@ -2779,6 +2779,15 @@ fn default_composer_arrows_scroll_for_platform(use_mouse_capture: bool, _is_wind
 }
 
 impl App {
+    pub(crate) fn should_adopt_live_local_ollama(&mut self) -> bool {
+        crate::local_ollama::should_adopt_live_local_ollama(
+            self.startup_route_configured,
+            self.api_provider,
+            self.view_stack.provider_picker_interacted(),
+            self.onboarding_needs_api_key || self.onboarding_missing_key_recovery,
+        )
+    }
+
     /// A retained roster remains readable only in its owning conversation.
     pub(crate) fn current_agent_roster(&self) -> &[crate::agent_roster::AgentRosterRow] {
         if self

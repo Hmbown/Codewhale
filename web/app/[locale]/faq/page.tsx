@@ -268,7 +268,7 @@ api_key = "sk-or-v1-..."`}
     a: (
       <>
         Codewhale is a bidirectional MCP client and server. Define servers in <code className="inline">~/.codewhale/mcp.json</code>.
-        Tools appear as <code className="inline">mcp_&lt;server&gt;_&lt;tool&gt;</code>. You can also expose Codewhale as an MCP server with <code className="inline">codewhale mcp</code>.
+        Tools appear as <code className="inline">mcp_&lt;server&gt;_&lt;tool&gt;</code>. You can also expose Codewhale as an MCP server with <code className="inline">codewhale serve --mcp</code>.
         See the <Link href={p("/docs/mcp")} className="body-link">docs page</Link> for configuration examples.
       </>
     ),
@@ -629,7 +629,7 @@ api_key = "sk-or-v1-..."`}
     a: (
       <>
         Codewhale 是双向 MCP 客户端和服务器。在 <code className="inline">~/.codewhale/mcp.json</code> 中定义服务器。
-        工具以 <code className="inline">mcp_&lt;server&gt;_&lt;tool&gt;</code> 形式呈现。你也可以通过 <code className="inline">codewhale mcp</code> 将 Codewhale 暴露为 MCP 服务器。
+        工具以 <code className="inline">mcp_&lt;server&gt;_&lt;tool&gt;</code> 形式呈现。你也可以通过 <code className="inline">codewhale serve --mcp</code> 将 Codewhale 暴露为 MCP 服务器。
         查看 <Link href={p("/docs/mcp")} className="body-link">文档页面</Link> 了解配置示例。
       </>
     ),

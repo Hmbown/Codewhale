@@ -5,7 +5,7 @@ import type { MerchSizingProductCode } from "@/lib/merch/sizing";
 const text = {
   title: { en: "Compare garment measurements", zh: "对照成衣尺寸，选择尺码" },
   introduction: { en: "Start with a garment you like: lay it flat and measure its length, shoulders and sleeves. Compare only with the chart for the exact supplier garment; fit and letter sizes differ between styles.", zh: "找一件穿着合适的衣服，平铺后量衣长、肩宽和袖长，再对照对应供应商款式的尺寸表。不同款式的版型和字母尺码不通用。" },
-  guidance: { en: "These are supplier garment measurements, not body measurements or a sample-verified fit guide. We do not guess sizes from height, weight or where you live.", zh: "这里列的是供应商提供的成衣尺寸，不是人体尺寸，也尚未用实物样品验证版型。不按身高、体重或所在地区猜测尺码。" },
+  guidance: { en: "These are supplier garment measurements, not body measurements or a sample-verified fit guide. Do not choose a size from height, weight or where you live.", zh: "这里列的是供应商提供的成衣尺寸，不是人体尺寸，也尚未用实物样品验证版型。不按身高、体重或所在地区猜测尺码。" },
   garment: { en: "Supplier garment", zh: "供应商款式" },
   units: { en: "Measurement units", zh: "尺寸单位" },
   cm: { en: "cm", zh: "厘米" },

@@ -785,6 +785,51 @@ fn offering_key(offering: &ProviderModelOffering) -> (String, String) {
     )
 }
 
+fn offering_with_absent_facts_filled(
+    mut offering: ProviderModelOffering,
+    lower: &ProviderModelOffering,
+) -> ProviderModelOffering {
+    if offering.canonical_model.is_none() {
+        offering.canonical_model.clone_from(&lower.canonical_model);
+    }
+    if offering.limits.context_tokens.is_none() {
+        offering.limits.context_tokens = lower.limits.context_tokens;
+    }
+    if offering.limits.input_tokens.is_none() {
+        offering.limits.input_tokens = lower.limits.input_tokens;
+    }
+    if offering.limits.output_tokens.is_none() {
+        offering.limits.output_tokens = lower.limits.output_tokens;
+    }
+    for (target, source) in [
+        (
+            &mut offering.capabilities.attachments,
+            lower.capabilities.attachments,
+        ),
+        (
+            &mut offering.capabilities.image_input,
+            lower.capabilities.image_input,
+        ),
+        (
+            &mut offering.capabilities.reasoning,
+            lower.capabilities.reasoning,
+        ),
+        (
+            &mut offering.capabilities.native_tool_calls,
+            lower.capabilities.native_tool_calls,
+        ),
+        (
+            &mut offering.capabilities.structured_output,
+            lower.capabilities.structured_output,
+        ),
+    ] {
+        if *target == codewhale_config::route::CapabilityState::Unknown {
+            *target = source;
+        }
+    }
+    offering
+}
+
 fn row_matches_endpoint_fingerprint(row: &CatalogOffering, fingerprint: &str) -> bool {
     matches!(
         &row.source,
@@ -903,7 +948,12 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
     // Curated transport facts win ordinary Models.dev collisions, exactly as
     // in RouteResolver::new(). A fresh exact roster replaces its whole scope.
     for offering in bundled_offerings() {
-        route_offerings.insert(offering_key(&offering), offering);
+        let key = offering_key(&offering);
+        let enriched = match route_offerings.get(&key) {
+            Some(lower) => offering_with_absent_facts_filled(offering, lower),
+            None => offering,
+        };
+        route_offerings.insert(key, enriched);
     }
     // Keep curated transport identity, applying only fields explicitly signed
     // at the lower cloud layer. Hidden rows must not be resurrected here.

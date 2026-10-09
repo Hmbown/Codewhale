@@ -1,13 +1,16 @@
 # Dot-whale habitat and Watch
 
-The underwater transcript uses the portable 980-point whale for its completion
-visitor. The whale is the home form of a persistent field of dots. Version 2
-reorganizes those dots into reasoning knots, woven code, filesystem branches,
-browser layers, circulating traffic and open decision junctions. Original
-recordings retain version 1 behavior; new habitats use version 2. This slice
-replaces the old `≈≈>` / spray / fluke glyph sequence. The explicit Watch panel
-adds foreground telemetry through the same world and score used by native and
-web hosts, with opt-in stereo PCM output through FFmpeg's `ffplay`.
+The original 980-point whale remains the canonical body of one persistent
+world. Its owner now prepares a living-glyph presentation from admitted Engine
+activity: the dots form readable Chinese characters and moving tools, then
+return to the whale. This presentation uses the existing world clock; it does
+not replace the simulation, recording format or score. Original recordings
+retain their expression-version behavior.
+
+The underwater transcript's completion visitor remains a bounded decoration.
+The explicit `/pet` habitat observes foreground activity through the shared
+owner, with opt-in stereo PCM output through FFmpeg's `ffplay`. A reusable
+painter or a captured preview alone does not establish a live client connection.
 
 ## Ownership
 
@@ -20,6 +23,65 @@ web hosts, with opt-in stereo PCM output through FFmpeg's `ffplay`.
 - `pet_cameo.rs` is the completion presentation inside the existing habitat.
   It consumes `WhaleCameo` and `AmbientActivity`; it never reads a wall clock,
   schedules a frame, or classifies model/tool text.
+
+## Living-glyph presentation
+
+`pet/src/core/pet-native.ts` prepares live and Still views of the owner's same
+980-point body. `dot-field.ts` projects those points and their materials from
+the typed activity projection and the supplied world time, and blends changes
+on that clock. It does not step the world, consume randomness or modify the
+canonical checkpoint. The fixed `[-1, 1]` envelope keeps scale stable across
+forms; consumers fit that envelope rather than fitting each changing shape.
+
+The presentation samples 980 interior points from the existing filled pet mark,
+preserving its eye, mouth and curled negative space at home. During activity,
+all 980 points become the prepared activity character at the whale's full
+footprint; tool use is the two-character `工具`.
+Every occupied glyph-mask pixel receives a particle, preserving stroke detail
+in compact views. No separate tool icon overlays the character.
+
+An 8.4-second cycle returns all 980 points to the filled whale between
+expressions, using the presentation's admission timestamp rather than its
+heartbeats. Completion holds its character for 800 ms and settles into the
+whale within 1.7 seconds. The
+materials stay within an ocean palette, with warm glyph accents for waiting or
+observed failure. Still presents the full-size character during activity and
+the filled whale at rest, without the cycle or swim.
+`build-dot-glyphs.py --whale-body` reproducibly derives the
+interior sampling from the pinned alpha mask in `pet/public/whale.png`.
+
+The glyphs are `读 写 搜 试 行 览 控 记 工具 思 答 协 待 成`: reading, editing,
+searching, testing, executing, browsing, computer use, memory, tool,
+thinking, responding, delegating, waiting and completion. Flowing ink and light
+express the action within the character: reading scans rows, searching moves a
+spotlight, writing traces across strokes, memory draws light inward and
+delegating runs concurrent bands. Glyph masks in `dot-glyphs.ts` are generated
+by `pet/scripts/build-dot-glyphs.py`; font provenance and license are in
+`pet/assets/dot-glyphs-LICENSE.txt`. Captions carry the meaning independently of
+color, motion and the viewer's ability to read a small glyph.
+
+The Engine admits `activity_kind` and optional `action_id` on operation start
+and completion. The projection exposes `activityKind` and `actionId`, including
+active spans and the latest failed-tool receipt. An action ID is a bounded
+canonical or admitted integration identifier, at most 256 UTF-8 bytes without
+control characters. It is not a command, path, argument, result or text-derived
+guess. The owner's presentation layer uses the typed kind for the form and the
+safe exact ID for variation; views can show that ID in a caption. Neither layer
+classifies tool names. Unknown or stale observation keeps an honest unobserved
+presentation.
+
+Both prepared poses carry one `[r, g, b, alpha]` material per point. The owner in
+`pet_watch/owner.rs` applies saved appearance, brightness and lighting once.
+These are final RGBA values: consumers must not multiply them by style alpha or
+apply the appearance settings again. A carrier may still dim a stale/offline
+view and adapt ink to terminal capabilities. Reduced motion selects the owner's
+`still` pose rather than running a second simulation or pausing mid-morph.
+
+GPUI and the Ratatui `DotWhale` component consume prepared geometry. The product
+web app has a guarded prepared-frame adapter and an opt-in particle painter,
+but its Runtime/control-plane transport is not wired to those frames yet. The
+owner's authenticated loopback browser companion is a separate connected
+surface; it is not evidence of live product-web integration.
 
 ## Completion is a bounded observation
 
@@ -63,8 +125,9 @@ and does not backfill events from before attachment.
 
 `ui/event_loop.rs` passes accepted foreground Engine events through the existing
 `core::protocol_parity::event_to_protocol` projection. The pet allowlist keeps
-only lifecycle kind, stable ids, tool names, channel and outcome. Prompt text,
-reasoning, arguments, results, paths and routing credentials never enter the
+only lifecycle kind, stable ids, admitted operation kind/action identity,
+channel and outcome. Prompt text, reasoning, arguments, results, paths and
+routing credentials never enter the
 worker queue or pet tape. No session context or KV-cache prefix is changed.
 
 The generated `pet_watch/pet-native.js` comes from the canonical source in `pet/src/core`:
@@ -83,9 +146,9 @@ a failure back to the operation's start. Typed `ShellPhase::Waiting/Approval`
 can extend an already witnessed human request, preserving the outstanding request without approach-to-owner steering.
 
 The presentation companion now owns the one persistent world. Terminal Watch,
-full-screen habitat, browser, macOS window, Apple Shared and Android Shared
-attach to its authenticated loopback snapshots. View interpolation and stillness
-never advance or modify the world. The existing Ratatui draw loop owns pixel
+full-screen habitat, the owner's browser companion, macOS window, Apple Shared
+and Android Shared attach to its authenticated loopback snapshots. View
+interpolation and stillness never advance or modify the world. The existing Ratatui draw loop owns pixel
 placement and cleanup; a successful Kitty query selects pixels, otherwise the
 view uses braille. Full habitat focus uses the existing modal stack.
 

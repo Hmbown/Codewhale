@@ -85,7 +85,9 @@ Sources to keep in sync:
   scoped selector aliases, completion references and pure transport metadata.
   The existing seed renderer embeds this reviewed supplement in Models.dev.
 - `crates/agent/src/lib.rs` - compatibility projection of those shared selector
-  rows for `codewhale model list` and `codewhale model resolve`.
+  rows, used by `codewhale model resolve` (and the `[model]` config surface).
+  `codewhale model list` reads the resolved provider lake instead, so a single
+  list shows bundled, live and configured rows together.
 - `config.example.toml` and `docs/CONFIGURATION.md` - user-facing config
   examples and environment variable reference.
 - `scripts/check-provider-registry.py` - drift check for canonical provider
@@ -1117,8 +1119,11 @@ price. Flash ships the published $0.15/$0.50 list. A live call can still
 
 ## Static Model Registry
 
-`codewhale model list` and `codewhale model resolve` project the reviewed
-`selections` in `crates/config/assets/catalog_corrections.json` through
+This table describes the static registry, which `codewhale model resolve` (and
+the `[model]` config surface) still use to resolve selector aliases.
+
+`codewhale model resolve` projects the reviewed `selections` in
+`crates/config/assets/catalog_corrections.json` through
 `crates/agent/src/lib.rs`. There is no independent Rust model roster. These
 ordered aliases and flags are compatibility metadata, not account availability
 or executable route permission. This differs from live `/models` discovery.

@@ -17,7 +17,7 @@ export const states: StatesDict = {
   reload: "Reload the page",
   homeLink: "Back to the home page",
   docsIndexLink: "Open the documentation index",
-  notFoundTitle: "We all make typos.",
+  notFoundTitle: "Typo in the URL?",
   notFoundBody:
     "This page doesn’t exist yet.\nNeither does this game.",
   notFoundHomeLink: "Return to base",

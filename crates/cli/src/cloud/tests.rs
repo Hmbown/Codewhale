@@ -2114,7 +2114,14 @@ fn account_computers_use_the_same_account_api_and_report_queued_starts() {
         vec!["codewhale", "account", "computers", "show", ID],
         vec!["codewhale", "account", "computers", "start", ID],
         vec!["codewhale", "account", "computers", "pause", ID],
-        vec!["codewhale", "account", "computers", "delete", ID],
+        vec![
+            "codewhale",
+            "account",
+            "computers",
+            "delete",
+            ID,
+            "--discard-files",
+        ],
     ];
     for argv in commands {
         run_with(

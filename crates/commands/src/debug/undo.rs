@@ -10,7 +10,7 @@ use codewhale_command_contract::metadata::{CommandInfo, RegisterCommand};
 
 macro_rules! registration {
     ($ty:ident, $name:literal, $usage:literal, $aliases:expr, $key:literal, $caps:expr, $handler:ident) => {
-        pub(in crate::commands) struct $ty;
+        pub struct $ty;
         impl RegisterCommand<CommandResult> for $ty {
             fn info() -> &'static CommandInfo {
                 &CommandInfo {
@@ -66,10 +66,10 @@ registration!(
     retry
 );
 
-pub(in crate::commands) const SNAPSHOT_REPO_UNAVAILABLE_PREFIX: &str = "Snapshot repo unavailable";
-pub(in crate::commands) const FILES_NOT_REVERTED_NOTE: &str =
+pub const SNAPSHOT_REPO_UNAVAILABLE_PREFIX: &str = "Snapshot repo unavailable";
+pub const FILES_NOT_REVERTED_NOTE: &str =
     "Workspace files were NOT reverted — only the conversation was rolled back.";
-pub(in crate::commands) const NO_FILE_CHANGES_NOTE: &str = "No file changes to undo.";
+pub const NO_FILE_CHANGES_NOTE: &str = "No file changes to undo.";
 
 pub(super) fn edit(contexts: CommandContexts<'_>, _: Option<&str>) -> CommandResult {
     let mut parts = contexts.into_parts();
@@ -181,7 +181,7 @@ pub(super) fn diff(contexts: CommandContexts<'_>, _: Option<&str>) -> CommandRes
 
 /// A conversation undo that removed anything hands the truncated conversation
 /// to the engine, which owns the model context (#6788).
-pub(in crate::commands) fn conversation_result(undone: DebugConversationUndo) -> CommandResult {
+pub fn conversation_result(undone: DebugConversationUndo) -> CommandResult {
     if undone.removed > 0 {
         CommandResult::with_message_and_action(
             format!("Removed {} message(s)", undone.removed),
@@ -256,7 +256,7 @@ fn conversation_only(undone: DebugConversationUndo, files_note: &str) -> Command
 
 /// Format snapshot outcomes without invoking host operations. Host tests also
 /// use this for the file-only operation before the command's chat fallback.
-pub(in crate::commands) fn patch_result(outcome: DebugUndoOutcome) -> CommandResult {
+pub fn patch_result(outcome: DebugUndoOutcome) -> CommandResult {
     match outcome {
         DebugUndoOutcome::RepoUnavailable { workspace, error } => CommandResult::error(format!(
             "{SNAPSHOT_REPO_UNAVAILABLE_PREFIX} for {}: {error}",

@@ -6749,6 +6749,9 @@ command = "echo project"
             ("read", "safe"),
             ("write", "file_write"),
             ("edit", "file_write"),
+            // Searches the workspace without caller-named write targets, so it
+            // keeps the classification it already had as a deferred tool.
+            ("file_search", "other"),
             ("bash", "shell"),
             // The router itself touches nothing a hook needs to gate.
             ("agent", "other"),

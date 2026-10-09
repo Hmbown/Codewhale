@@ -1317,6 +1317,11 @@ impl crate::host_terminal::HostTerminal for TuiHostTerminal {
     fn apply_notification_settings(&self, config: &crate::config::NotificationsConfig) {
         let _ = crate::tui::notifications::apply_settings(config);
     }
+
+    fn begin_turn_chrome(&self) {
+        crate::tui::notifications::set_taskbar_progress_busy();
+        crate::tui::notifications::start_title_animation("codewhale");
+    }
 }
 
 /// Install the TUI as the process's terminal host. Idempotent: the first

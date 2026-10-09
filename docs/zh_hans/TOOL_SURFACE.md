@@ -20,22 +20,23 @@
 
 ## 默认激活契约
 
-新回合开始时带有十一个预加载（eager）的原生名称，外加合成的 `tool_search`：
+新回合开始时带有十二个预加载（eager）的原生名称，外加合成的 `tool_search`：
 
 1. `read`
 2. `write`
 3. `edit`
-4. `bash`
-5. `agent`
-6. `workflow`
-7. `todo_write`
-8. `create_goal`
-9. `get_goal`
-10. `update_goal`
-11. `load_skill`
-12. `tool_search`（合成，始终激活）
+4. `file_search`
+5. `bash`
+6. `agent`
+7. `workflow`
+8. `todo_write`
+9. `create_goal`
+10. `get_goal`
+11. `update_goal`
+12. `load_skill`
+13. `tool_search`（合成，始终激活）
 
-这十一个原生名称就是 `crates/tui/src/core/engine/tool_catalog.rs` 里的
+这十二个原生名称就是 `crates/tui/src/core/engine/tool_catalog.rs` 里的
 `DEFAULT_ACTIVE_NATIVE_TOOLS`，由
 `default_active_contract_keeps_discovery_and_core_tools_eager` 固定住。
 权限边界（authority boundary）可以在子智能体达到最大深度时移除 `agent`，
@@ -299,6 +300,6 @@ cargo test --locked -p codewhale-tui --lib core::engine::tests::print_mode_tool_
 `1 passed`（被忽略的指标测试报告 `1 passed` 只是因为 `--ignored` 选中了它）；
 `0 passed` 意味着过滤器没匹配到任何东西，检查根本没跑。
 
-不依赖提供商的回执必须报告上面列出的十一个默认激活名称。另一份仓库范围的
+不依赖提供商的回执必须报告上面列出的十二个默认激活名称。另一份仓库范围的
 工具计数可能包含延迟、动态、受特性开关控制以及仅为兼容而存在的注册；
 它不是放进首回合模型目录的工具数量。

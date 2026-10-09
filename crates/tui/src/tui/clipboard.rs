@@ -885,22 +885,6 @@ fn osc52_sequence(text: &str) -> Result<String> {
     Ok(format!("\x1b]52;c;{encoded}\x07"))
 }
 
-/// Resolve the directory pasted images should land in. Prefers
-/// `~/.codewhale/clipboard-images/` so the path is stable across worktrees and
-/// matches the location described in user-facing docs; falls back to
-/// `<workspace>/clipboard-images/` if the home dir is unavailable.
-pub(crate) fn clipboard_images_dir(workspace: &Path) -> PathBuf {
-    let home = crate::config::effective_home_dir();
-    clipboard_images_dir_for_home(workspace, home.as_deref())
-}
-
-fn clipboard_images_dir_for_home(workspace: &Path, home: Option<&Path>) -> PathBuf {
-    if let Some(home) = home {
-        return home.join(".codewhale").join("clipboard-images");
-    }
-    workspace.join("clipboard-images")
-}
-
 /// Pinned, no-follow writer for `dir`, which is `<root>/<name>`: `root` may be a
 /// user-selected link (a relocated `~/.codewhale`), but nothing below it may be.
 #[cfg(any(
@@ -928,7 +912,7 @@ fn clipboard_image_target(
     all(target_os = "linux", not(target_env = "ohos"))
 ))]
 fn save_image_as_png(workspace: &Path, image: &ImageData) -> Result<PastedImage> {
-    save_image_as_png_in(&clipboard_images_dir(workspace), image)
+    save_image_as_png_in(&crate::config::clipboard_images_dir(workspace), image)
 }
 
 /// Lower-level variant that writes into an explicit directory. Exposed so the
@@ -1230,7 +1214,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
 
         assert_eq!(
-            clipboard_images_dir_for_home(workspace.path(), Some(home.path())),
+            crate::config::clipboard_images_dir_for_home(workspace.path(), Some(home.path())),
             home.path().join(".codewhale").join("clipboard-images")
         );
     }
@@ -1240,7 +1224,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
 
         assert_eq!(
-            clipboard_images_dir_for_home(workspace.path(), None),
+            crate::config::clipboard_images_dir_for_home(workspace.path(), None),
             workspace.path().join("clipboard-images")
         );
     }
