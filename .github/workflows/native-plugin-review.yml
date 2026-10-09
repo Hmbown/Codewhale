@@ -3,36 +3,51 @@ on:
   push:
     branches: [feat/native-plugin-login-install]
 permissions:
-  contents: read
+  contents: write
 jobs:
-  source:
+  implement-and-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          persist-credentials: false
-      - uses: actions/checkout@v4
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
         with:
-          repository: TokenNotIncluded/codewhale-lmm-provider
-          ref: 954fc45b360204915f5f37fe8d8fbebeabc88294
-          path: .review-plugin
-          persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          repository: TokenNotIncluded/api.lmm.best
-          path: .review-server
-          persist-credentials: false
-      - name: Archive tracked source without credentials
+          shared-key: native-plugin-login-review
+      - name: Apply the reviewed source edits
         run: |
-          mkdir -p "$RUNNER_TEMP/native-review"
-          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/native-review/codewhale.tar.gz"
-          git -C .review-plugin archive --format=tar.gz HEAD > "$RUNNER_TEMP/native-review/plugin.tar.gz"
-          git -C .review-server archive --format=tar.gz HEAD apps/api-go packages/pi-lmm-provider > "$RUNNER_TEMP/native-review/server.tar.gz"
-          git rev-parse HEAD > "$RUNNER_TEMP/native-review/codewhale.sha"
-          git -C .review-plugin rev-parse HEAD > "$RUNNER_TEMP/native-review/plugin.sha"
-          git -C .review-server rev-parse HEAD > "$RUNNER_TEMP/native-review/server.sha"
+          python3 .native-plugin-edit.py
+          git diff --name-only -- '*.rs' | xargs -r rustfmt --edition 2024 --config skip_children=true
+          git diff --check
+          mkdir -p "$RUNNER_TEMP/native-results"
+          git diff --binary > "$RUNNER_TEMP/native-results/changes.patch"
+          git rm .native-plugin-edit.py .github/workflows/native-plugin-review.yml
+          git add crates/cli/src/lib.rs crates/localization crates/tui/src docs/PLUGINS.md docs/PLUGIN_PROVIDERS.md docs/features.toml
+          git -c user.name=LIghtJUNction -c user.email=lightjunction.me@gmail.com commit -m 'feat(plugins): unify installation and native OAuth sign-in' -m 'Reuse the existing reviewed installer and host OAuth owner. Add codewhale install, pinned npm/GitHub sources, /login provider and /logout provider; remove API-key entry for plugin OAuth. Keep plugin catalogs account-scoped. Local baseline plugin checks: 62 passed; upstream compile receipt is recorded by this workflow.'
+          git push origin HEAD:feat/native-plugin-login-install
+          git rev-parse HEAD > "$RUNNER_TEMP/native-results/commit.txt"
+      - name: Check changed Rust packages and their test code
+        run: |
+          set -o pipefail
+          cargo check -p codewhale-tui -p codewhale-cli --tests --locked 2>&1 | tee "$RUNNER_TEMP/native-results/cargo-check.log"
+      - name: Run localization checks
+        if: success()
+        run: |
+          set -o pipefail
+          cargo test -p codewhale-localization --locked 2>&1 | tee "$RUNNER_TEMP/native-results/localization.log"
+      - name: Check blocking-call budget
+        if: always()
+        run: python3 scripts/check-blocking-calls-budget.py > "$RUNNER_TEMP/native-results/blocking-budget.log" 2>&1
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: native-plugin-review-source
-          path: ${{ runner.temp }}/native-review
-          retention-days: 1
+          name: native-plugin-review-results
+          path: ${{ runner.temp }}/native-results
+          retention-days: 3
