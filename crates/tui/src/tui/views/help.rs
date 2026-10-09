@@ -6,7 +6,7 @@
 //! Help lead with commands, while keyboard shortcuts lead with the key
 //! reference that the footer promises. The command list is sourced from
 //! [`crate::commands::command_infos()`] and the keybinding list from
-//! [`crate::tui::keybindings::KEYBINDINGS`] so neither can drift from the
+//! [`crate::keybinding_table::KEYBINDINGS`] so neither can drift from the
 //! wired-up handlers.
 //!
 //! Keys: any printable character extends the filter, `Backspace` (or `Ctrl+H`)
@@ -32,7 +32,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::commands;
-use crate::tui::keybindings::KEYBINDINGS;
+use crate::keybinding_table::KEYBINDINGS;
 use crate::tui::menu_style;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, render_modal_footer, render_panel_scroll_rail,
@@ -93,7 +93,7 @@ struct HelpEntry {
     section: HelpSection,
     /// Sort-within-section key — keybinding entries reuse their declared
     /// section's rank so the help overlay groups Navigation, Editing, … in
-    /// the same order as `tui::keybindings`.
+    /// the same order as `keybinding_table`.
     sub_rank: u8,
     label: String,
     description: String,
@@ -762,14 +762,14 @@ fn group_label(entry: &HelpEntry, locale: Locale) -> String {
     }
 }
 
-fn keybinding_section_for_rank(rank: u8) -> Option<crate::tui::keybindings::KeybindingSection> {
-    crate::tui::keybindings::KeybindingSection::ALL
+fn keybinding_section_for_rank(rank: u8) -> Option<crate::keybinding_table::KeybindingSection> {
+    crate::keybinding_table::KeybindingSection::ALL
         .into_iter()
         .find(|section| section.rank() == rank)
 }
 
 fn default_collapsed(ordering: HelpOrdering) -> HashSet<String> {
-    use crate::tui::keybindings::KeybindingSection;
+    use crate::keybinding_table::KeybindingSection;
     let kb_keys = KeybindingSection::ALL
         .into_iter()
         .map(|section| format!("kb:{}", section.rank()));
