@@ -225,7 +225,6 @@ impl ApprovalReceiptStore {
         Self { sessions_dir }
     }
 
-    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn default_location() -> io::Result<Self> {
         crate::session_manager::default_sessions_dir().map(Self::new)
     }

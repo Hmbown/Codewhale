@@ -315,7 +315,6 @@ pub fn family_label(family: ToolFamily) -> &'static str {
 /// Position of a line within a multi-line card — drives the left-rail
 /// glyph so the box reads as a contiguous group from top to bottom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // wired by future card-refactor follow-ups
 pub enum CardRail {
     /// First line of the card — the header. `╭`.
     Top,
@@ -330,7 +329,6 @@ pub enum CardRail {
 /// Map a [`CardRail`] position to its rail glyph. Returned as a `&str`
 /// because callers paste it into a span.
 #[must_use]
-#[allow(dead_code)] // wired by future card-refactor follow-ups
 pub fn rail_glyph(rail: CardRail) -> &'static str {
     match rail {
         CardRail::Top => "\u{256D}",    // ╭
