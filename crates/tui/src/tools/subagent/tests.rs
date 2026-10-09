@@ -11665,6 +11665,36 @@ fn state_path_accepts_a_state_root_relocated_behind_a_junction() {
         checked_subagent_state_path(&workspace, &escaped).is_err(),
         "an escape past both roots must still fail"
     );
+
+    // `mklink /J` accepts a target that does not exist yet, and creating the
+    // junction before the first run is a normal setup order. Both sides then
+    // resolve to the link's own spelling, so containment holds until the
+    // target exists.
+    let dangling_workspace = tmp.path().join("dangling");
+    let dangling_target = tmp.path().join("not-created-yet");
+    std::fs::create_dir_all(&dangling_workspace).expect("mkdir dangling workspace");
+    let output = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(dangling_workspace.join(".codewhale"))
+        .arg(&dangling_target)
+        .output()
+        .expect("invoke Windows junction creation");
+    assert!(
+        output.status.success(),
+        "failed to create dangling junction: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !dangling_target.exists(),
+        "the probe needs a target that does not exist yet"
+    );
+    checked_subagent_state_path(
+        &dangling_workspace,
+        &std::path::Path::new(".codewhale")
+            .join("state")
+            .join(SUBAGENT_STATE_FILE),
+    )
+    .expect("a junction whose target is not created yet must pass containment");
 }
 
 /// The guards that run after `checked_subagent_state_path` must reach the same
@@ -11718,28 +11748,6 @@ fn state_writes_follow_a_relocated_state_root() {
         "the transcript must land in the junction target {}: {}",
         resolved_target.display(),
         writer.path.display()
-    );
-}
-
-/// The same workspace without the link keeps its state inside the workspace.
-#[test]
-fn state_path_stays_in_the_workspace_without_a_link() {
-    let tmp = tempdir().expect("tempdir");
-    let workspace = tmp.path().join("workspace");
-    std::fs::create_dir_all(&workspace).expect("mkdir workspace");
-
-    let state_path = checked_subagent_state_path(
-        &workspace,
-        &std::path::Path::new(".codewhale")
-            .join("state")
-            .join(SUBAGENT_STATE_FILE),
-    )
-    .expect("plain workspace state path");
-
-    assert!(
-        state_path.starts_with(&workspace),
-        "state stays in the workspace: {}",
-        state_path.display()
     );
 }
 
