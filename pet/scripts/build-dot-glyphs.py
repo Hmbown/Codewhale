@@ -45,18 +45,19 @@ if font_hash != "ca094f6b0001fb048ca39ddd797a0cdb0179e1e55c6561e111c49c3e6a61d7b
     raise ValueError("Expected the pinned Noto Sans CJK SC Medium font in dot-glyphs-LICENSE.txt")
 characters = dict(zip(
     ("reading", "editing", "searching", "testing", "executing", "browsing", "computer", "memory", "tool", "thinking", "responding", "delegating", "waiting", "done"),
-    "读写搜试行览控记用思答协待成",
+    ("读", "写", "搜", "试", "行", "览", "控", "记", "工具", "思", "答", "协", "待", "成"),
     strict=True,
 ))
-for size in range(48, 0, -1):
-    font = ImageFont.truetype(str(args.font), size)
-    bounds = [font.getbbox(char) for char in characters.values()]
-    if all(right - left <= 44 and bottom - top <= 44 for left, top, right, bottom in bounds):
-        break
 lines = ["import type { OwnerActivityKind } from './pet-engine.js';", "", "export const DOT_GLYPHS: Record<OwnerActivityKind | 'waiting' | 'done', string[]> = {"]
+sizes = set()
 for key, char in characters.items():
+    for size in range(48, 0, -1):
+        font = ImageFont.truetype(str(args.font), size)
+        left, top, right, bottom = font.getbbox(char)
+        if right - left <= 44 and bottom - top <= 44:
+            break
+    sizes.add(size)
     image = Image.new("L", (48, 48), 0)
-    left, top, right, bottom = font.getbbox(char)
     ImageDraw.Draw(image).text(((48 - right + left) // 2 - left, (48 - bottom + top) // 2 - top), char, font=font, fill=255)
     rows = ["".join("#" if image.getpixel((x, y)) >= 128 else "." for x in range(48)) for y in range(48)]
     lines.append(f"  {key}: [")
@@ -65,4 +66,4 @@ for key, char in characters.items():
 lines.append("};")
 args.output.parent.mkdir(parents=True, exist_ok=True)
 args.output.write_text("\n".join(lines) + "\n", encoding="utf-8")
-print(f"Generated {len(characters)} masks at 48 × 48, font size {size}, threshold 128: {args.output}")
+print(f"Generated {len(characters)} masks at 48 × 48, font sizes {sorted(sizes)}, threshold 128: {args.output}")

@@ -1138,7 +1138,7 @@ fn spawn_product_stack_server(
         .clone();
     std::thread::Builder::new()
         .name("runtime-api-test-server".to_string())
-        .stack_size(crate::CODEWHALE_MAIN_STACK_BYTES)
+        .stack_size(codewhale_runtime::CODEWHALE_MAIN_STACK_BYTES)
         .spawn(move || {
             // Adopted for the thread's lifetime; the scope's generation check
             // refuses enrollment once the sealing test has ended.

@@ -1,6 +1,6 @@
 //! Native worktree manager UI (list / create / switch / compare).
 //!
-//! Data lives in [`super::git_status`]; this module is pure presentation +
+//! Data lives in [`crate::git_status`]; this module is pure presentation +
 //! key handling. Never blocks the render path on git subprocesses — refresh
 //! is scheduled via `git_status::refresh_if_stale` / `force_refresh` from
 //! background-friendly call sites.
@@ -17,7 +17,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::tui::git_status::{self, GitStatusSnapshot, WorktreeEntry};
+use crate::git_status::{self, GitStatusSnapshot, WorktreeEntry};
 use crate::tui::menu_style;
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
 use codewhale_palette as palette;

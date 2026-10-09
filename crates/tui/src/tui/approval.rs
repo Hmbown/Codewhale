@@ -72,10 +72,9 @@ use previews::{
 pub use view::ApprovalOption;
 pub use view::ApprovalView;
 
-pub use policy::{
-    ApprovalStakes, RiskLevel, ToolCategory, classify_risk, classify_stakes,
-    get_tool_category_for_call,
-};
+pub use policy::{ApprovalStakes, ToolCategory, classify_stakes, get_tool_category_for_call};
+
+use crate::core::authority::{RiskLevel, classify_risk};
 
 /// User's decision for a pending approval
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -353,7 +353,7 @@ New integrations should prefer `codewhale app-server`.")]
     )]
     Login(LoginArgs),
     /// Remove saved authentication state (every provider key, OAuth login,
-    /// the account session and the Daytona token). Asks before deleting.
+    /// the Codewhale account session). Asks before deleting.
     Logout(LogoutArgs),
     /// Manage authentication credentials and provider mode.
     Auth(AuthArgs),
@@ -2934,7 +2934,7 @@ fn reject_legacy_login_provider_args(args: &LoginArgs) -> Result<()> {
 }
 
 const LOGOUT_CONFIRM_PROMPT: &str = "This deletes every saved provider API key and OAuth login, \
-the Codewhale account session and the Daytona token. Type 'yes' to log out: ";
+the Codewhale account session. Type 'yes' to log out: ";
 
 /// `codewhale logout` wipes every provider credential at once, so it must not
 /// run on a stray keystroke. Non-interactive callers opt in with `--yes`.

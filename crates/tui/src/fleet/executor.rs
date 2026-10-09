@@ -474,7 +474,7 @@ fn parse_exec_terminal_final_answer(value: &serde_json::Value) -> Option<FleetWo
         .and_then(|chars| usize::try_from(chars).ok())
         .unwrap_or_else(|| excerpt.chars().count());
     Some(FleetWorkerFinalAnswer {
-        excerpt: crate::exec_stream_final_answer_excerpt(excerpt),
+        excerpt: exec_stream_final_answer_excerpt(excerpt),
         chars,
     })
 }
@@ -1033,6 +1033,29 @@ impl FleetExecutor {
     /// True once every started worker has reached a terminal state.
     pub fn all_terminal(&self) -> bool {
         !self.streams.is_empty() && self.streams.values().all(|s| s.terminal)
+    }
+}
+
+/// Character bound for `metadata.visible_final_answer_excerpt`. The excerpt
+/// is a status surface (fleet receipts, event labels, runtime API payloads),
+/// not the transcript: the full answer lives in the saved session and the
+/// worker's stream-json log, and `visible_final_answer_chars` carries the real
+/// length so a consumer can tell a bounded excerpt from a short answer.
+pub(crate) const EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS: usize = 4_000;
+
+/// Bound and secret-redact the visible final answer once, at the emitter, so
+/// every downstream consumer reads the same excerpt.
+pub(crate) fn exec_stream_final_answer_excerpt(output: &str) -> String {
+    let redacted = codewhale_config::persistence::redact_secrets(output.trim());
+    let mut chars = redacted.chars();
+    let excerpt: String = chars
+        .by_ref()
+        .take(EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS)
+        .collect();
+    if chars.next().is_some() {
+        format!("{excerpt}...")
+    } else {
+        excerpt
     }
 }
 
@@ -2059,7 +2082,7 @@ mod tests {
         })).unwrap();
         assert!(!answer.excerpt.contains("sk-ant-must-not-leak"));
         assert!(
-            answer.excerpt.chars().count() <= crate::EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS + 3
+            answer.excerpt.chars().count() <= super::EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS + 3
         );
         assert_eq!(answer.chars, 9000);
     }

@@ -1296,14 +1296,17 @@ impl Engine {
     async fn consult_auto_review_guardian(
         &self,
         client: &dyn crate::core::model_client::ModelClient,
-        context: &crate::tui::auto_review::AutoReviewContext<'_>,
+        context: &crate::core::authority::auto_review::AutoReviewContext<'_>,
         tool_input: &Value,
         held_reason: &str,
         tool_id: &str,
         turn: &mut TurnContext,
     ) -> Result<(), ToolError> {
-        let context_text =
-            crate::tui::auto_review::build_reviewer_context(context, held_reason, tool_input);
+        let context_text = crate::core::authority::auto_review::build_reviewer_context(
+            context,
+            held_reason,
+            tool_input,
+        );
         let _ = self
             .send_event(Event::status(format!(
                 "Auto-Review checking '{}'",
@@ -1428,8 +1431,7 @@ impl Engine {
             .terminal_chrome_enabled
             .then(crate::sleep_guard::SleepGuard::hold);
         if self.config.terminal_chrome_enabled {
-            crate::tui::notifications::set_taskbar_progress_busy();
-            crate::tui::notifications::start_title_animation("codewhale");
+            crate::host_terminal::host().begin_turn_chrome();
         }
 
         let client = self
@@ -2150,7 +2152,7 @@ impl Engine {
 
             if blocked_error.is_none() {
                 let review_context =
-                    crate::tui::auto_review::AutoReviewContext::from_tool_call_async(
+                    crate::core::authority::auto_review::AutoReviewContext::from_tool_call_async(
                         &tool_name,
                         &tool_input,
                         if self.is_acp_turn() {
