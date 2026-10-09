@@ -1,0 +1,71 @@
+name: Native plugin recovery verification
+on:
+  push:
+    branches: [feat/native-plugin-login-install]
+permissions:
+  contents: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update only plugin OAuth recovery text
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/tui/src/oauth.rs')
+          text = p.read_text()
+          replacements = {
+              'relogin_hint: "codewhale auth plugin-login",': 'relogin_hint: "codewhale auth plugin-login --provider <provider>",',
+              'session_login_hint: "/auth plugin-login",': 'session_login_hint: "/login <provider>",',
+              'Plugin OAuth login missing; run codewhale auth plugin-login --provider <provider>': 'Plugin OAuth login missing; use /login <provider> in Codewhale or codewhale auth plugin-login --provider <provider> in a terminal',
+          }
+          for old, new in replacements.items():
+              assert text.count(old) == 1, old
+              text = text.replace(old, new, 1)
+          assert '/auth plugin-login' not in text
+          p.write_text(text)
+          PY
+          git diff --check
+          mkdir -p "$RUNNER_TEMP/native-results"
+          git diff --binary > "$RUNNER_TEMP/native-results/recovery.patch"
+          git rm .github/workflows/native-plugin-review.yml
+          git add crates/tui/src/oauth.rs
+          git -c user.name=LIghtJUNction -c user.email=lightjunction.me@gmail.com commit -m 'fix(plugins): point OAuth recovery at the native login command'
+          git push origin HEAD:feat/native-plugin-login-install
+          git rev-parse HEAD > "$RUNNER_TEMP/native-results/commit.txt"
+      - name: Install upstream build dependencies
+        run: bash scripts/ci-apt-install.sh libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-plugin-login-review
+          cache-on-failure: true
+      - name: Check changed file formatting
+        run: rustfmt --check --edition 2024 --config skip_children=true crates/tui/src/oauth.rs
+      - name: Check Rust packages and test code
+        run: |
+          set -o pipefail
+          cargo check -p codewhale-tui -p codewhale-cli --tests --locked 2>&1 | tee "$RUNNER_TEMP/native-results/cargo-check.log"
+      - name: Check localization
+        if: always()
+        run: |
+          set -o pipefail
+          cargo test -p codewhale-localization --locked 2>&1 | tee "$RUNNER_TEMP/native-results/localization.log"
+      - name: Check blocking-call budget
+        if: always()
+        run: python3 scripts/check-blocking-calls-budget.py > "$RUNNER_TEMP/native-results/blocking-budget.log" 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-plugin-recovery-verification
+          path: ${{ runner.temp }}/native-results
+          retention-days: 3
