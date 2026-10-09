@@ -471,21 +471,10 @@ fn auto_review_routes_shell_commands_requiring_approval_to_reviewer() {
             None,
         );
 
-        if cfg!(windows) && command == "cargo test & curl https://example.com" {
-            // Unclassified Windows input hits the built-in floor before the reviewer.
-            assert_eq!(
-                decision,
-                AutoReviewPlanDecision::Block(
-                    "Built-in safety gate requires approval: Windows command input cannot be classified safely enough to exclude termination of Codewhale npm launchers; use a direct PID- or port-specific command".into()
-                )
-            );
-            assert_eq!(audit["decision"], "hold_for_review");
-        } else {
-            assert!(
-                matches!(decision, AutoReviewPlanDecision::ConsultReviewer(_)),
-                "Auto-Review must not auto-approve {command} without reviewer judgment"
-            );
-        }
+        assert!(
+            matches!(decision, AutoReviewPlanDecision::ConsultReviewer(_)),
+            "Auto-Review must not auto-approve {command} without reviewer judgment"
+        );
         assert_ne!(audit["decision"], "allow", "unexpected allow for {command}");
     }
 }
