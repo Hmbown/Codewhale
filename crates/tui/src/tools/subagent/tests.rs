@@ -11615,6 +11615,80 @@ fn persist_state_rejects_state_path_outside_state_root() {
     assert!(format!("{err:#}").contains("must stay within state root"));
 }
 
+/// A user who keeps application state on another volume makes the workspace's
+/// `.codewhale` a junction, so `.codewhale/state/...` resolves inside that
+/// target. That target is where the state lives; refusing it failed every
+/// child at step 0.
+#[cfg(windows)]
+#[test]
+fn state_path_accepts_a_state_root_relocated_behind_a_junction() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().join("workspace");
+    let relocated = tmp.path().join("relocated-state");
+    std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+    std::fs::create_dir_all(&relocated).expect("mkdir relocated");
+    let link = workspace.join(".codewhale");
+    let output = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&relocated)
+        .output()
+        .expect("invoke Windows junction creation");
+    assert!(
+        output.status.success(),
+        "failed to create junction: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let state_path = checked_subagent_state_path(
+        &workspace,
+        &std::path::Path::new(".codewhale")
+            .join("state")
+            .join(SUBAGENT_STATE_FILE),
+    )
+    .expect("a relocated state root must pass containment");
+
+    let resolved_target = relocated.canonicalize().expect("canonical target");
+    assert!(
+        state_path.starts_with(&resolved_target),
+        "state must land in the junction target {}: {}",
+        resolved_target.display(),
+        state_path.display()
+    );
+
+    // The re-root covers that one user-owned link, not the boundary: a path
+    // that resolves outside both roots is still refused.
+    let escaped = std::path::Path::new("..")
+        .join("escaped")
+        .join(SUBAGENT_STATE_FILE);
+    assert!(
+        checked_subagent_state_path(&workspace, &escaped).is_err(),
+        "an escape past both roots must still fail"
+    );
+}
+
+/// The same workspace without the link keeps its state inside the workspace.
+#[test]
+fn state_path_stays_in_the_workspace_without_a_link() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+
+    let state_path = checked_subagent_state_path(
+        &workspace,
+        &std::path::Path::new(".codewhale")
+            .join("state")
+            .join(SUBAGENT_STATE_FILE),
+    )
+    .expect("plain workspace state path");
+
+    assert!(
+        state_path.starts_with(&workspace),
+        "state stays in the workspace: {}",
+        state_path.display()
+    );
+}
+
 #[test]
 fn explicit_state_roots_isolate_managers_for_the_same_execution_workspace() {
     let tmp = tempdir().expect("tempdir");

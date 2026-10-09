@@ -10453,6 +10453,10 @@ fn checked_subagent_state_path(state_root: &Path, path: &Path) -> Result<PathBuf
     // an 8.3 component (for example `RUNNER~1`) that no longer prefixes the root.
     let parent = resolve_path_for_containment(parent)?;
     let state_path = parent.join(file_name);
+    // The state root may itself sit behind a link the user created: see
+    // `effective_state_root`. Both checks below must use the same root, or a
+    // relocated state directory fails containment and then fails the walk.
+    let state_root = effective_state_root(&state_root, &state_path);
     if !path_is_within_state_root(&state_path, &state_root) {
         return Err(anyhow!(
             "sub-agent state path must stay within state root: {}",
@@ -10461,6 +10465,35 @@ fn checked_subagent_state_path(state_root: &Path, path: &Path) -> Result<PathBuf
     }
     reject_root_relative_symlinks(&state_root, &state_path)?;
     Ok(state_path)
+}
+
+/// The state root in effect for an already-resolved child path.
+///
+/// `default_state_path` and the transcript artifact writer both build
+/// `.codewhale/state/...` under the state root. A user who keeps application
+/// state on another volume makes `<state_root>/.codewhale` a junction (or a
+/// symlink), which resolves the child outside the state root while landing
+/// exactly where that user put the state. When the link exists and the child
+/// resolves inside its target, the target is the root the containment check
+/// and the link walk must use; otherwise the state root is returned unchanged.
+///
+/// A child that resolves anywhere else keeps the stricter state root, so this
+/// re-roots one known, user-owned link and does not widen the boundary.
+fn effective_state_root(state_root: &Path, state_path: &Path) -> PathBuf {
+    let linked = state_root.join(codewhale_config::CODEWHALE_APP_DIR);
+    let Ok(metadata) = fs::symlink_metadata(&linked) else {
+        return state_root.to_path_buf();
+    };
+    // Windows junctions are reparse points without the symlink tag, so the
+    // shared predicate is required here; `FileType::is_symlink` alone would
+    // miss exactly the case this exists for.
+    if !crate::plugins::metadata_is_link_or_reparse(&metadata) {
+        return state_root.to_path_buf();
+    }
+    match resolve_path_for_containment(&linked) {
+        Ok(resolved) if path_is_within_state_root(state_path, &resolved) => resolved,
+        _ => state_root.to_path_buf(),
+    }
 }
 
 /// Canonicalize `path` when it exists; otherwise canonicalize the deepest
