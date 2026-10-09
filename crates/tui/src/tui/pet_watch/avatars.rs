@@ -119,13 +119,15 @@ impl Avatars {
     }
     pub fn choices(&self) -> String {
         std::iter::once("whale".to_string())
-            .chain(std::iter::once("whale-girl".to_string()))
+            .chain(["particles".to_string(), "whale-girl".to_string()])
             .chain(self.catalog.iter().map(|p| p.key.clone()))
             .collect::<Vec<_>>()
             .join("\n")
     }
     pub fn select(&mut self, key: &str) -> bool {
-        if !matches!(key, "whale" | "whale-girl") && !self.catalog.iter().any(|p| p.key == key) {
+        if !matches!(key, "whale" | "whale-girl" | "particles")
+            && !self.catalog.iter().any(|p| p.key == key)
+        {
             return false;
         }
         self.key = key.into();

@@ -12,6 +12,7 @@ pub fn clear(output: &mut impl Write) -> io::Result<()> {
 
 #[derive(Default)]
 pub struct Renderer {
+    pub colors: Vec<[u8; 3]>,
     dimensions: (usize, usize),
     background: Vec<u8>,
     appearance: super::appearance::Appearance,
@@ -74,13 +75,23 @@ impl Renderer {
             Vec::new()
         };
         let mut cells = vec![0u8; cols * rows];
+        self.colors = vec![self.appearance.background; cols * rows];
+        let mut strengths = vec![0.0; cols * rows];
         let val = |name: &str, default: f64| pose.state[name].as_f64().unwrap_or(default);
-        let attention = val("attention", 0.0);
+        let attention = if pose.materials.is_some() {
+            0.0
+        } else {
+            val("attention", 0.0)
+        };
         let flip = val("flip", 1.0);
-        let scale = (w as f64 * 0.52).min(h as f64 * 0.85) * (1.0 + attention * 0.07);
+        let scale = if pose.materials.is_some() {
+            w.min(h) as f64 * 0.46
+        } else {
+            (w as f64 * 0.52).min(h as f64 * 0.85) * (1.0 + attention * 0.07)
+        };
         let ox = w as f64 * (0.5 + val("roamX", 0.0) * 0.30);
         let oy = h as f64 * (0.47 + val("roamY", 0.0) * 0.30 + attention * 0.05);
-        let colour = [pose.style.r, pose.style.g, pose.style.b];
+
         if view.pixels && self.appearance.environment {
             for x in 16..w.saturating_sub(16) {
                 blend(&mut rgb, w, h, x as i32, 16, [45.0, 70.0, 81.0], 0.5);
@@ -104,6 +115,28 @@ impl Renderer {
         }
         let radius = (w.min(h) as f64 * 0.00285).clamp(0.68, 1.55) * self.appearance.dot_scale;
         for (i, q) in pose.points.iter().enumerate() {
+            let depth = 0.65 + 0.35 * ((i * 37 % 101) as f64 / 100.0);
+            let material = pose.materials.as_ref().and_then(|m| m.get(i));
+            let fallback = [
+                pose.style.r,
+                pose.style.g,
+                pose.style.b,
+                pose.style.alpha * depth,
+            ];
+            let mut pigment = *material.unwrap_or(&fallback);
+            if let Some(old) = previous
+                .and_then(|s| s.materials.as_ref())
+                .and_then(|m| m.get(i))
+            {
+                for k in 0..4 {
+                    pigment[k] = old[k] + (pigment[k] - old[k]) * mix;
+                }
+            }
+            let colour = [pigment[0], pigment[1], pigment[2]];
+            let alpha = pigment[3].clamp(0.0, 1.0);
+            if alpha <= 0.0 {
+                continue;
+            }
             let p = previous.and_then(|s| s.points.get(i));
             let xx = p.map_or(q[0], |p| p[0] + (q[0] - p[0]) * mix);
             let yy = p.map_or(q[1], |p| p[1] + (q[1] - p[1]) * mix);
@@ -113,13 +146,20 @@ impl Renderer {
             let cy = (y / h as f64 * (rows * 4) as f64).floor() as i32;
             if cx >= 0 && cy >= 0 && cx < (cols * 2) as i32 && cy < (rows * 4) as i32 {
                 let bit = [[0, 3], [1, 4], [2, 5], [6, 7]][cy as usize % 4][cx as usize % 2];
-                cells[(cy as usize / 4) * cols + cx as usize / 2] |= 1 << bit;
+                let index = (cy as usize / 4) * cols + cx as usize / 2;
+                cells[index] |= 1 << bit;
+                if alpha > strengths[index] {
+                    strengths[index] = alpha;
+                    for k in 0..3 {
+                        self.colors[index][k] = (colour[k] * alpha
+                            + f64::from(self.appearance.background[k]) * (1.0 - alpha))
+                            as u8;
+                    }
+                }
             }
             if !view.pixels {
                 continue;
             }
-            let depth = 0.65 + 0.35 * ((i * 37 % 101) as f64 / 100.0);
-            let alpha = (pose.style.alpha * depth).clamp(0.0, 1.0);
             let r = radius * depth;
             let glow = if !pose.style.hollow && i % 5 == 0 {
                 1.0 + 4.0 * self.appearance.glow
@@ -196,6 +236,7 @@ mod tests {
     fn pixel_transport_is_bounded_chunked_rgb_and_braille_remains_available() {
         let pose = Pose {
             points: vec![[0.0, 0.0]; 980],
+            materials: None,
             style: Style {
                 r: 120.,
                 g: 210.,

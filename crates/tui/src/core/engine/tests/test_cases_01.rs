@@ -736,6 +736,7 @@ async fn event_capacity_cancelled_parallel_tool_keeps_completed_span_and_call_wh
                 Event::OperationActivityStarted {
                     span_id,
                     activity_kind,
+                    ..
                 } => Some((span_id, activity_kind)),
                 _ => None,
             })
@@ -748,6 +749,7 @@ async fn event_capacity_cancelled_parallel_tool_keeps_completed_span_and_call_wh
                     span_id,
                     activity_kind,
                     outcome,
+                    ..
                 } => Some((span_id, activity_kind, outcome)),
                 _ => None,
             })

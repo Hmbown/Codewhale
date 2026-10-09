@@ -1447,6 +1447,35 @@ impl From<&crate::tool_inspection::TurnStopDiagnostics> for RuntimeTurnRequestDi
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeOperationSpan {
+    pub span_id: String,
+    pub activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
+    pub started_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeOperationCompletion {
+    pub span_id: String,
+    pub activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
+    pub completed_at: DateTime<Utc>,
+    pub outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeOperationActivity {
+    pub observed_at: DateTime<Utc>,
+    pub active: Vec<RuntimeOperationSpan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_completed: Option<RuntimeOperationCompletion>,
+    #[serde(default)]
+    pub overflowed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnRecord {
     /// Admitted per-request allowance. Older turns have no explicit allowance.
     #[serde(
@@ -1601,6 +1630,8 @@ pub struct TurnRecord {
         skip_serializing_if = "Option::is_none"
     )]
     pub model_request_diagnostics: Option<RuntimeTurnRequestDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_activity: Option<RuntimeOperationActivity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default)]
@@ -1635,6 +1666,24 @@ pub struct TurnRecord {
 
 impl TurnRecord {
     fn validate_output_token_limit(&self) -> Result<()> {
+        if let Some(activity) = &self.operation_activity {
+            let safe_id =
+                |id: &str| !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control);
+            anyhow::ensure!(
+                activity.active.len() <= 256
+                    && activity.active.iter().all(|span| {
+                        safe_id(&span.span_id)
+                            && span.action_id.as_deref().is_none_or(safe_id)
+                            && span.started_at <= activity.observed_at
+                    })
+                    && activity.last_completed.as_ref().is_none_or(|span| {
+                        safe_id(&span.span_id)
+                            && span.action_id.as_deref().is_none_or(safe_id)
+                            && span.completed_at <= activity.observed_at
+                    }),
+                "Turn operation activity exceeds its bound"
+            );
+        }
         if self.decision_receipts.len() > MAX_ROUTED_USAGE_RECORDS_PER_TURN
             || self.decision_receipts.iter().any(|r| !r.is_bounded())
         {
@@ -1962,6 +2011,7 @@ fn settle_unaccepted_routed_usage(
             routed_usage_source_ids: Vec::new(),
             routed_usage_dropped_records: 0,
             model_request_diagnostics: None,
+            operation_activity: None,
             error: Some(UNACCEPTED_TURN_REASON.to_string()),
             item_ids: Vec::new(),
             steer_count: 0,
@@ -13244,6 +13294,7 @@ impl RuntimeThreadManager {
                     routed_usage_source_ids: Vec::new(),
                     routed_usage_dropped_records: 0,
                     model_request_diagnostics: None,
+                    operation_activity: None,
                     error: None,
                     item_ids,
                     steer_count: 0,
@@ -13648,6 +13699,9 @@ impl RuntimeThreadManager {
                         .saturating_add(background_residual);
                     if turn.status == RuntimeTurnStatus::InProgress {
                         turn.status = RuntimeTurnStatus::Failed;
+                        if let Some(activity) = &mut turn.operation_activity {
+                            activity.active.clear();
+                        }
                         turn.ended_at = Some(now);
                         turn.duration_ms = turn.started_at.map(|start| duration_ms(start, now));
                         turn.error = Some(reason.to_string());
@@ -14544,6 +14598,7 @@ impl RuntimeThreadManager {
             routed_usage_source_ids: Vec::new(),
             routed_usage_dropped_records: 0,
             model_request_diagnostics: None,
+            operation_activity: None,
             error: None,
             item_ids: Vec::new(),
             steer_count: 0,
@@ -15054,6 +15109,7 @@ impl RuntimeThreadManager {
             routed_usage_source_ids: Vec::new(),
             routed_usage_dropped_records: 0,
             model_request_diagnostics: None,
+            operation_activity: None,
             error: None,
             item_ids: Vec::new(),
             steer_count: 0,
@@ -16779,6 +16835,77 @@ impl RuntimeThreadManager {
                     )
                     .await?;
                 }
+                operation @ (EngineEvent::OperationActivityStarted { .. }
+                | EngineEvent::OperationActivityCompleted { .. }
+                | EngineEvent::ToolCallHeartbeat) => {
+                    if !saw_turn_started {
+                        continue;
+                    }
+                    if !matches!(operation, EngineEvent::ToolCallHeartbeat) {
+                        saw_engine_activity = true;
+                    }
+                    let projection_lock = self.projection_lock(&thread_id);
+                    let _projection = projection_lock.lock().await;
+                    let store = self.store.clone();
+                    let operation_turn_id = turn_id.clone();
+                    let projected = tokio::task::spawn_blocking(move || {
+                        let _turn_mutation = store.turn_mutation.lock();
+                        let mut turn = store.load_turn(&operation_turn_id)?;
+                        if turn.status != RuntimeTurnStatus::InProgress {
+                            return Ok::<_, anyhow::Error>(None);
+                        }
+                        if matches!(operation, EngineEvent::ToolCallHeartbeat)
+                            && turn.operation_activity.as_ref().is_none_or(|a| a.active.is_empty())
+                        {
+                            return Ok(None);
+                        }
+                        let now = Utc::now();
+                        let activity = turn.operation_activity.get_or_insert_with(|| RuntimeOperationActivity {
+                            observed_at: now,
+                            active: Vec::new(),
+                            last_completed: None,
+                            overflowed: false,
+                        });
+                        let now = now.max(activity.observed_at);
+                        activity.observed_at = now;
+                        let (name, mut payload) = match operation {
+                            EngineEvent::OperationActivityStarted { span_id, activity_kind, action_id } => {
+                                let span_id = format!("operation:{}", crate::hashing::sha256_hex(span_id));
+                                let action_id = action_id.filter(|id| !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control));
+                                if !activity.active.iter().any(|span| span.span_id == span_id) {
+                                    if activity.active.len() < 256 {
+                                        activity.active.push(RuntimeOperationSpan {
+                                            span_id: span_id.clone(), activity_kind, action_id: action_id.clone(), started_at: now,
+                                        });
+                                    } else {
+                                        activity.overflowed = true;
+                                    }
+                                }
+                                ("operation.activity_started", json!({"span_id":span_id,"activity_kind":activity_kind,"action_id":action_id,"observed_at":now}))
+                            }
+                            EngineEvent::OperationActivityCompleted { span_id, activity_kind, action_id, outcome } => {
+                                let span_id = format!("operation:{}", crate::hashing::sha256_hex(span_id));
+                                let action_id = action_id.filter(|id| !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control));
+                                activity.active.retain(|span| span.span_id != span_id);
+                                activity.last_completed = Some(RuntimeOperationCompletion {
+                                    span_id: span_id.clone(), activity_kind, action_id: action_id.clone(), completed_at: now, outcome,
+                                });
+                                ("operation.activity_completed", json!({"span_id":span_id,"activity_kind":activity_kind,"action_id":action_id,"outcome":outcome,"observed_at":now}))
+                            }
+                            EngineEvent::ToolCallHeartbeat => ("operation.heartbeat", json!({"observed_at":now})),
+                            _ => unreachable!(),
+                        };
+                        if payload.get("action_id").is_some_and(Value::is_null) {
+                            payload.as_object_mut().expect("operation payload").remove("action_id");
+                        }
+                        store.save_turn(&turn)?;
+                        Ok(Some((name, payload)))
+                    }).await.context("Runtime operation projection task failed")??;
+                    if let Some((name, payload)) = projected {
+                        self.emit_event(&thread_id, Some(&turn_id), None, name, payload)
+                            .await?;
+                    }
+                }
                 EngineEvent::ToolExecutionStarted { id } => {
                     if let Some(item_id) = tool_items.get(&id) {
                         self.emit_event(
@@ -18298,6 +18425,9 @@ impl RuntimeThreadManager {
             let _turn_mutation = self.store.turn_mutation.lock();
             let mut turn = self.store.load_turn(&turn_id)?;
             turn.status = turn_status;
+            if let Some(activity) = &mut turn.operation_activity {
+                activity.active.clear();
+            }
             turn.ended_at = Some(ended_at);
             turn.duration_ms = turn.started_at.map(|start| duration_ms(start, ended_at));
             turn.usage = turn_usage;
@@ -18720,6 +18850,9 @@ impl RuntimeThreadManager {
             }
             if interrupted_candidate {
                 turn.status = RuntimeTurnStatus::Interrupted;
+                if let Some(activity) = &mut turn.operation_activity {
+                    activity.active.clear();
+                }
                 turn.error = Some(RUNTIME_RESTART_REASON.to_string());
                 turn.ended_at = Some(now);
                 if let Some(started_at) = turn.started_at {
