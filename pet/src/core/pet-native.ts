@@ -15,7 +15,7 @@ export class PetNative {
   private engineTick = 0;
   private segment?: PetSegment;
   private liveTape = new PetLiveTape();
-  private stillProjection?: { key: string; points: number[][]; style: PetSim['frame'] };
+  private stillProjection?: { key: string; style: PetSim['frame'] };
   constructor(pointsJSON: string, tapeJSONL = '', interactionsJSON = '[]', live = false, expressionVersion: 1 | 2 = 2) {
     const points = JSON.parse(pointsJSON) as [number, number][];
     if (!Array.isArray(points) || points.length !== 980 || points.some(p => !Array.isArray(p) || p.length !== 2 || !p.every(n => Number.isFinite(n) && Math.abs(n) <= 1)))
@@ -25,10 +25,10 @@ export class PetNative {
   step(dt: number, motion: boolean): string { this.world.step(dt, { motion, sensitivity: 1 }); return this.snapshot(); }
   snapshot(): string { return JSON.stringify({ ...this.world.frame, voices: this.world.voices, digest: digest(this.world.sim) }); }
   private expression(): DotField {
-    const { sim, frame } = this.world;
-    const target = projectDotField(sim.p.map(p => [p.x, p.y]), this.expressionActivity, frame.timeMs);
+    const { frame } = this.world;
+    const target = projectDotField(this.expressionActivity, frame.timeMs, false, this.expressionTransition?.at ?? 0);
     return this.expressionTransition
-      ? blendDotFields(this.expressionTransition.from, target, (frame.timeMs - this.expressionTransition.at) / 260)
+      ? blendDotFields(this.expressionTransition.from, target, (frame.timeMs - this.expressionTransition.at) / 560)
       : target;
   }
   private prepareExpression(activity: EngineOwnerProjection): void {
@@ -50,9 +50,9 @@ export class PetNative {
       const peers = frame.pod.filter(p => p.present);
       still.step(1 / 30, state, { motion: false, sensitivity: 1,
         podSlots: peers.length >= 3 ? peers.map(p => [[0, 2, 4, 1, 3, 5][p.slot], p.phase] as const) : undefined });
-      this.stillProjection = { key, points: still.p.map(p => [p.x, p.y]), style: still.frame };
+      this.stillProjection = { key, style: still.frame };
     }
-    const still = projectDotField(this.stillProjection.points, activity, frame.timeMs, true);
+    const still = projectDotField(activity, frame.timeMs, true);
     return JSON.stringify({ ...frame, digest: digest(sim), state, style: { ...sim.frame, hollow: !observed }, activity,
       ...this.expression(),
       still: { ...still, style: { ...this.stillProjection.style, hollow: !observed }, state } });

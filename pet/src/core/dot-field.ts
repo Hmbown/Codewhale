@@ -1,18 +1,21 @@
 import { stableHash } from './model.js';
 import { DOT_GLYPHS } from './dot-glyphs.js';
+import { DOT_BODY } from './dot-body.js';
 import type { EngineOwnerProjection, OwnerActivityKind } from './pet-engine.js';
 
 export interface DotField { points: number[][]; materials: number[][] }
 type Verb = OwnerActivityKind | 'waiting' | 'done';
 const TAU = Math.PI * 2;
 const clamp = (n: number, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, n));
+const ease = (n: number) => { const u = clamp(n); return u * u * (3 - 2 * u); };
+const WHALE_DOTS = 640, GLYPH_DOTS = 260;
 const GLYPH_POINTS = Object.fromEntries(Object.entries(DOT_GLYPHS).map(([key, rows]) => [key,
   rows.flatMap((row, y) => [...row].flatMap((pixel, x) => pixel === '#' ? [[(x - 23.5) / 38, (y - 23.5) / 38]] : [])),
 ])) as Record<Verb, number[][]>;
 const HUES: Record<Verb, number> = {
-  reading: 185, editing: 325, searching: 43, testing: 214, executing: 249,
-  browsing: 203, computer: 198, memory: 169, tool: 222, thinking: 155,
-  responding: 185, delegating: 276, waiting: 38, done: 165,
+  reading: 185, editing: 190, searching: 194, testing: 201, executing: 198,
+  browsing: 195, computer: 198, memory: 180, tool: 195, thinking: 185,
+  responding: 188, delegating: 192, waiting: 38, done: 180,
 };
 
 function verb(a: EngineOwnerProjection, timeMs: number): Verb | null {
@@ -49,8 +52,8 @@ function stroke(path: number[][], u: number): number[] {
   return path[0];
 }
 
-export function projectDotField(body: readonly number[][], activity: EngineOwnerProjection,
-  timeMs: number, still = false): DotField {
+export function projectDotField(activity: EngineOwnerProjection,
+  timeMs: number, still = false, expressionAtMs = 0): DotField {
   const kind = verb(activity, timeMs), identity = activity.actionId || activity.activityKind || 'whale';
   const seed = stableHash(identity), variant = (seed % 997) / 997;
   const t = still ? 0 : timeMs / 1000, cycle = still ? .43 : (t / (2.8 + variant * .6)) % 1;
@@ -58,16 +61,26 @@ export function projectDotField(body: readonly number[][], activity: EngineOwner
   const glyph = kind ? GLYPH_POINTS[kind] : null;
   const fresh = activity.freshness === 'fresh' && activity.observed;
   const failed = fresh && !activity.activeSpans.length && !!activity.failedToolAge;
+  const phase = ((Math.max(0, timeMs - expressionAtMs) / 1000 + 1.7) % 8.4);
+  const morph = !kind ? 0 : still ? 1 : kind === 'done'
+    ? 1 - ease((timeMs - (activity.observedAtMs ?? timeMs) - 180) / 900)
+    : ease(phase / 1.7) * (1 - ease((phase - 5.4) / .9));
   const points: number[][] = [], materials: number[][] = [];
   const lens = [Math.sin(cycle * TAU) * .30, -.25 + scanRow * .16];
-  for (let i = 0; i < body.length; i++) {
+  for (let i = 0; i < DOT_BODY.length; i++) {
     const grain = ((i * 37) % 101) / 100;
-    let [x, y] = body[i], light = .65, alpha = fresh ? .7 : .42;
-    if (glyph && kind) {
-      if (i < glyph.length) {
-        [x, y] = glyph[i];
+    const [hx, hy] = DOT_BODY[i];
+    const tail = clamp((-hx - hy + .1) / .65);
+    const homeX = hx * 1.9 + (still ? 0 : .008 * Math.sin(t * .75 + hy * 5));
+    const homeY = hy * 1.9 + (still ? 0 : .009 * Math.sin(t * 1.1 + hx * 4)
+      + tail * .012 * Math.sin(t * 1.55 + hx * 7));
+    const bodyLight = .61 + .14 * clamp((hx + .45) / .9) + .035 * Math.cos(hy * 7);
+    let x = homeX, y = homeY, light = bodyLight, alpha = fresh ? .88 : .42;
+    if (glyph && kind && i >= WHALE_DOTS) {
+      if (i < WHALE_DOTS + GLYPH_DOTS) {
+        [x, y] = glyph[Math.floor((i - WHALE_DOTS) * glyph.length / GLYPH_DOTS)];
         let beam = Math.exp(-Math.pow((y - sweep) * 12, 2));
-        if (kind === 'searching') beam = Math.exp(-Math.pow((Math.hypot(x - lens[0], y - lens[1]) - .23) * 15, 2));
+        if (kind === 'searching') beam = .18 + .35 * (Math.sin(t * 1.3) + 1) / 2;
         if (kind === 'editing' || kind === 'responding') beam = Math.exp(-Math.pow((x - sweep) * 14, 2));
         if (kind === 'executing' || kind === 'tool') beam = Math.exp(-Math.pow((x - sweep) * 10, 2));
         if (kind === 'waiting') beam = .12;
@@ -76,10 +89,10 @@ export function projectDotField(body: readonly number[][], activity: EngineOwner
         alpha = .72 + beam * .26;
         if (kind === 'editing' && !still) y += .017 * beam * Math.sin(x * 24);
       } else {
-        const count = body.length - glyph.length, j = i - glyph.length, u = j / Math.max(1, count - 1);
+        const count = DOT_BODY.length - WHALE_DOTS - GLYPH_DOTS, j = i - WHALE_DOTS - GLYPH_DOTS, u = j / Math.max(1, count - 1);
         const lane = j % 4, flow = still ? u : (u + cycle) % 1;
         light = .61 + grain * .16;
-        alpha = .48 + grain * .28;
+        alpha = .42 + grain * .24;
         switch (kind) {
           case 'reading': {
             if (u < .7) [x, y] = stroke([[-.76, -.72], [-.08, -.68], [0, -.61], [.08, -.68], [.76, -.72], [.76, .72], [.08, .76], [0, .70], [-.08, .76], [-.76, .72], [-.76, -.72]], u / .7);
@@ -149,25 +162,30 @@ export function projectDotField(body: readonly number[][], activity: EngineOwner
           }
         }
       }
+      const lettering = i < WHALE_DOTS + GLYPH_DOTS;
+      x = lettering ? x * .38 - .20 : x * .24 + .31;
+      y = lettering ? y * .38 - .20 : y * .24 - .25;
+      if (!still) {
+        const px = x, py = y;
+        x += .009 * Math.sin(py * 12 - t * 1.3) + .003 * Math.sin(px * 24 + py * 8 + t * 2.1);
+        y += .007 * Math.sin(px * 13 + t * 1.05) + .003 * Math.cos(py * 26 - px * 6 - t * 1.7);
+      }
+      x = homeX + (x - homeX) * morph; y = homeY + (y - homeY) * morph;
+      light = bodyLight + (light - bodyLight) * morph;
+      alpha = .88 + (alpha - .88) * morph;
     }
-    if (glyph && !still) {
-      const px = x, py = y;
-      const breath = 1 + .018 * Math.sin(t * 1.15);
-      const current = .026 * Math.sin(py * 4.2 - t * 1.3);
-      x = px * breath + current + .009 * Math.sin(px * 9 + py * 3 + t * 2.1);
-      y = py * breath + .021 * Math.sin(px * 4.8 + t * 1.05)
-        + .008 * Math.cos(py * 10 - px * 2 - t * 1.7);
-      light = clamp(light + .035 * Math.sin(px * 5 - py * 4 - t * 1.8), .5, .9);
-    }
+    if (!still) light = clamp(light + .025 * Math.sin(hx * 10 - hy * 5 - t * 1.1), .5, .9);
     points.push([clamp(x, -.94, .94), clamp(y, -.94, .94)]);
-    const color = !fresh ? [145, 166, 178] : pigment((failed ? 16 : kind ? HUES[kind] : 188) + variant * 16 - 8, light);
+    const hue = i >= WHALE_DOTS && morph > 0 ? (failed ? 16 : kind ? HUES[kind] : 188) : 188;
+    const base = pigment(188 + variant * 6 - 3, light), accent = pigment(hue + variant * 6 - 3, light);
+    const color = !fresh ? [145, 166, 178] : base.map((v, k) => Math.round(v + (accent[k] - v) * morph));
     materials.push([...color, alpha]);
   }
   return { points, materials };
 }
 
 export function blendDotFields(from: DotField, to: DotField, progress: number): DotField {
-  const u = clamp(progress), mix = u * u * (3 - 2 * u);
+  const mix = ease(progress);
   if (mix >= 1) return to;
   return {
     points: to.points.map((p, i) => p.map((v, k) => from.points[i][k] + (v - from.points[i][k]) * mix)),
