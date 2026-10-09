@@ -583,10 +583,17 @@ async fn queued_child_cancel_preserves_checkpoint_without_dispatching_a_fresh_re
 
 #[tokio::test(flavor = "current_thread")]
 async fn actual_child_transport_services_approval_and_cancel_with_saturated_steer_queue() {
+    use crate::approval_log::{ApprovalDecider, ApprovalOutcome};
     use crate::llm_client::mock::canned;
     use crate::tools::subagent::engine::{drive_child_actor, send_test_child_input};
     use crate::tools::subagent::{ChildApprovalOutcome, SubAgentStatus};
-    for cancel in [false, true] {
+    for (cancel, by, approved) in [
+        (false, ApprovalDecider::User, true),
+        (false, ApprovalDecider::SessionRule, true),
+        (false, ApprovalDecider::Posture, false),
+        (false, ApprovalDecider::Host, false),
+        (true, ApprovalDecider::User, true),
+    ] {
         let dir = tempdir().unwrap();
         let _home = crate::test_support::SealedHome::at(dir.path());
         let (_old, _old_handle, captured, _) = fixture(dir.path(), Some(vec!["bash".into()]));
@@ -619,6 +626,8 @@ async fn actual_child_transport_services_approval_and_cancel_with_saturated_stee
             4,
         )
         .await;
+        let receipt_store = core.approval_receipt_store.clone().unwrap();
+        let receipt_session = core.session.id.clone();
         let manager = job.authority.runtime.manager.clone();
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(2));
@@ -667,11 +676,16 @@ async fn actual_child_transport_services_approval_and_cancel_with_saturated_stee
             if cancel {
                 job.authority.runtime.cancel_token.cancel();
             } else {
+                let answer = if approved {
+                    ChildApprovalOutcome::Approved { by }
+                } else {
+                    ChildApprovalOutcome::Denied { by }
+                };
                 assert!(
                     manager
                         .write()
                         .await
-                        .resolve_child_approval(&approval_id, ChildApprovalOutcome::Approved)
+                        .resolve_child_approval(&approval_id, answer)
                 );
             }
             drop(input_tx);
@@ -720,11 +734,27 @@ async fn actual_child_transport_services_approval_and_cancel_with_saturated_stee
             assert_eq!(mock.call_count(), 1);
         } else {
             assert_eq!(result.status, SubAgentStatus::Completed);
-            assert_eq!(
-                std::fs::read_to_string(dir.path().join("effect.txt")).unwrap(),
-                "child"
-            );
+            if approved {
+                assert_eq!(
+                    std::fs::read_to_string(dir.path().join("effect.txt")).unwrap(),
+                    "child"
+                );
+            } else {
+                assert!(!dir.path().join("effect.txt").exists());
+            }
             assert_eq!(mock.call_count(), 2);
+            let replay = receipt_store.replay(&receipt_session).unwrap();
+            assert!(replay.unmatched_asks.is_empty());
+            assert_eq!(replay.completed.len(), 1);
+            assert_eq!(replay.completed[0].decided_by, Some(by));
+            assert_eq!(
+                replay.completed[0].outcome,
+                if approved {
+                    ApprovalOutcome::ApprovedOnce
+                } else {
+                    ApprovalOutcome::Denied
+                }
+            );
         }
         assert!(result.checkpoint.is_some());
         let checkpoint = result.checkpoint.as_ref().unwrap();

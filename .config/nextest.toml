@@ -78,8 +78,9 @@ test-group = 'fleet-manager-lifecycle'
 
 [[profile.default.overrides]]
 # DSH preparation also launches the isolated host against the shared hermetic
-# home. Keep its ACL grants/retirement in this existing serial lane.
-filter = 'package(codewhale-tui) & kind(lib) & (test(/^extension_host::/) | test(/^core::engine::.*extension/) | test(/^plugins::install::dsh::/) | test(/^plugins::tests::dsh_/) | test(/^runtime_api::tests::dsh_package_preview_then_exact_install_over_http$/) | test(/^commands::contract::tests::plugin_adapter_dsh_preview_runs_from_live_runtime$/) | test(/^commands::groups::plugins::tests::dsh_import_reviews_without_installing_then_installs_the_exact_bundle$/))'
+# home. OCR/PDF consumers also launch real hosts outside extension_host's
+# namespace. Keep their process lifecycle checks in this existing serial lane.
+filter = 'package(codewhale-tui) & kind(lib) & (test(/^extension_host::/) | test(/^tools::image_ocr::host_tests::/) | test(/^tools::pdf::host_tests::/) | test(/^core::engine::.*extension/) | test(/^plugins::install::dsh::/) | test(/^plugins::tests::dsh_/) | test(/^runtime_api::tests::dsh_package_preview_then_exact_install_over_http$/) | test(/^commands::contract::tests::plugin_adapter_dsh_preview_runs_from_live_runtime$/) | test(/^commands::groups::plugins::tests::dsh_import_reviews_without_installing_then_installs_the_exact_bundle$/))'
 test-group = 'extension-host'
 
 [[profile.default.overrides]]

@@ -326,10 +326,10 @@ fn test_patch_undo_requests_session_resync_after_restore() {
 
     let repo = SnapshotRepo::open_or_init(&workspace).unwrap();
     std::fs::write(workspace.join("a.txt"), b"original").unwrap();
-    repo.snapshot_with_session("pre-turn:1", Some("test-session"))
+    repo.snapshot_with_session("pre-turn:1: please edit a.txt", Some("test-session"))
         .unwrap();
     std::fs::write(workspace.join("a.txt"), b"modified").unwrap();
-    repo.snapshot_with_session("post-turn:1", Some("test-session"))
+    repo.snapshot_with_session("post-turn:1: please edit a.txt", Some("test-session"))
         .unwrap();
 
     let mut app = create_test_app();
@@ -432,10 +432,10 @@ fn test_patch_undo_prunes_pre_turn_context() {
     let repo = SnapshotRepo::open_or_init(&workspace).unwrap();
     let file = workspace.join("a.txt");
     std::fs::write(&file, b"alpha").unwrap();
-    repo.snapshot_with_session("pre-turn:1", Some("test-session"))
+    repo.snapshot_with_session("pre-turn:1: please edit a.txt", Some("test-session"))
         .unwrap();
     std::fs::write(&file, b"alpha-fixed").unwrap();
-    repo.snapshot_with_session("post-turn:1", Some("test-session"))
+    repo.snapshot_with_session("post-turn:1: please edit a.txt", Some("test-session"))
         .unwrap();
 
     let mut app = create_test_app();
@@ -890,6 +890,209 @@ fn undo_never_reverts_files_of_a_request_the_conversation_still_holds() {
     assert!(app.api_messages.is_empty());
 }
 
+/// Identity refusals must reach the command as refusals, rather than its
+/// conversation-only fallback, and must run before a forced safety snapshot.
+fn assert_undo_identity_refused(fx: &UndoFixture, app: &mut App) {
+    let messages = app.api_messages.as_ref().clone();
+    let history_len = app.history.len();
+    let snapshots: Vec<_> = fx
+        .repo
+        .list(usize::MAX)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    let contents = fx.read("a.txt");
+    for command in ["/undo", "/undo force"] {
+        let result = super::execute(command, app);
+        assert!(
+            result.message.as_deref().is_some_and(|message| {
+                message
+                    .starts_with("Nothing was undone. This restore point cannot be matched safely")
+                    && message.contains("/restore")
+            }),
+            "{command}: {:?}",
+            result.message
+        );
+        assert!(result.action.is_none(), "no conversation-only fallback");
+        assert_eq!(app.api_messages.as_ref(), &messages);
+        assert_eq!(app.history.len(), history_len);
+        assert_eq!(fx.read("a.txt"), contents);
+        assert_eq!(
+            fx.repo
+                .list(usize::MAX)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            snapshots,
+            "identity refusal creates no backup"
+        );
+    }
+}
+
+#[test]
+fn undo_refuses_repeated_requests_even_after_a_conversation_rewind() {
+    for rewind in [false, true] {
+        let fx = UndoFixture::new();
+        fx.write("a.txt", "a0");
+        fx.snapshot("pre-turn:1: continue", "s1");
+        fx.write("a.txt", "a1");
+        fx.snapshot("post-turn:1: continue", "s1");
+        fx.snapshot("pre-turn:2: continue", "s1");
+        fx.snapshot("post-turn:2: continue", "s1");
+        let mut app = fx.app("s1");
+        push_exchange(&mut app, "continue");
+        if !rewind {
+            push_exchange(&mut app, "continue");
+        }
+        // Previously the no-op second request was skipped, then the first
+        // request's files were restored while the last held exchange vanished.
+        assert_undo_identity_refused(&fx, &mut app);
+    }
+}
+
+#[test]
+fn undo_refuses_lossy_shared_prefix_and_first_line_labels() {
+    let prefix = "x".repeat(100);
+    for (first, second) in [
+        (format!("{prefix} first"), format!("{prefix} second")),
+        (
+            "edit a.txt\nfirst change".into(),
+            "edit a.txt\nsecond change".into(),
+        ),
+    ] {
+        let fx = UndoFixture::new();
+        fx.write("a.txt", "a0");
+        fx.snapshot(
+            &crate::core::turn::format_snapshot_label("pre-turn", 1, Some(&first)),
+            "s1",
+        );
+        fx.write("a.txt", "a1");
+        fx.snapshot(
+            &crate::core::turn::format_snapshot_label("post-turn", 1, Some(&first)),
+            "s1",
+        );
+        fx.snapshot(
+            &crate::core::turn::format_snapshot_label("pre-turn", 2, Some(&second)),
+            "s1",
+        );
+        fx.snapshot(
+            &crate::core::turn::format_snapshot_label("post-turn", 2, Some(&second)),
+            "s1",
+        );
+        let mut app = fx.app("s1");
+        push_exchange(&mut app, &first);
+        push_exchange(&mut app, &second);
+        assert_undo_identity_refused(&fx, &mut app);
+    }
+}
+
+#[test]
+fn undo_refuses_a_unique_lossy_prompt_even_without_a_collision() {
+    for prompt in ["x".repeat(101), "edit a.txt\nwith a second line".into()] {
+        let fx = UndoFixture::new();
+        fx.write("a.txt", "a0");
+        fx.snapshot(
+            &crate::core::turn::format_snapshot_label("pre-turn", 1, Some(&prompt)),
+            "s1",
+        );
+        fx.write("a.txt", "a1");
+        fx.snapshot(
+            &crate::core::turn::format_snapshot_label("post-turn", 1, Some(&prompt)),
+            "s1",
+        );
+        let mut app = fx.app("s1");
+        push_exchange(&mut app, &prompt);
+        assert_undo_identity_refused(&fx, &mut app);
+    }
+}
+
+#[test]
+fn undo_refuses_missing_prompt_labels_and_multipart_requests() {
+    for kind in 0..4 {
+        let fx = UndoFixture::new();
+        fx.write("a.txt", "a0");
+        fx.snapshot(
+            if kind == 0 {
+                "pre-turn:1"
+            } else {
+                "pre-turn:1: edit a.txt"
+            },
+            "s1",
+        );
+        fx.write("a.txt", "a1");
+        // Leave the end open so /undo force would otherwise write a backup.
+        let mut app = fx.app("s1");
+        if kind == 0 {
+            push_exchange(&mut app, "edit a.txt");
+        } else {
+            let image = ContentBlock::ImageUrl {
+                image_url: codewhale_models::ImageUrlContent {
+                    url: "data:image/png;base64,AAAA".into(),
+                },
+            };
+            let text = ContentBlock::Text {
+                text: "edit a.txt".into(),
+                cache_control: None,
+            };
+            app.api_messages_mut().push(Message {
+                role: Role::User,
+                content: match kind {
+                    1 => vec![image],
+                    2 => vec![text, image],
+                    _ => vec![
+                        text,
+                        ContentBlock::Text {
+                            text: "second instruction".into(),
+                            cache_control: None,
+                        },
+                    ],
+                },
+            });
+        }
+        assert_undo_identity_refused(&fx, &mut app);
+    }
+}
+
+#[test]
+fn undo_identity_guard_includes_history_only_requests() {
+    let fx = UndoFixture::new();
+    fx.write("a.txt", "a0");
+    fx.snapshot("pre-turn:1: continue", "s1");
+    fx.write("a.txt", "a1");
+    fx.snapshot("post-turn:1: continue", "s1");
+    let mut app = fx.app("s1");
+    for _ in 0..2 {
+        app.history.push(HistoryCell::User {
+            content: "continue".into(),
+        });
+    }
+    assert_undo_identity_refused(&fx, &mut app);
+}
+
+#[test]
+fn undo_keeps_lossless_hundred_character_unicode_prompts_available() {
+    let fx = UndoFixture::new();
+    let prompt = "漢".repeat(100);
+    fx.write("a.txt", "a0");
+    fx.snapshot(
+        &crate::core::turn::format_snapshot_label("pre-turn", 1, Some(&prompt)),
+        "s1",
+    );
+    fx.write("a.txt", "a1");
+    fx.snapshot(
+        &crate::core::turn::format_snapshot_label("post-turn", 1, Some(&prompt)),
+        "s1",
+    );
+    let mut app = fx.app("s1");
+    push_exchange(&mut app, &prompt);
+    let result = super::execute("/undo", &mut app);
+    assert!(!result.is_error, "{:?}", result.message);
+    assert_eq!(fx.read("a.txt"), "a0");
+    assert!(app.history.is_empty() && app.api_messages.is_empty());
+}
+
 /// A file the older request changed was edited since. That refusal belongs
 /// to the older request: the newer one, which changed no files, still comes
 /// off first, and the refusal is shown once the older request is the last.
@@ -950,11 +1153,10 @@ fn undo_takes_a_newer_request_off_before_refusing_an_older_one() {
     );
 }
 
-/// Esc Esc rewinds the conversation and leaves the files. `/undo` afterwards
-/// puts that request's files back and leaves the older conversation alone,
-/// and the message says the conversation was not changed.
+/// A restore point absent from a held conversation has no proven request
+/// identity, even when both display labels are distinct and lossless.
 #[test]
-fn undo_after_a_conversation_rewind_restores_files_and_keeps_the_conversation() {
+fn undo_refuses_an_unmatched_restore_point_after_a_partial_conversation_rewind() {
     let fx = UndoFixture::new();
     fx.write("a.txt", "a0");
     fx.snapshot("pre-turn:1: say hello", "s1");
@@ -962,21 +1164,28 @@ fn undo_after_a_conversation_rewind_restores_files_and_keeps_the_conversation() 
     fx.snapshot("pre-turn:2: edit a.txt", "s1");
     fx.write("a.txt", "a1");
     fx.snapshot("post-turn:2: edit a.txt", "s1");
-
     let mut app = fx.app("s1");
-    // The rewind already dropped "edit a.txt"; "say hello" is what is left.
     push_exchange(&mut app, "say hello");
+    assert_undo_identity_refused(&fx, &mut app);
+}
 
+/// File-only undo still works after all requests have been rewound away.
+#[test]
+fn undo_after_a_full_conversation_rewind_restores_files_without_messages() {
+    let fx = UndoFixture::new();
+    fx.write("a.txt", "a0");
+    fx.snapshot("pre-turn:1: edit a.txt", "s1");
+    fx.write("a.txt", "a1");
+    fx.snapshot("post-turn:1: edit a.txt", "s1");
+    let mut app = fx.app("s1");
     let result = super::execute("/undo", &mut app);
-
     assert_eq!(fx.read("a.txt"), "a0", "{:?}", result.message);
-    assert_eq!(app.api_messages.len(), 2, "the older exchange stays");
-    assert_eq!(app.history.len(), 2);
-    assert_eq!(
-        result.message.as_deref(),
-        Some(
-            "Undid your request \"edit a.txt\". 1 file is back as it was before it:\n  restored a.txt\nThe conversation was not changed."
-        )
+    assert!(app.api_messages.is_empty() && app.history.is_empty());
+    assert!(
+        result
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("The conversation was not changed."))
     );
 }
 

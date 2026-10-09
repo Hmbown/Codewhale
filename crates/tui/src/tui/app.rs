@@ -1594,6 +1594,8 @@ pub struct App {
     /// Receipts are aligned to transcript cells because provider context can
     /// be compacted or purged without changing what remains visible.
     completed_assistant_outputs: Vec<CompletedAssistantOutputReceipt>,
+    /// Exact completed Plan text awaiting this session/turn's host answer.
+    pub(crate) pending_plan_handoff: Option<crate::tui::plan_handoff::PendingPlanHandoff>,
     pub(crate) context_token_cache: RefCell<ContextTokenCache>,
     /// Typed account-owned browser relay for this exact TUI session.
     pub remote_control: crate::remote_control::RemoteControlController,
@@ -5014,6 +5016,7 @@ impl App {
         self.history.clear();
         self.history_revisions.clear();
         self.completed_assistant_outputs.clear();
+        self.pending_plan_handoff = None;
         self.context_references_by_cell.clear();
         self.session_context_references.clear();
         self.session_artifacts.clear();
@@ -5071,6 +5074,85 @@ impl App {
             .rev()
             .find(|receipt| !receipt.text.trim().is_empty())
             .map(|receipt| receipt.text.as_str())
+    }
+
+    /// Freeze only output completed inside this turn's transcript boundary.
+    /// Restored/older receipts cannot cause a new hand-off.
+    pub(crate) fn prepare_plan_handoff(
+        &mut self,
+        status: crate::core::events::TurnOutcomeStatus,
+        turn_id: Option<&str>,
+        has_open_todos: bool,
+    ) -> Option<String> {
+        let receipt = self
+            .completed_assistant_outputs
+            .iter()
+            .rev()
+            .find(|receipt| {
+                receipt.history_index >= self.ocean_turn_history_start
+                    && receipt.history_index < self.history.len()
+            });
+        if !crate::tui::plan_handoff::plan_ready(
+            self.mode,
+            status,
+            receipt.map(|receipt| receipt.text.as_str()),
+        ) {
+            return None;
+        }
+        let session_id = self.current_session_id.as_ref()?;
+        let turn_id = turn_id.filter(|id| self.runtime_turn_id.as_deref() == Some(*id))?;
+        if self.pending_plan_handoff.is_some() {
+            return None;
+        }
+        let request_id = format!(
+            "{}:{}:{}:{}",
+            crate::tui::plan_handoff::REQUEST_ID,
+            session_id.len(),
+            session_id,
+            turn_id
+        );
+        self.pending_plan_handoff = Some(crate::tui::plan_handoff::PendingPlanHandoff {
+            request_id: request_id.clone(),
+            session_id: session_id.clone(),
+            turn_id: turn_id.to_string(),
+            history_start: self.ocean_turn_history_start,
+            transcript_epoch: self.transcript_identity_epoch,
+            text: receipt?.text.clone(),
+            // Only successful typed receipts inside this turn can preserve a
+            // checklist. Tool evidence can outlive UI-initiated dispatch.
+            has_current_checklist: has_open_todos
+                && self.history.get(self.ocean_turn_history_start..).is_some_and(|cells| {
+                    cells.iter().any(|cell| {
+                        matches!(cell, HistoryCell::Tool(crate::tui::history::ToolCell::Generic(tool))
+                            if tool.status == crate::tui::history::ToolStatus::Success
+                                && crate::tui::history::is_checklist_tool_name(&tool.name))
+                    })
+                }),
+            seeded_todo_id: None,
+        });
+        Some(request_id)
+    }
+
+    pub(crate) fn plan_handoff_is_current(
+        &self,
+        plan: &crate::tui::plan_handoff::PendingPlanHandoff,
+        request_id: &str,
+    ) -> bool {
+        plan.request_id == request_id
+            && self.current_session_id.as_deref() == Some(plan.session_id.as_str())
+            && self.runtime_turn_id.as_deref() == Some(plan.turn_id.as_str())
+            && self.ocean_turn_history_start == plan.history_start
+            && self.transcript_identity_epoch == plan.transcript_epoch
+            && self.mode == AppMode::Plan
+            && !self.is_loading
+            && !self.dispatch_in_flight
+            && self.pending_steers.is_empty()
+            && !self.remote_control.runtime_chat_blocks_local_dispatch()
+            && self.queued_message_count() == 0
+            && self.queued_draft.is_none()
+            && self.input.is_empty()
+            && self.view_stack.is_empty()
+            && self.agent_focus.is_none()
     }
 
     /// Pop the trailing history cell, keeping revisions in sync.

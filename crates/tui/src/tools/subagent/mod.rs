@@ -3948,11 +3948,15 @@ pub(crate) fn child_approval_keys(agent_id: &str, name: &str, input: &Value) -> 
     )
 }
 
-/// A person's answer to an approval prompt raised for a child's tool call.
+/// An answer to a child's approval prompt, preserving who made the decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildApprovalOutcome {
-    Approved,
-    Denied,
+    Approved {
+        by: crate::approval_log::ApprovalDecider,
+    },
+    Denied {
+        by: crate::approval_log::ApprovalDecider,
+    },
     /// The host could not put the request in front of a person (for example
     /// it belongs to a conversation that is no longer shown). Recorded as
     /// `unavailable`, never as the person's denial.

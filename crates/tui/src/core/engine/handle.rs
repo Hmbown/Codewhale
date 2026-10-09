@@ -590,11 +590,20 @@ impl EngineHandle {
     async fn send_approval(&self, decision: ApprovalDecision) -> Result<()> {
         use crate::tools::subagent::ChildApprovalOutcome;
         let child = match &decision {
-            ApprovalDecision::Approved { id, .. } => Some((id, ChildApprovalOutcome::Approved)),
-            ApprovalDecision::Denied { id, .. } => Some((id, ChildApprovalOutcome::Denied)),
+            ApprovalDecision::Approved { id, by } => {
+                Some((id, ChildApprovalOutcome::Approved { by: *by }))
+            }
+            ApprovalDecision::Denied { id, by } => {
+                Some((id, ChildApprovalOutcome::Denied { by: *by }))
+            }
             // An agent has no timeout outcome of its own (#6101): an expired
             // card is a deny for whichever call it was answering.
-            ApprovalDecision::TimedOut { id } => Some((id, ChildApprovalOutcome::Denied)),
+            ApprovalDecision::TimedOut { id } => Some((
+                id,
+                ChildApprovalOutcome::Denied {
+                    by: ApprovalDecider::Host,
+                },
+            )),
             ApprovalDecision::Unavailable { id } => Some((id, ChildApprovalOutcome::Unavailable)),
             // A sandbox retry only exists for the parent's own tool call.
             ApprovalDecision::RetryWithPolicy { .. } => None,

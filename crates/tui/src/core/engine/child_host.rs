@@ -681,8 +681,8 @@ impl Engine {
                         handle.cancel();
                     } else {
                         match decision {
-                            Ok(crate::tools::subagent::ChildApprovalOutcome::Approved) => handle.approve_tool_call(id).await?,
-                            Ok(crate::tools::subagent::ChildApprovalOutcome::Denied) => handle.deny_tool_call(id).await?,
+                            Ok(crate::tools::subagent::ChildApprovalOutcome::Approved { by }) => handle.approve_tool_call_by(id, by).await?,
+                            Ok(crate::tools::subagent::ChildApprovalOutcome::Denied { by }) => handle.deny_tool_call_by(id, by).await?,
                             _ => handle.deny_tool_call_unavailable(id).await?,
                         }
                     }

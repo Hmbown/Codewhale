@@ -111,7 +111,7 @@ fn repeated_provider_id_ask_rejects_stale_answer_and_keeps_local_artifact_origin
                                         .await
                                         .expect("queued decisions are consumed")
                                         .unwrap(),
-                                    ChildApprovalOutcome::Approved
+                                    ChildApprovalOutcome::Approved { by: crate::approval_log::ApprovalDecider::User }
                                 );
                                 let receipts = receipt_store.load(&session_id).unwrap();
                                 assert_eq!(receipts.len(), 3, "stale answer cannot decide the second Ask");

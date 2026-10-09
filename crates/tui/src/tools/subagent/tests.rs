@@ -323,23 +323,42 @@ async fn child_execution_identity_cannot_replace_a_waiter_or_answer_a_later_call
             .register_child_approval("other", &first, "bash", "wrong owner")
             .is_err()
     );
-    assert!(manager.resolve_child_approval(&first, ChildApprovalOutcome::Denied));
+    assert!(manager.resolve_child_approval(
+        &first,
+        ChildApprovalOutcome::Denied {
+            by: crate::approval_log::ApprovalDecider::User
+        }
+    ));
     assert!(matches!(
         receiver.await.unwrap(),
-        ChildApprovalOutcome::Denied
+        ChildApprovalOutcome::Denied {
+            by: crate::approval_log::ApprovalDecider::User
+        }
     ));
     let (_, mut receiver) = manager
         .register_child_approval("child", &second, "bash", "two")
         .unwrap();
-    assert!(!manager.resolve_child_approval(&first, ChildApprovalOutcome::Approved));
+    assert!(!manager.resolve_child_approval(
+        &first,
+        ChildApprovalOutcome::Approved {
+            by: crate::approval_log::ApprovalDecider::User
+        }
+    ));
     assert!(matches!(
         receiver.try_recv(),
         Err(tokio::sync::oneshot::error::TryRecvError::Empty)
     ));
-    assert!(manager.resolve_child_approval(&second, ChildApprovalOutcome::Approved));
+    assert!(manager.resolve_child_approval(
+        &second,
+        ChildApprovalOutcome::Approved {
+            by: crate::approval_log::ApprovalDecider::User
+        }
+    ));
     assert!(matches!(
         receiver.await.unwrap(),
-        ChildApprovalOutcome::Approved
+        ChildApprovalOutcome::Approved {
+            by: crate::approval_log::ApprovalDecider::User
+        }
     ));
 }
 
@@ -20091,7 +20110,12 @@ async fn status_waiting_is_derived_from_pending_store() {
         None,
         Some("bash".to_string()),
     );
-    assert!(inner.resolve_child_approval(&approval_id, ChildApprovalOutcome::Approved));
+    assert!(inner.resolve_child_approval(
+        &approval_id,
+        ChildApprovalOutcome::Approved {
+            by: crate::approval_log::ApprovalDecider::User
+        }
+    ));
     let record = inner.get_worker_record(&agent_id).expect("worker record");
     assert_ne!(record.status, AgentWorkerStatus::WaitingForUser);
     assert!(record.pending_request.is_none());
@@ -24379,10 +24403,21 @@ mod child_permission_gate {
 
     #[tokio::test]
     async fn ask_with_a_prompting_host_raises_the_prompt_and_honours_the_answer() {
-        for (answer, expect_ok) in [
-            (ChildApprovalOutcome::Approved, true),
-            (ChildApprovalOutcome::Denied, false),
-        ] {
+        use crate::approval_log::ApprovalDecider;
+        for (by, expect_ok) in [
+            ApprovalDecider::User,
+            ApprovalDecider::SessionRule,
+            ApprovalDecider::Posture,
+            ApprovalDecider::Host,
+        ]
+        .into_iter()
+        .flat_map(|by| [(by, true), (by, false)])
+        {
+            let answer = if expect_ok {
+                ChildApprovalOutcome::Approved { by }
+            } else {
+                ChildApprovalOutcome::Denied { by }
+            };
             let (registry, mut rx, manager) =
                 worker_registry(ApprovalMode::Suggest, false, true, None);
             let (receipt_store, session_id) = receipt_context(&registry);
@@ -24465,10 +24500,18 @@ mod child_permission_gate {
                 (true, Ok(output)) => assert!(output.contains("gated"), "{output}"),
                 (false, Err(err)) => {
                     assert!(
-                        matches!(err.downcast_ref::<ToolError>(), Some(ToolError::PermissionDenied { message })
-                            if message.starts_with("Tool 'bash' denied by user — ")),
+                        matches!(
+                            err.downcast_ref::<ToolError>(),
+                            Some(ToolError::PermissionDenied { .. })
+                        ),
                         "{err}"
                     );
+                    if by == ApprovalDecider::User {
+                        assert!(
+                            err.to_string().starts_with("Tool 'bash' denied by user — "),
+                            "{err}"
+                        );
+                    }
                 }
                 (true, Err(err)) => panic!("approved call must run: {err}"),
                 (false, Ok(output)) => panic!("denied call must not run: {output}"),
@@ -24484,6 +24527,7 @@ mod child_permission_gate {
                 ApprovalOutcome::Denied
             };
             assert_eq!(replay.completed[0].outcome, expected_outcome);
+            assert_eq!(replay.completed[0].decided_by, Some(by));
             assert!(matches!(
                 &replay.completed[0].ask,
                 ApprovalReceipt::Asked { tool_name, .. } if tool_name == "bash"
@@ -24542,10 +24586,12 @@ mod child_permission_gate {
                         ..
                     } = event
                     {
-                        manager_for_answer
-                            .write()
-                            .await
-                            .resolve_child_approval(&id, ChildApprovalOutcome::Denied);
+                        manager_for_answer.write().await.resolve_child_approval(
+                            &id,
+                            ChildApprovalOutcome::Denied {
+                                by: crate::approval_log::ApprovalDecider::User,
+                            },
+                        );
                         return (approval_key, approval_grouping_key);
                     }
                 }
@@ -24671,7 +24717,12 @@ mod child_permission_gate {
                     .task_handle
                     .is_some()
             );
-            assert!(!manager.resolve_child_approval(&approval_id, ChildApprovalOutcome::Approved));
+            assert!(!manager.resolve_child_approval(
+                &approval_id,
+                ChildApprovalOutcome::Approved {
+                    by: crate::approval_log::ApprovalDecider::User
+                }
+            ));
         }
         let requested = manager.read().await.get_result(&agent_id).expect("agent");
         let settled = settle_requested_child(&manager, requested).await;
@@ -24695,12 +24746,12 @@ mod child_permission_gate {
         );
         assert_completed_receipt(&receipt_store, &session_id, ApprovalOutcome::Cancelled);
         // A late answer finds nobody waiting and applies to nothing.
-        assert!(
-            !manager
-                .write()
-                .await
-                .resolve_child_approval(&approval_id, ChildApprovalOutcome::Approved)
-        );
+        assert!(!manager.write().await.resolve_child_approval(
+            &approval_id,
+            ChildApprovalOutcome::Approved {
+                by: crate::approval_log::ApprovalDecider::User
+            }
+        ));
     }
 
     #[tokio::test]
@@ -24756,12 +24807,12 @@ mod child_permission_gate {
             let id = next_child_approval_id(&mut rx).await;
             // The person takes several tool timeouts to decide.
             tokio::time::sleep(Duration::from_secs(3)).await;
-            assert!(
-                manager_for_answer
-                    .write()
-                    .await
-                    .resolve_child_approval(&id, ChildApprovalOutcome::Approved)
-            );
+            assert!(manager_for_answer.write().await.resolve_child_approval(
+                &id,
+                ChildApprovalOutcome::Approved {
+                    by: crate::approval_log::ApprovalDecider::User
+                }
+            ));
         });
         let output = run_tool_with_person_aware_timeout(
             tool_timeout,
@@ -24907,12 +24958,12 @@ mod child_permission_gate {
             let approval_id = next_child_approval_id(&mut rx).await;
             std::fs::remove_file(&log_path).expect("remove log after durable ask");
             std::fs::create_dir(&log_path).expect("replace log with unwritable directory");
-            assert!(
-                manager_for_answer
-                    .write()
-                    .await
-                    .resolve_child_approval(&approval_id, ChildApprovalOutcome::Approved)
-            );
+            assert!(manager_for_answer.write().await.resolve_child_approval(
+                &approval_id,
+                ChildApprovalOutcome::Approved {
+                    by: crate::approval_log::ApprovalDecider::User
+                }
+            ));
         });
 
         let err = registry
@@ -25295,9 +25346,19 @@ mod child_permission_gate {
                 ));
                 let mut manager = manager.write().await;
                 assert_eq!(manager.pending_child_approvals(), 1);
-                assert!(manager.resolve_child_approval(&id, ChildApprovalOutcome::Denied));
+                assert!(manager.resolve_child_approval(
+                    &id,
+                    ChildApprovalOutcome::Denied {
+                        by: crate::approval_log::ApprovalDecider::User
+                    }
+                ));
                 assert!(
-                    !manager.resolve_child_approval(&id, ChildApprovalOutcome::Approved),
+                    !manager.resolve_child_approval(
+                        &id,
+                        ChildApprovalOutcome::Approved {
+                            by: crate::approval_log::ApprovalDecider::User
+                        }
+                    ),
                     "a late allow cannot replace the same denied request"
                 );
                 id
@@ -25521,12 +25582,12 @@ mod child_permission_gate {
             };
             // The person tightens Permissions, then answers the open card.
             live.switch_for_tests(ApprovalMode::Never);
-            assert!(
-                manager
-                    .write()
-                    .await
-                    .resolve_child_approval(&id, ChildApprovalOutcome::Approved)
-            );
+            assert!(manager.write().await.resolve_child_approval(
+                &id,
+                ChildApprovalOutcome::Approved {
+                    by: crate::approval_log::ApprovalDecider::User
+                }
+            ));
             id
         };
         let (result, id) = tokio::join!(call, answer);
@@ -25542,10 +25603,12 @@ mod child_permission_gate {
         );
         assert_completed_receipt(&receipt_store, &session_id, ApprovalOutcome::ApprovedOnce);
         assert!(
-            !manager
-                .write()
-                .await
-                .resolve_child_approval(&id, ChildApprovalOutcome::Approved),
+            !manager.write().await.resolve_child_approval(
+                &id,
+                ChildApprovalOutcome::Approved {
+                    by: crate::approval_log::ApprovalDecider::User
+                }
+            ),
             "a late allow cannot revive the already refused call"
         );
     }

@@ -2843,6 +2843,7 @@ pub(crate) async fn run_event_loop(
                         app.ocean_completion_started_at = None;
                         app.ocean_receipt_settle_start = None;
                         app.ocean_turn_history_start = app.history.len();
+                        app.pending_plan_handoff = None;
                         app.suppress_stream_events_until_turn_complete = false;
                         app.is_loading = true;
                         app.offline_mode = false;
@@ -3520,14 +3521,18 @@ pub(crate) async fn run_event_loop(
                             });
                         }
 
-                        // Plan hand-off: a Plan turn that left open To-do
-                        // steps asks how to go on instead of just ending.
+                        // Plan hand-off freezes this successful turn's exact
+                        // completed response, including prose-only plans.
                         // Only on an idle screen — a modal that takes digit
                         // keys must never land on a draft, a queued follow-up
                         // or another open view, and the answer goes to this
                         // session, not to a focused agent.
                         if queued_to_send.is_none()
                             && !newer_dispatch_owns_turn_state
+                            && !app.is_loading
+                            && !app.dispatch_in_flight
+                            && app.pending_steers.is_empty()
+                            && !app.remote_control.runtime_chat_blocks_local_dispatch()
                             && app.queued_message_count() == 0
                             && app.queued_draft.is_none()
                             && app.input.is_empty()
@@ -3535,14 +3540,17 @@ pub(crate) async fn run_event_loop(
                             && app.agent_focus.is_none()
                         {
                             let todos = app.todos.lock().await.snapshot();
-                            if crate::tui::plan_handoff::plan_ready(
-                                app.mode,
-                                status,
-                                &app.tool_evidence,
-                                &todos,
-                            ) {
+                            let has_open_todos =
+                                todos.items.iter().any(|item| !item.status.is_settled());
+                            if !was_locally_cancelled
+                                && let Some(request_id) = app.prepare_plan_handoff(
+                                    status,
+                                    completed_turn.as_ref().map(|turn| turn.turn_id.as_str()),
+                                    has_open_todos,
+                                )
+                            {
                                 app.view_stack.push(UserInputView::new(
-                                    crate::tui::plan_handoff::REQUEST_ID,
+                                    request_id,
                                     crate::tui::plan_handoff::request(app.ui_locale),
                                 ));
                                 app.needs_redraw = true;

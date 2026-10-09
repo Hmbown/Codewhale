@@ -206,16 +206,15 @@ fn session_sync_payload(app: &App) -> SessionSyncPayload {
     }
 }
 
-/// The prompts of this conversation's requests, oldest first, as a restore
-/// point's label carries them (`None` for a request without text).
-fn request_snippets(app: &App) -> Vec<Option<String>> {
-    use crate::core::turn::snapshot_label_prompt_snippet;
+/// Full text of this conversation's requests, oldest first. Missing text is
+/// retained: an image-only request is a boundary, not a request to skip.
+fn request_prompts(app: &App) -> Vec<Option<String>> {
     if app.api_messages.is_empty() {
         return app
             .history
             .iter()
             .filter_map(|cell| match cell {
-                HistoryCell::User { content } => Some(snapshot_label_prompt_snippet(content)),
+                HistoryCell::User { content } => Some(Some(content.clone())),
                 _ => None,
             })
             .collect();
@@ -229,27 +228,76 @@ fn request_snippets(app: &App) -> Vec<Option<String>> {
             )
         })
         .map(|message| {
-            crate::receipts::prompt_text(message)
-                .as_deref()
-                .and_then(snapshot_label_prompt_snippet)
+            let meta_index =
+                crate::runtime_handoff::turn_metadata_text(message).map(|(index, _)| index);
+            let mut content = message
+                .content
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| Some(*index) != meta_index);
+            // A text label cannot identify the rest of a multipart request.
+            match (content.next(), content.next()) {
+                (Some((_, codewhale_models::ContentBlock::Text { text, .. })), None) => {
+                    Some(text.clone())
+                }
+                _ => None,
+            }
         })
         .collect()
 }
 
-/// Where the request that restore point `label` starts sits in the
-/// conversation: its last request (`Some(true)`), an earlier one
-/// (`Some(false)`), or no longer in it (`None`).
-fn request_is_last(app: &App, label: &str) -> Option<bool> {
-    let request = crate::core::turn::parse_snapshot_label(label).prompt_snippet;
-    let requests = request_snippets(app);
-    // A label without a prompt cannot be matched: it is the last request's.
-    if request.is_none() || requests.last() == Some(&request) {
-        Some(true)
-    } else if requests.contains(&request) {
-        Some(false)
-    } else {
-        None
+/// Match only lossless, unique prompt labels. Display snippets are not durable
+/// request identities: repeated, multiline, truncated or multipart prompts cannot
+/// authorize a combined file/conversation rollback. `/restore` remains explicit.
+fn request_is_last(
+    requests: &[Option<String>],
+    owned_request_snippets: &[Option<String>],
+    label: &str,
+) -> Result<Option<bool>, Box<DebugUndoOutcome>> {
+    use crate::core::turn::{parse_snapshot_label, snapshot_label_prompt_snippet};
+    if requests.is_empty() {
+        return Ok(None);
     }
+    let refusal = || {
+        Box::new(DebugUndoOutcome::RestoreBlocked(
+            concat!(
+                "Nothing was undone. This restore point cannot be matched safely to a request ",
+                "in the conversation. Use /restore to choose a restore point explicitly.",
+            )
+            .to_string(),
+        ))
+    };
+    // A held request with missing or shortened text could be the candidate
+    // even when its display label appears to name an older request.
+    if requests.iter().any(|prompt| {
+        prompt.as_deref().is_none_or(|prompt| {
+            prompt.is_empty() || snapshot_label_prompt_snippet(prompt).as_deref() != Some(prompt)
+        })
+    }) {
+        return Err(refusal());
+    }
+    let request = parse_snapshot_label(label).prompt_snippet;
+    let Some(prompt) = request.as_deref().filter(|prompt| {
+        !prompt.is_empty() && snapshot_label_prompt_snippet(prompt).as_deref() == Some(*prompt)
+    }) else {
+        return Err(refusal());
+    };
+    let matches = requests
+        .iter()
+        .filter(|candidate| candidate.as_deref() == Some(prompt))
+        .count();
+    if matches != 1
+        || owned_request_snippets
+            .iter()
+            .filter(|candidate| candidate.as_deref() == Some(prompt))
+            .count()
+            > 1
+    {
+        // Snapshots outlive conversation rewinds, so checking only the held
+        // prompts would still confuse an older occurrence with the latest.
+        return Err(refusal());
+    }
+    Ok(Some(requests.last() == Some(&request)))
 }
 
 /// Deepest fork chain [`snapshot_owners`] follows. A chain this long is
@@ -358,6 +406,8 @@ pub(in crate::commands) struct UndoStep {
     /// The step has no recorded end and runs only because the user typed
     /// `force`: it also puts back edits made since the request started.
     pub(in crate::commands) forced: bool,
+    /// The validated request boundary, captured before any backup is taken.
+    request_is_last: Option<bool>,
 }
 
 /// Find the newest step of `snapshots` (newest first) that `owners` own and
@@ -381,10 +431,11 @@ pub(in crate::commands) struct UndoStep {
 /// whatever was edited since; that one is refused unless the user typed
 /// `force`.
 ///
-/// `newer_request_held` says whether the conversation still holds a request
-/// newer than the one a restore point's label names. Such a request left no
-/// file change to undo and comes off first (the caller's conversation-only
-/// undo), so the conversation never keeps a request whose files went back,
+/// `request_position` validates each non-no-op candidate before any backup or
+/// restore write and says whether it names the last held request. An earlier held request means
+/// the conversation still holds a request newer than this restore point. Such a
+/// request left no file change to undo and comes off first (the caller's
+/// conversation-only undo), so the conversation never keeps a request whose files went back,
 /// and a refusal about an older request never blocks taking a newer one off.
 ///
 /// Planning writes nothing, except when the newest step ends now: the
@@ -406,7 +457,7 @@ fn plan_undo_step(
     snapshots: Vec<crate::snapshot::Snapshot>,
     owners: &[SnapshotOwner],
     force: bool,
-    newer_request_held: &dyn Fn(&str) -> bool,
+    request_position: &dyn Fn(&str) -> Result<Option<bool>, Box<DebugUndoOutcome>>,
 ) -> Result<UndoStep, Box<DebugUndoOutcome>> {
     let owned: Vec<crate::snapshot::Snapshot> = snapshots
         .into_iter()
@@ -448,7 +499,10 @@ fn plan_undo_step(
                 {
                     continue;
                 }
-                if newer_request_held(&target.label) {
+                // An open-ended step can write its backup while planning:
+                // establish identity before force can take that snapshot.
+                let request_is_last = request_position(&target.label)?;
+                if request_is_last == Some(false) {
                     return Err(Box::new(DebugUndoOutcome::NoDifference));
                 }
                 if !force {
@@ -509,7 +563,10 @@ fn plan_undo_step(
             // cannot restore: keep walking back.
             continue;
         }
-        if newer_request_held(&target.label) {
+        // No-op and already-undone snapshots outlive conversation rewinds.
+        // Only a candidate with remaining changes needs request identity.
+        let request_is_last = request_position(&target.label)?;
+        if request_is_last == Some(false) {
             return Err(Box::new(DebugUndoOutcome::NoDifference));
         }
         if !changed_since.is_empty() {
@@ -529,6 +586,7 @@ fn plan_undo_step(
             skipped,
             backup,
             forced: !bounded,
+            request_is_last,
         });
     }
     Err(Box::new(DebugUndoOutcome::NoDifference))
@@ -571,7 +629,7 @@ pub(in crate::commands) fn active_turn_restore_refusal(app: &App) -> Option<Stri
 /// Trust mode and Full Access are not consulted: the restore is confined to
 /// regular files inside the workspace that the request itself changed.
 /// `force` (the user typed `/undo force`) accepts a request with no recorded
-/// end.
+/// end, never an ambiguous request identity.
 pub(in crate::commands) fn undo_files(app: &mut App, force: bool) -> DebugUndoOutcome {
     if let Some(refusal) = active_turn_restore_refusal(app) {
         return DebugUndoOutcome::RestoreBlocked(refusal);
@@ -617,13 +675,20 @@ pub(in crate::commands) fn undo_files(app: &mut App, force: bool) -> DebugUndoOu
         return DebugUndoOutcome::NoSession;
     }
 
-    let newer_request_held = |label: &str| request_is_last(app, label) == Some(false);
-    let step = match plan_undo_step(&repo, snapshots, &owners, force, &newer_request_held) {
+    let requests = request_prompts(app);
+    let owned_request_snippets: Vec<_> = snapshots
+        .iter()
+        .filter(|snapshot| is_undo_step_label(&snapshot.label))
+        .filter(|snapshot| owners.iter().any(|owner| owner.owns(snapshot)))
+        .map(|snapshot| crate::core::turn::parse_snapshot_label(&snapshot.label).prompt_snippet)
+        .collect();
+    let request_position = |label: &str| request_is_last(&requests, &owned_request_snippets, label);
+    let step = match plan_undo_step(&repo, snapshots, &owners, force, &request_position) {
         Ok(step) => step,
         Err(outcome) => return *outcome,
     };
     let target = &step.target;
-    let is_last_request = request_is_last(app, &target.label);
+    let is_last_request = step.request_is_last;
 
     let plan: Vec<(PathBuf, crate::snapshot::SnapshotId)> = step
         .restore

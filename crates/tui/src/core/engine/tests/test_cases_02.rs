@@ -118,7 +118,9 @@ async fn an_agent_approval_answer_reaches_the_agent_while_the_engine_is_busy() {
         .expect("answer");
     assert_eq!(
         outcome,
-        crate::tools::subagent::ChildApprovalOutcome::Approved
+        crate::tools::subagent::ChildApprovalOutcome::Approved {
+            by: crate::approval_log::ApprovalDecider::User
+        }
     );
 }
 

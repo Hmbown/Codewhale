@@ -1738,8 +1738,8 @@ pub(crate) async fn drive_child_actor(
                     handle.cancel();
                 } else {
                     match decision {
-                        Ok(ChildApprovalOutcome::Approved) => handle.approve_tool_call(id).await?,
-                        Ok(ChildApprovalOutcome::Denied) => handle.deny_tool_call(id).await?,
+                        Ok(ChildApprovalOutcome::Approved { by }) => handle.approve_tool_call_by(id, by).await?,
+                        Ok(ChildApprovalOutcome::Denied { by }) => handle.deny_tool_call_by(id, by).await?,
                         _ => handle.deny_tool_call_unavailable(id).await?,
                     }
                 }

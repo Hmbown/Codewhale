@@ -1,4 +1,13 @@
-//! Plan hand-off: when a Plan turn leaves open To-do steps, ask how to go on.
+//! Plan hand-off: ask how to continue a successfully completed Plan response.
+//!
+//! The exact completed text is frozen for one session and turn. A prose plan
+//! seeds one bounded pending item; it is not parsed into English-shaped steps.
+//! Checkpoint admission uses the incumbent queued boundary, not a disk-write
+//! acknowledgement. Failed preparation removes only its unchanged seed from
+//! the current To-do projection; the graph retains unprojected history. That
+//! repair cannot recall a checkpoint already accepted by the persistence actor.
+//! If cleanup refuses because the owned item changed or Work validation fails,
+//! retain its ownership and refuse a new dispatch rather than erase other work.
 //!
 //! The question uses the modal `request_user_input` already draws. It is
 //! host-owned: no tool call is waiting in the engine, so the answer is applied
@@ -10,12 +19,9 @@ use codewhale_execpolicy::ApprovalMode;
 use codewhale_localization::{Locale, MessageId, tr};
 
 use crate::core::events::TurnOutcomeStatus;
-use crate::tools::todo::TodoListSnapshot;
 use crate::tools::user_input::{
     UserInputOption, UserInputQuestion, UserInputRequest, UserInputResponse,
 };
-use crate::tui::app::ToolEvidence;
-use crate::tui::history::is_checklist_tool_name;
 
 /// Request id of the hand-off question on the view stack.
 pub(crate) const REQUEST_ID: &str = "codewhale:plan-handoff";
@@ -32,20 +38,26 @@ pub(crate) enum PlanHandoffChoice {
     KeepPlanning,
 }
 
-/// Whether a finished turn left a plan to hand off: it ran in Plan, completed,
-/// wrote the To-do list, and that list still has open steps.
-pub(crate) fn plan_ready(
-    mode: AppMode,
-    status: TurnOutcomeStatus,
-    evidence: &[ToolEvidence],
-    todos: &TodoListSnapshot,
-) -> bool {
+/// One completed Plan response. The question id prevents a delayed answer
+/// from approving a newer plan, even in the same session.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingPlanHandoff {
+    pub request_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub history_start: usize,
+    pub transcript_epoch: u64,
+    pub text: String,
+    pub has_current_checklist: bool,
+    /// Retained only if failed-preparation cleanup cannot safely remove it.
+    pub seeded_todo_id: Option<u32>,
+}
+
+/// Only typed, successful, nonempty output from the current Plan turn qualifies.
+pub(crate) fn plan_ready(mode: AppMode, status: TurnOutcomeStatus, output: Option<&str>) -> bool {
     mode == AppMode::Plan
         && status == TurnOutcomeStatus::Completed
-        && evidence
-            .iter()
-            .any(|entry| is_checklist_tool_name(&entry.tool_name))
-        && todos.items.iter().any(|item| !item.status.is_settled())
+        && output.is_some_and(|text| !text.trim().is_empty())
 }
 
 /// The hand-off question, in the person's language.
@@ -106,30 +118,7 @@ pub(crate) fn choice(locale: Locale, response: &UserInputResponse) -> PlanHandof
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::todo::{TodoItem, TodoStatus};
     use crate::tools::user_input::UserInputAnswer;
-
-    fn evidence(tool_name: &str) -> Vec<ToolEvidence> {
-        vec![ToolEvidence {
-            tool_name: tool_name.to_string(),
-            summary: String::new(),
-        }]
-    }
-
-    fn todos(statuses: &[TodoStatus]) -> TodoListSnapshot {
-        TodoListSnapshot {
-            items: statuses
-                .iter()
-                .zip(1u32..)
-                .map(|(status, id)| TodoItem {
-                    id,
-                    content: format!("step {id}"),
-                    status: *status,
-                })
-                .collect(),
-            ..TodoListSnapshot::default()
-        }
-    }
 
     fn answer(label: &str, value: &str) -> UserInputResponse {
         UserInputResponse {
@@ -142,56 +131,26 @@ mod tests {
     }
 
     #[test]
-    fn a_completed_plan_turn_with_open_todo_steps_is_ready() {
-        let open = todos(&[TodoStatus::Completed, TodoStatus::Pending]);
-        let wrote = evidence("todo_write");
+    fn only_successful_nonempty_plan_output_is_ready() {
+        let prose = Some("先检查数据。\n\nThen build the report.");
         assert!(plan_ready(
             AppMode::Plan,
             TurnOutcomeStatus::Completed,
-            &wrote,
-            &open
+            prose
         ));
-
-        // Work and Operate turns write the same list while doing the work.
         for mode in [AppMode::Agent, AppMode::Operate] {
+            assert!(!plan_ready(mode, TurnOutcomeStatus::Completed, prose));
+        }
+        for status in [TurnOutcomeStatus::Interrupted, TurnOutcomeStatus::Failed] {
+            assert!(!plan_ready(AppMode::Plan, status, prose));
+        }
+        for output in [None, Some(""), Some(" \n ")] {
             assert!(!plan_ready(
-                mode,
+                AppMode::Plan,
                 TurnOutcomeStatus::Completed,
-                &wrote,
-                &open
+                output
             ));
         }
-        // An interrupted or failed turn did not finish its plan.
-        for status in [TurnOutcomeStatus::Interrupted, TurnOutcomeStatus::Failed] {
-            assert!(!plan_ready(AppMode::Plan, status, &wrote, &open));
-        }
-        // A Plan turn that only answered a question left no new plan, even
-        // when an older list is still open.
-        assert!(!plan_ready(
-            AppMode::Plan,
-            TurnOutcomeStatus::Completed,
-            &evidence("read"),
-            &open
-        ));
-        assert!(!plan_ready(
-            AppMode::Plan,
-            TurnOutcomeStatus::Completed,
-            &[],
-            &open
-        ));
-        // Nothing left to start.
-        assert!(!plan_ready(
-            AppMode::Plan,
-            TurnOutcomeStatus::Completed,
-            &wrote,
-            &todos(&[TodoStatus::Completed, TodoStatus::Cancelled])
-        ));
-        assert!(!plan_ready(
-            AppMode::Plan,
-            TurnOutcomeStatus::Completed,
-            &wrote,
-            &todos(&[])
-        ));
     }
 
     #[test]
