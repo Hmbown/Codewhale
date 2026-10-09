@@ -137,7 +137,7 @@ export const home: HomeDict = {
 
   communityHeading: "Contribute to Codewhale",
   communityBody:
-    "Report a bug, improve the docs or contribute code on GitHub. You can also build plugins and share workflows with other users.",
+    "Report a bug, improve the docs or contribute code on GitHub. You can also build plugins and share workflows with others.",
   communityLinksAria: "Community links",
   contribute: "Contribute on GitHub",
 };

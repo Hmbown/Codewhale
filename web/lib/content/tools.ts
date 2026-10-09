@@ -10,6 +10,7 @@ export const TOOLS_COPY = {
     { name: "read", detail: { en: "path · offset? · limit?", zh: "path · offset? · limit?" } },
     { name: "write", detail: { en: "path · content", zh: "path · content" } },
     { name: "edit", detail: { en: "path · edits", zh: "path · edits" } },
+    { name: "file_search", detail: { en: "Find workspace files by name, path, or glob pattern.", zh: "按文件名、路径或 glob 通配模式查找工作区文件。" } },
     { name: "bash", detail: { en: "command · timeout?", zh: "command · timeout?" } },
     { name: "agent · workflow", detail: { en: "Delegate work and coordinate dependent phases.", zh: "委派工作并协调有依赖关系的阶段。" } },
     { name: "todo_write", detail: { en: "Replace the task list with content and status entries.", zh: "用包含内容与状态的条目替换任务列表。" } },

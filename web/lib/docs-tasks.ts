@@ -144,8 +144,8 @@ export const DOC_TASKS: DocTask[] = [
     id: "code-mode",
     label: { en: "Try code mode", zh: "试用代码模式" },
     description: {
-      en: "Let the model compose several read-only tool calls in one short program. Experimental.",
-      zh: "让模型在一段简短的程序中组合多个只读工具调用。实验性功能。",
+      en: "Let the model compose several tool calls — MCP and plugin tools included — in one short program, under the same approvals as direct calls. Experimental, on by default.",
+      zh: "让模型在一段简短的程序中组合多个工具调用（包括 MCP 和插件工具），审批流程与直接调用相同。实验性功能，默认开启。",
     },
     href: "/docs/mcp",
     topicId: "mcp",
