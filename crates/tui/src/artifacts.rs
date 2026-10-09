@@ -207,7 +207,10 @@ pub(crate) fn open_session_relative(
     if create {
         std::fs::create_dir_all(&root)?;
     }
-    crate::fleet::files::WorkspaceFile::open(
+    // The sessions root is the application's own state, which a user may have
+    // relocated behind a link (on Windows, a junction to another volume).
+    // Resolve the root once; everything below it stays link-refusing.
+    crate::fleet::files::WorkspaceFile::open_resolved_root(
         &root,
         &PathBuf::from(session_id).join(relative_path),
         create,
