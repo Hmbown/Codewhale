@@ -114,6 +114,13 @@ export function create() {
     async focus(args) { record("focus", args); return { action_sent: true, focused: true, strategy: "a11y" }; },
     async get_value(args) { record("get_value", args); return { value: "Fixture text", strategy: "a11y" }; },
     async invoke_menu(args) { record("invoke_menu", args); return { action_sent: true, strategy: "a11y" }; },
+    // Who would receive input: FAKE_BACKEND_OWNER is the owning app as JSON, or
+    // "null" for the desktop. The server must consult this before any input.
+    async input_owner({ kind, point } = {}) {
+      record("input_owner", { kind, point });
+      const raw = process.env.FAKE_BACKEND_OWNER;
+      return raw && raw !== "null" ? JSON.parse(raw) : null;
+    },
     async app_script(args) { record("app_script", args); return { result: "fake", language: args.language ?? "applescript" }; },
   };
 }
