@@ -119,9 +119,9 @@ fn goal_status(
         return CommandResult::message(goal_usage());
     };
     let elapsed = if goal.time_used_seconds > 0 {
-        format_elapsed(goal.time_used_seconds)
+        codewhale_command_contract::elapsed::format_elapsed_secs(goal.time_used_seconds)
     } else if let Some(secs) = goal.started_at_elapsed_seconds {
-        format_elapsed(secs)
+        codewhale_command_contract::elapsed::format_elapsed_secs(secs)
     } else {
         "unknown".to_string()
     };
@@ -246,16 +246,6 @@ fn goal_status_label(status: ProjectGoalStatus) -> &'static str {
         ProjectGoalStatus::Complete => "complete",
         ProjectGoalStatus::Paused => "paused",
         ProjectGoalStatus::Blocked => "blocked",
-    }
-}
-
-/// Format a whole-seconds duration (portable replica of the TUI leaf helper,
-/// byte-identical output; the contract never ships preformatted strings).
-fn format_elapsed(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else {
-        format!("{}m {:02}s", secs / 60, secs % 60)
     }
 }
 
@@ -587,19 +577,6 @@ mod tests {
                 .unwrap()
                 .contains("Command capability unavailable: presentation")
         );
-    }
-
-    #[test]
-    fn format_elapsed_matches_tui_leaf_helper() {
-        // The portable replica must stay byte-identical to the TUI elapsed
-        // helper (Phase 4 review recommendation).
-        for secs in [0, 1, 59, 60, 61, 125, 3599, 3600, 3601] {
-            assert_eq!(
-                format_elapsed(secs),
-                crate::elapsed::format_elapsed_secs(secs),
-                "format_elapsed({secs}) must equal the TUI helper"
-            );
-        }
     }
 
     #[test]

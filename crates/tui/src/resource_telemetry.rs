@@ -160,7 +160,7 @@ impl ResourceTelemetry {
             out,
             "{} tok · {}",
             format_tokens(self.tokens_used),
-            crate::elapsed::format_elapsed_secs(self.time_used_seconds),
+            codewhale_command_contract::elapsed::format_elapsed_secs(self.time_used_seconds),
         );
         if let Some(percent) = self.budget_percent() {
             let _ = write!(out, " · {percent}% budget");

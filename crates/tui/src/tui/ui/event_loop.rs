@@ -3672,7 +3672,8 @@ pub(crate) async fn run_event_loop(
                     }
                     EngineEvent::GoalContinuationWaiting { delay_seconds } => {
                         app.goal_continuation_waiting = true;
-                        let delay = crate::elapsed::format_elapsed_secs(delay_seconds);
+                        let delay =
+                            codewhale_command_contract::elapsed::format_elapsed_secs(delay_seconds);
                         app.status_message = Some(
                             app.tr(MessageId::GoalContinuationWaiting)
                                 .replace("{delay}", &delay),

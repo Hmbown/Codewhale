@@ -145,12 +145,11 @@ use codewhale_release::tls;
 // re-exports; the split deletes it by rewriting these paths to
 // `codewhale_runtime::` (docs/design/TUI_DECONSTRUCTION.md).
 use codewhale_runtime::{
-    context_budget, continual_harness, elapsed, fast_hash, goal_loop, hashing, host_terminal,
+    context_budget, continual_harness, fast_hash, goal_loop, hashing, host_terminal,
     llm_response_cache, media_originals, model_context, native_memory, prompt_zones, regex_cache,
     retry_status, safe_label, session_tree, skill_state, sleep_guard, tool_history_repair,
     workspace_discovery,
 };
-mod diagnostics_reports;
 mod todo_snapshot;
 mod tool_inspection;
 mod tool_output_receipts;

@@ -117,30 +117,33 @@ The destination below still describes the intended layering, with one
 change: the engine, turn loop and tools move into `codewhale-runtime`
 together (there is no separate `codewhale-engine` crate), because the
 engine, tools, config and client form one dependency cycle today.
-`crates/core` stays the lower request-construction layer:
-`codewhale-command-contract` depends on it, and the runtime needs the
-contract, so putting the runtime into `core` would be a Cargo cycle.
+`crates/core` stays the lower request-construction layer. Portable command
+shapes in `codewhale-command-contract` depend on protocol, not core or runtime;
+implementations in `codewhale-commands` depend only on that contract and JSON.
+The engine still needs the lower request-construction layer when it moves.
 
 ## Intended ownership
 
 This is the proposed destination, not a claim that the boundaries exist now.
-Reuse existing crates; introduce only the three cohesive runtime libraries
-below, with real consumers and all replaced paths migrated in each slice.
+Reuse existing crates where the ownership fits; cohesive compilation boundaries
+must have real consumers and migrate all replaced paths in the same slice.
 
 | Owner | Responsibility |
 | --- | --- |
 | `codewhale-tui` | Terminal lifecycle, rendering, input, pickers, terminal command presentation. No provider I/O, policy decisions, durable store, or agent loop. |
 | `codewhale-cli` | Argument parsing, launch/composition, headless command presentation. Existing binary names remain compatible. |
 | `codewhale-app-server` | HTTP/SSE and stdio transport adapters over the same runtime. Reconcile the embedded Runtime API and existing app-server; preserve external routes and auth. |
-| New `codewhale-runtime` | Session/thread lifecycle, scheduling, recovery, child supervision, and composition of engine and stores. No model/tool execution loop. Used in process by terminal and server hosts. |
-| New `codewhale-engine` | The shared parent/child execution implementation, context/compaction, tool dispatch, cancellation, approvals, and typed events. |
+| `codewhale-runtime` | Session/thread lifecycle, scheduling, recovery, child supervision, the shared engine/turn loop and composition of stores. Used in process by terminal and server hosts. |
+| `codewhale-commands` | Portable command implementations and diagnostics formatting. The complete debug group and report helpers move here; clients retain host registration, I/O capabilities and action conversion. |
+| `codewhale-command-contract` | Portable metadata, facets, results and shared elapsed/money/metrics formatting; no host services or runtime dependency. |
 | New `codewhale-models` | Provider clients, live catalog/pricing resolution, and model routing against canonical config facts. Consolidate existing `agent` catalog consumers instead of retaining a second seeded registry. |
 | Existing `config`, `secrets`, `execpolicy` | Canonical schema/route identity, credential storage/access, and policy decisions. UI labels stay outside these owners. |
 | Existing `tools`, `mcp`, `hooks` | Tool contracts and implementations, extension transports, and hook execution. Agent/task tools call runtime capabilities; they do not own another agent loop. |
 | Existing `state`, `protocol`, `core` | Persistence, shared wire/domain records, and request construction. Move the existing core runtime service owner into the runtime library as its callers migrate. |
 
-Dependency direction: terminal/server -> runtime -> engine -> provider/tool
-implementations and shared lower-level crates. Tools must not import the
+Dependency direction: terminal/server -> runtime -> provider/tool implementations
+and shared lower-level crates. Portable commands depend on the command contract;
+clients adapt their results into host actions. Tools must not import the
 concrete engine or runtime host. Use narrow service capabilities at the
 composition boundary where a tool needs scheduling or agent control; do not
 introduce a generic service-locator framework or a trait for every helper.

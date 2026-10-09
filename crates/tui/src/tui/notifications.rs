@@ -1046,7 +1046,7 @@ pub(crate) fn completion_status(
         return label.to_string();
     }
 
-    let human = crate::elapsed::format_elapsed_secs(elapsed.as_secs());
+    let human = codewhale_command_contract::elapsed::format_elapsed_secs(elapsed.as_secs());
     match cost {
         Some(cost) => format!("{label} ({human}, {cost})"),
         None => format!("{label} ({human})"),

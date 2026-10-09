@@ -450,12 +450,12 @@ impl ToolInspectionSnapshot {
     #[must_use]
     #[cfg(test)]
     pub fn render_text(&self) -> String {
-        crate::diagnostics_reports::render_tool_snapshot_text(&project_snapshot(self))
+        codewhale_commands::diagnostics_reports::render_tool_snapshot_text(&project_snapshot(self))
     }
 
     #[cfg(test)]
     pub fn render_json(&self) -> Result<String, serde_json::Error> {
-        crate::diagnostics_reports::render_tool_snapshot_json(&project_snapshot(self))
+        codewhale_commands::diagnostics_reports::render_tool_snapshot_json(&project_snapshot(self))
     }
 }
 

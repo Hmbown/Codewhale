@@ -9,7 +9,7 @@ use codewhale_command_contract::metadata::{
 
 use super::CommandResult;
 
-pub(in crate::commands) struct BalanceCmd;
+pub struct BalanceCmd;
 
 const CONTRACT_INFO: ContractInfo = ContractInfo {
     name: "balance",

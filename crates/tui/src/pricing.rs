@@ -5065,28 +5065,28 @@ mod tests {
     #[test]
     fn format_cost_amount_precise_keeps_report_precision() {
         assert_eq!(
-            crate::diagnostics_reports::format_cost_amount_precise(
+            codewhale_commands::diagnostics_reports::format_cost_amount_precise(
                 0.1234,
                 codewhale_command_contract::types::CommandCurrency::Usd
             ),
             "$0.1234"
         );
         assert_eq!(
-            crate::diagnostics_reports::format_cost_amount_precise(
+            codewhale_commands::diagnostics_reports::format_cost_amount_precise(
                 0.1234,
                 codewhale_command_contract::types::CommandCurrency::Cny
             ),
             "¥0.1234"
         );
         assert_eq!(
-            crate::diagnostics_reports::format_cost_amount_precise(
+            codewhale_commands::diagnostics_reports::format_cost_amount_precise(
                 0.0,
                 codewhale_command_contract::types::CommandCurrency::Usd
             ),
             "$0.0000"
         );
         assert_eq!(
-            crate::diagnostics_reports::format_cost_amount_precise(
+            codewhale_commands::diagnostics_reports::format_cost_amount_precise(
                 0.00001,
                 codewhale_command_contract::types::CommandCurrency::Usd
             ),

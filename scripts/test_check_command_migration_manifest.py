@@ -432,18 +432,18 @@ class DebugGroupFrontierTests(unittest.TestCase):
         doc = mod.load_topology()
         debug = doc["topology"]["debug"]
         actual = {p.relative_to(ROOT).as_posix() for p in
-                  (ROOT / "crates/tui/src/commands/groups/debug").rglob("*.rs")}
+                  (ROOT / "crates/commands/src/debug").rglob("*.rs")}
         self.assertEqual(set(mod.group_source_scope("debug", debug, ROOT)), actual)
         self.assertNotIn("debug", doc["frontier"])
         self.assertNotIn("debug", mod.load_pending_groups())
         self.assertEqual(mod.check_source_frontier({"debug": debug}, [], ROOT), [])
-        self.assertIn("crates/tui/src/commands/groups/debug/receipts.rs", actual)
+        self.assertIn("crates/commands/src/debug/receipts.rs", actual)
 
     def test_omitted_receipts_and_new_nested_commands_fail_inventory(self) -> None:
         for filename in ["receipts.rs", "new/command.rs"]:
             with self.subTest(filename=filename), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                directory = root / "crates/tui/src/commands/groups/debug"
+                directory = root / "crates/commands/src/debug"
                 directory.mkdir(parents=True)
                 (directory / "mod.rs").write_text("// complete portable module\n")
                 omitted = directory / filename
@@ -463,12 +463,12 @@ class DebugGroupFrontierTests(unittest.TestCase):
     def test_omitted_pure_file_is_automatically_included_in_scan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            directory = root / "crates/tui/src/commands/groups/debug"
+            directory = root / "crates/commands/src/debug"
             directory.mkdir(parents=True)
             (directory / "future.rs").write_text("pub fn future() {}\n")
             node = {"kind": "group", "scope": [], "slices": []}
             self.assertEqual(mod.group_source_scope("debug", node, root),
-                             ["crates/tui/src/commands/groups/debug/future.rs"])
+                             ["crates/commands/src/debug/future.rs"])
             self.assertEqual(mod.check_source_frontier({"debug": node}, [], root), [])
 
 

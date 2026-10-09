@@ -9,7 +9,7 @@
 //! paths are normalised only at the documented comparison boundary.
 //!
 //! The module deliberately lives at the `commands` root, outside
-//! `groups/debug`, which FEAT-045 later moves into `codewhale-commands`.
+//! `codewhale-commands`, which owns the portable implementations.
 
 use std::time::Instant;
 

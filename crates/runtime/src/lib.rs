@@ -11,9 +11,10 @@
 // Copied verbatim from the TUI crate root: moved code relies on it.
 #![allow(clippy::uninlined_format_args)]
 
+pub use codewhale_command_contract::elapsed;
+
 pub mod context_budget;
 pub mod continual_harness;
-pub mod elapsed;
 pub mod fast_hash;
 pub mod goal_loop;
 pub mod hashing;

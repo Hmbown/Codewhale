@@ -8,7 +8,7 @@ use codewhale_command_contract::facets::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) fn format_warmup_status(
+pub fn format_warmup_status(
     last_warmup: Option<&DebugWarmupKey>,
     current: &DebugWarmupKey,
     last_hash_short: Option<&str>,
@@ -356,7 +356,7 @@ pub(super) fn format_cache_zones(telemetry: &DebugCacheTelemetry) -> String {
 
 /// Formats a u64 token count with a compact suffix: K for thousands,
 /// M for millions. Never returns scientific notation.
-pub(crate) fn format_tokens(n: u64) -> String {
+pub fn format_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {
@@ -517,7 +517,7 @@ pub(crate) fn format_cache_history(
         totals_reasoning += u64::from(rec.reasoning_tokens.unwrap_or(0));
         let cost_cell = turn_cost_cell(rec, cost, &mut unpriced_reasons, &mut unpriced_classes);
         let route_cell = format_turn_cache_route(rec);
-        let age = crate::elapsed::format_elapsed_secs(rec.age_seconds);
+        let age = codewhale_command_contract::elapsed::format_elapsed_secs(rec.age_seconds);
 
         // No cache telemetry → render `—` everywhere and don't pollute totals
         // with inferred zeros. Some providers (and some routes inside DeepSeek)
@@ -631,7 +631,7 @@ pub(crate) fn format_cache_history(
     Ok(format!("{header}{body}{footer}"))
 }
 
-pub(crate) fn format_turn_cache_route(rec: &DebugCacheTurn) -> String {
+pub fn format_turn_cache_route(rec: &DebugCacheTurn) -> String {
     let Some(model) = rec.model.as_deref().filter(|model| !model.is_empty()) else {
         return "—".to_string();
     };
