@@ -14,8 +14,8 @@
 #
 # Examples:
 #   scripts/dev-test.sh config
-#   scripts/dev-test.sh tui elapsed::
-#   scripts/dev-test.sh crates/runtime/src/elapsed.rs
+#   scripts/dev-test.sh command-contract elapsed::
+#   scripts/dev-test.sh crates/command-contract/src/elapsed.rs
 #
 # Environment:
 #   CODEWHALE_DEV_NEXTEST  auto|1|0  (default auto: use cargo-nextest when
@@ -44,6 +44,7 @@ app-server        cargo test -p codewhale-app-server --lib --locked
 build-support     cargo test -p codewhale-build-support --lib --locked
 cli               cargo test -p codewhale-cli --lib --locked
 command-contract  cargo test -p codewhale-command-contract --lib --locked
+commands          cargo test -p codewhale-commands --lib --locked
 config            cargo test -p codewhale-config --lib --locked
 core              cargo test -p codewhale-core --lib --locked
 execpolicy        cargo test -p codewhale-execpolicy --lib --locked
@@ -148,9 +149,9 @@ if [ -e "$area" ] || printf '%s' "$area" | grep -q /; then
     crates/tui/*|crates/tui)
       area=tui
       ;;
-    crates/runtime/src/*)
-      area=runtime
-      extra=$(printf '%s' "${rel#crates/runtime/src/}" | awk -F/ '{print $1}')
+    crates/runtime/src/*|crates/commands/src/*|crates/command-contract/src/*)
+      area=$(printf '%s' "$rel" | awk -F/ '{print $2}')
+      extra=$(printf '%s' "${rel#crates/*/src/}" | awk -F/ '{print $1}')
       extra=${extra%.rs}::
       ;;
     crates/*)
@@ -178,6 +179,7 @@ case $area in
   build-support) pkg=codewhale-build-support ;;
   cli) pkg=codewhale-cli ;;
   command-contract) pkg=codewhale-command-contract ;;
+  commands) pkg=codewhale-commands ;;
   config) pkg=codewhale-config ;;
   core) pkg=codewhale-core ;;
   execpolicy) pkg=codewhale-execpolicy ;;

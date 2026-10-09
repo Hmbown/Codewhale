@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- The bundled first-party catalog pins marketplace revision
+  `9b5f9d614ef69702be9944a61e89aeb3df14c047`; the 19 catalog entries are
+  unchanged, and installed bundles now come from a revision carrying the
+  reviewed Computer Use and bridge fixes and the MIT license.
+
 ## [0.10.2] - 2026-10-08
 
 Codewhale v0.10.2 adds an animated pet view (`/pet on`) and a live Terminal work

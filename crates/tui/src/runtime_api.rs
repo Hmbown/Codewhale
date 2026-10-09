@@ -1236,6 +1236,7 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
     RuntimeCapabilities {
         client_token_intents: true,
         account_session: true,
+        account_model_owner: true,
         threads: true,
         thread_shell_consent: true,
         turns: true,
@@ -8159,6 +8160,7 @@ async fn retry_thread_turn(
         .start_turn_from_stored_images(
             &forked_thread.id,
             StartTurnRequest {
+                account_model_owner: None,
                 profile_constitution: None,
                 expected_workspace: None,
                 max_output_tokens,
@@ -9091,6 +9093,7 @@ async fn stream_turn(
         .start_turn(
             &thread.id,
             StartTurnRequest {
+                account_model_owner: None,
                 profile_constitution: None,
                 max_output_tokens: req.max_output_tokens,
                 prompt,
@@ -10432,6 +10435,34 @@ pub(crate) fn runtime_chat_relay_catalog(
         return Err("Codewhale returned an invalid Runtime Chat relay challenge.".to_string());
     }
 
+    let mut account_config;
+    let ready = config
+        .active_provider_identity()
+        .ok()
+        .is_some_and(|identity| {
+            matches!(
+                crate::provider_readiness::credential_state_for_provider(config, &identity),
+                CredentialState::Saved
+                    | CredentialState::ImportedToken
+                    | CredentialState::Local
+                    | CredentialState::NoAuth
+            )
+        });
+    let config = if ready {
+        config
+    } else {
+        account_config = config.clone();
+        let identity = account_config
+            .resolve_persisted_provider_identity(Some("codewhale"), Some("codewhale"))?;
+        if account_config.account_model_api_key(&identity).is_none() {
+            return Err(
+                "Connect account model access before using the Codewhale agent.".to_string(),
+            );
+        }
+        account_config.scope_to_provider_identity(&identity)?;
+        &account_config
+    };
+
     let identity = config
         .active_provider_identity()
         .map_err(|_| "The active Runtime provider identity is invalid.".to_string())?;
@@ -10483,6 +10514,7 @@ pub(crate) fn runtime_chat_relay_catalog(
                 "turn_image_inputs": true,
                 "turn_output_token_limit": true,
                 "profile_constitution": true,
+                "account_model_owner": true,
                 "tool_execution": false,
                 "stable_event_ids": true,
             },

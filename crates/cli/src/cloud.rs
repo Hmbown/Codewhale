@@ -7,6 +7,7 @@
 
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -29,6 +30,10 @@ pub(crate) mod machine;
 mod work;
 
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024;
+const MAX_FILE_DOWNLOAD_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_COMPUTER_FILE_SAVE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_COMPUTER_FILE_RESTORE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_FILE_VERSION: u64 = 9_007_199_254_740_991;
 const MIN_API_KEY_BYTES: usize = 8;
 const MAX_API_KEY_BYTES: u64 = 4096;
 const MAX_API_KEY_STDIN_BYTES: u64 = MAX_API_KEY_BYTES + 1024;
@@ -347,7 +352,73 @@ enum CloudComputersCommand {
     /// Pause a Computer.
     Pause { id: String },
     /// Permanently delete a Computer and its provider allocation.
-    Delete { id: String },
+    Delete {
+        id: String,
+        #[arg(
+            long,
+            required = true,
+            help = "Confirm discarding files still on this computer"
+        )]
+        discard_files: bool,
+    },
+    #[command(
+        about = "Save and restore computer files, or inspect and download account file versions"
+    )]
+    Files {
+        #[command(subcommand)]
+        command: CloudComputerFilesCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CloudComputerFilesCommand {
+    #[command(about = "Save a nonempty workspace file up to 16 MiB to account storage")]
+    Save {
+        computer_id: String,
+        path: String,
+        #[arg(
+            long,
+            help = "Stable save request ID; reuse it when retrying the same save"
+        )]
+        request_id: String,
+        #[arg(long, requires = "expected_version")]
+        file_id: Option<String>,
+        #[arg(long, requires = "file_id", value_parser = clap::value_parser!(u64).range(1..=MAX_FILE_VERSION))]
+        expected_version: Option<u64>,
+        #[arg(long)]
+        expected_revision: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    #[command(
+        about = "Restore an account file version up to 4 MiB; existing destinations need --expected-revision"
+    )]
+    Restore {
+        computer_id: String,
+        file_id: String,
+        path: String,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=MAX_FILE_VERSION))]
+        version: u64,
+        #[arg(
+            long,
+            help = "Current destination SHA-256, required to replace an existing file"
+        )]
+        expected_revision: Option<String>,
+    },
+    #[command(about = "Read a computer workspace file's size and current SHA-256 revision")]
+    Revision { computer_id: String, path: String },
+    #[command(about = "List an account file's saved versions, sizes and SHA-256 hashes")]
+    Versions { file_id: String },
+    #[command(
+        about = "Download and verify one account file version without overwriting local files"
+    )]
+    Download {
+        file_id: String,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=MAX_FILE_VERSION))]
+        version: u64,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -440,6 +511,13 @@ struct ComputerResponse {
 struct ComputerDeleteResponse {
     deleted: bool,
     computer_id: String,
+}
+
+#[derive(Deserialize)]
+struct AccountFileVersion {
+    version: u64,
+    size: u64,
+    sha256: String,
 }
 
 #[derive(Deserialize)]
@@ -693,6 +771,17 @@ impl CloudTransport for ReqwestTransport {
             .base
             .join(request.path.trim_start_matches('/'))
             .context("failed to construct the Codewhale account request URL")?;
+        let file_download = request.method == HttpMethod::Get
+            && url
+                .path()
+                .strip_prefix("/v1/files/")
+                .and_then(|path| path.strip_suffix("/content"))
+                .is_some_and(|id| validate_account_file_id(id).is_ok());
+        let max_response_bytes = if file_download {
+            MAX_FILE_DOWNLOAD_BYTES
+        } else {
+            MAX_RESPONSE_BYTES
+        };
         let method = match request.method {
             HttpMethod::Get => reqwest::Method::GET,
             HttpMethod::Post => reqwest::Method::POST,
@@ -700,10 +789,14 @@ impl CloudTransport for ReqwestTransport {
             HttpMethod::Put => reqwest::Method::PUT,
             HttpMethod::Delete => reqwest::Method::DELETE,
         };
-        let mut builder = self
-            .client
-            .request(method, url)
-            .header(reqwest::header::ACCEPT, "application/json");
+        let mut builder = self.client.request(method, url).header(
+            reqwest::header::ACCEPT,
+            if file_download {
+                "application/octet-stream"
+            } else {
+                "application/json"
+            },
+        );
         // Hosted launch waits for provider creation and guest bootstrap. Its
         // HTTP deadline is separate from the guest's bounded trial runtime.
         if request.method == HttpMethod::Post && request.path == "/api/cloud-sessions" {
@@ -728,12 +821,12 @@ impl CloudTransport for ReqwestTransport {
             .and_then(|value| value.trim().parse::<u64>().ok());
         let mut body = Vec::new();
         response
-            .take(MAX_RESPONSE_BYTES + 1)
+            .take(max_response_bytes + 1)
             .read_to_end(&mut body)
             .map_err(|source| {
                 CloudTransportError::new("failed to read the Codewhale service response", source)
             })?;
-        if body.len() as u64 > MAX_RESPONSE_BYTES {
+        if body.len() as u64 > max_response_bytes {
             return Err(CloudTransportError::new(
                 "The Codewhale service returned an unexpectedly large response",
                 std::io::Error::other("response exceeded the account API size limit"),
@@ -1255,12 +1348,105 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
 
     fn delete_computer(&self, id: &str) -> Result<()> {
         let id = validate_computer_id(id)?;
-        let response =
-            self.execute_authenticated(HttpMethod::Delete, &format!("/api/computers/{id}"), None)?;
+        let response = self.execute_authenticated(
+            HttpMethod::Delete,
+            &format!("/api/computers/{id}"),
+            Some(json_body(&serde_json::json!({ "discardFiles": true }))?),
+        )?;
         let result: ComputerDeleteResponse = expect_json(response, &[200])?;
         if !result.deleted || result.computer_id != id {
             bail!("The Codewhale service did not confirm deletion of Computer {id}");
         }
+        Ok(())
+    }
+
+    fn computer_file_revision(&self, computer_id: &str, path: &str) -> Result<serde_json::Value> {
+        let id = validate_computer_id(computer_id)?;
+        validate_computer_file_path(path)?;
+        let mut url = Url::parse("https://codewhale.invalid/")?;
+        url.set_path(&format!("/api/computers/{id}/files/revision"));
+        url.query_pairs_mut().append_pair("path", path);
+        let response = self.execute_authenticated(
+            HttpMethod::Get,
+            &format!("{}?{}", url.path(), url.query().unwrap_or_default()),
+            None,
+        )?;
+        let value: serde_json::Value = expect_json(response, &[200])?;
+        if value["computerId"].as_str() != Some(id)
+            || value["path"].as_str() != Some(path)
+            || value["size"].as_u64().is_none()
+        {
+            bail!("The Codewhale service returned an invalid file revision");
+        }
+        validate_file_revision(value["revision"].as_str().unwrap_or_default())?;
+        Ok(value)
+    }
+
+    fn computer_file_action(
+        &self,
+        computer_id: &str,
+        action: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let id = validate_computer_id(computer_id)?;
+        let response = self.execute_authenticated(
+            HttpMethod::Post,
+            &format!("/api/computers/{id}/files/{action}"),
+            Some(json_body(&payload)?),
+        )?;
+        expect_json(response, &[200, 201])
+    }
+
+    fn account_file(&self, file_id: &str) -> Result<serde_json::Value> {
+        let id = validate_account_file_id(file_id)?;
+        let response =
+            self.execute_authenticated(HttpMethod::Get, &format!("/v1/files/{id}"), None)?;
+        let value: serde_json::Value = expect_json(response, &[200])?;
+        if value["file"]["id"].as_str() != Some(id) {
+            bail!("The Codewhale service returned a different account file");
+        }
+        Ok(value)
+    }
+
+    fn download_account_file(&self, file_id: &str, version: u64, output: &Path) -> Result<()> {
+        let id = validate_account_file_id(file_id)?;
+        match std::fs::symlink_metadata(output) {
+            Ok(_) => bail!("The output path already exists; choose another file name"),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("could not inspect the output path"),
+        }
+        let metadata = account_file_version(&self.account_file(id)?, version)?;
+        let response = self.execute_authenticated(
+            HttpMethod::Get,
+            &format!("/v1/files/{id}/content?version={version}"),
+            None,
+        )?;
+        if response.status != 200 {
+            return Err(response_error(&response));
+        }
+        if response.body.len() as u64 != metadata.size
+            || crate::update::sha256_hex(&response.body) != metadata.sha256
+        {
+            bail!(
+                "The downloaded file did not match its saved size and SHA-256; nothing was written"
+            );
+        }
+        let parent = output
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut pending = tempfile::NamedTempFile::new_in(parent)
+            .context("could not prepare the download beside its destination")?;
+        pending
+            .write_all(&response.body)
+            .context("could not write the verified download")?;
+        pending
+            .as_file()
+            .sync_all()
+            .context("could not sync the verified download")?;
+        pending
+            .persist_noclobber(output)
+            .context("could not save the download without replacing an existing file")?;
         Ok(())
     }
 
@@ -1422,6 +1608,65 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
 
 fn validate_computer_id(value: &str) -> Result<&str> {
     validate_resource_id(value, "Computer")
+}
+
+fn validate_account_file_id(value: &str) -> Result<&str> {
+    let suffix = value.strip_prefix("file_").unwrap_or_default();
+    if !(16..=64).contains(&suffix.len())
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("Account file ID must be file_ followed by 16-64 letters, digits, `-`, or `_`");
+    }
+    Ok(value)
+}
+
+fn validate_computer_file_path(value: &str) -> Result<()> {
+    let bytes = value.as_bytes();
+    if value.is_empty()
+        || value.len() > 4096
+        || value.starts_with('/')
+        || value.contains('\\')
+        || value.chars().any(char::is_control)
+        || bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+        || value.split('/').any(|part| matches!(part, "" | "." | ".."))
+    {
+        bail!(
+            "Choose a relative file path inside the computer workspace, without `.` or `..` segments"
+        );
+    }
+    Ok(())
+}
+
+fn validate_file_revision(value: &str) -> Result<&str> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        bail!("File revision must be a lowercase SHA-256 hash of 64 characters");
+    }
+    Ok(value)
+}
+
+fn account_file_version(value: &serde_json::Value, version: u64) -> Result<AccountFileVersion> {
+    if !(1..=MAX_FILE_VERSION).contains(&version) {
+        bail!("Choose an explicit positive saved file version");
+    }
+    let versions: Vec<AccountFileVersion> = serde_json::from_value(value["versions"].clone())
+        .context("The Codewhale service returned invalid file versions")?;
+    let mut matches = versions
+        .into_iter()
+        .filter(|entry| entry.version == version);
+    let selected = matches
+        .next()
+        .ok_or_else(|| anyhow!("That saved file version is unavailable"))?;
+    if matches.next().is_some() || selected.size == 0 || selected.size > MAX_FILE_DOWNLOAD_BYTES {
+        bail!("The Codewhale service returned invalid saved file metadata");
+    }
+    validate_file_revision(&selected.sha256)?;
+    Ok(selected)
 }
 
 fn validate_resource_id<'a>(value: &'a str, kind: &str) -> Result<&'a str> {
@@ -2254,9 +2499,146 @@ fn run_computers<T: CloudTransport, W: Write>(
             let result = client.computer_action(&id, "pause")?;
             write_computer(out, &result.computer)
         }
-        CloudComputersCommand::Delete { id } => {
+        CloudComputersCommand::Delete { id, discard_files } => {
+            if !discard_files {
+                bail!(
+                    "Deleting a computer discards its remaining files; save them first, then pass --discard-files"
+                );
+            }
             client.delete_computer(&id)?;
             writeln!(out, "Deleted Computer {}.", validate_computer_id(&id)?)?;
+            Ok(())
+        }
+        CloudComputersCommand::Files { command } => run_computer_files(command, client, out),
+    }
+}
+
+fn run_computer_files<T: CloudTransport, W: Write>(
+    command: CloudComputerFilesCommand,
+    client: &CloudClient<'_, T>,
+    out: &mut W,
+) -> Result<()> {
+    match command {
+        CloudComputerFilesCommand::Save {
+            computer_id,
+            path,
+            request_id,
+            file_id,
+            expected_version,
+            expected_revision,
+            name,
+        } => {
+            let id = validate_computer_id(&computer_id)?;
+            validate_computer_file_path(&path)?;
+            let request_id = validate_turn_id(&request_id)?;
+            if file_id.is_some() != expected_version.is_some()
+                || expected_version.is_some_and(|version| !(1..MAX_FILE_VERSION).contains(&version))
+            {
+                bail!("Saving another version needs both --file-id and a valid --expected-version");
+            }
+            if let Some(file_id) = &file_id {
+                validate_account_file_id(file_id)?;
+            }
+            if let Some(revision) = &expected_revision {
+                validate_file_revision(revision)?;
+            }
+            let result = client.computer_file_action(id, "save", serde_json::json!({
+                "path": path, "requestId": request_id, "fileId": file_id,
+                "expectedVersion": expected_version.unwrap_or(0), "expectedRevision": expected_revision, "name": name,
+            }))?;
+            let saved_id = result["file"]["id"].as_str().unwrap_or_default();
+            validate_account_file_id(saved_id)?;
+            let sha256 = result["file"]["sha256"].as_str().unwrap_or_default();
+            validate_file_revision(sha256)?;
+            if result["saved"]["computerId"].as_str() != Some(id)
+                || result["saved"]["path"].as_str() != Some(path.as_str())
+                || result["saved"]["revision"].as_str() != Some(sha256)
+                || result["file"]["version"].as_u64() != Some(expected_version.unwrap_or(0) + 1)
+                || !result["file"]["size"]
+                    .as_u64()
+                    .is_some_and(|size| (1..=MAX_COMPUTER_FILE_SAVE_BYTES).contains(&size))
+                || file_id
+                    .as_deref()
+                    .is_some_and(|expected| expected != saved_id)
+                || expected_revision
+                    .as_deref()
+                    .is_some_and(|expected| expected != sha256)
+            {
+                bail!("The save receipt could not be verified; retry using the same --request-id");
+            }
+            write_computer_json(out, &result)
+        }
+        CloudComputerFilesCommand::Restore {
+            computer_id,
+            file_id,
+            path,
+            version,
+            expected_revision,
+        } => {
+            let id = validate_computer_id(&computer_id)?;
+            validate_computer_file_path(&path)?;
+            if let Some(revision) = &expected_revision {
+                validate_file_revision(revision)?;
+            }
+            let metadata = account_file_version(&client.account_file(&file_id)?, version)?;
+            if metadata.size > MAX_COMPUTER_FILE_RESTORE_BYTES {
+                bail!("Restore supports files up to 4 MiB; download this version instead");
+            }
+            match client.computer_file_revision(id, &path) {
+                Ok(current) => match expected_revision.as_deref() {
+                    Some(expected) if current["revision"].as_str() == Some(expected) => {}
+                    Some(_) => {
+                        bail!("The destination revision changed; inspect it before restoring")
+                    }
+                    None => bail!(
+                        "The destination exists; inspect its revision and pass --expected-revision to replace it"
+                    ),
+                },
+                Err(error)
+                    if expected_revision.is_none()
+                        && error.downcast_ref::<CloudHttpError>().is_some_and(|error| {
+                            error.status == 404
+                                && error.code.as_deref() == Some("computer_file_not_found")
+                        }) => {}
+                Err(error) => return Err(error),
+            }
+            let result = client.computer_file_action(id, "restore", serde_json::json!({
+                "path": path, "fileId": file_id, "version": version, "expectedRevision": expected_revision,
+            }))?;
+            let restored = &result["restored"];
+            if restored["computerId"].as_str() != Some(id)
+                || restored["path"].as_str() != Some(path.as_str())
+                || restored["fileId"].as_str() != Some(file_id.as_str())
+                || restored["version"].as_u64() != Some(version)
+                || restored["size"].as_u64() != Some(metadata.size)
+                || restored["revision"].as_str() != Some(metadata.sha256.as_str())
+                || restored["created"].as_bool().is_none()
+            {
+                bail!(
+                    "The restore receipt could not be verified; inspect the destination revision before retrying"
+                );
+            }
+            write_computer_json(out, &result)
+        }
+        CloudComputerFilesCommand::Revision { computer_id, path } => {
+            write_computer_json(out, &client.computer_file_revision(&computer_id, &path)?)
+        }
+        CloudComputerFilesCommand::Versions { file_id } => {
+            write_computer_json(out, &client.account_file(&file_id)?)
+        }
+        CloudComputerFilesCommand::Download {
+            file_id,
+            version,
+            output,
+        } => {
+            client.download_account_file(&file_id, version, &output)?;
+            writeln!(
+                out,
+                "Downloaded {} version {} to {} (size and SHA-256 verified).",
+                file_id,
+                version,
+                printable(&output.display().to_string())
+            )?;
             Ok(())
         }
     }

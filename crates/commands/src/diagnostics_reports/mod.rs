@@ -3,7 +3,7 @@
 
 mod context;
 mod money;
-pub(crate) mod receipts;
+pub mod receipts;
 mod tool_snapshot;
 
 pub use money::format_cost_amount_precise;

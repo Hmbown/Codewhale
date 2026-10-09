@@ -141,7 +141,7 @@ build-dir + sccache 拓扑，所以新 worktree 仍然要往 `./target` 里做�
 export CODEWHALE_CACHE_ROOT=/path/to/cache/codewhale
 
 scripts/dev-cache.sh --self-check
-scripts/dev-test.sh crates/runtime/src/elapsed.rs
+scripts/dev-test.sh crates/command-contract/src/elapsed.rs
 CARGO_INCREMENTAL=0 scripts/dev-cargo.sh test -p codewhale-config --lib --locked --no-run
 ```
 

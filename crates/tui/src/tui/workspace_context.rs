@@ -1,7 +1,7 @@
 //! Per-workspace git context shown in the composer header.
 //!
 //! The TUI shows a "branch | clean/N modified/…" badge. It is derived from
-//! the one cached git probe ([`crate::tui::git_status`]) rather than a git
+//! the one cached git probe ([`crate::git_status`]) rather than a git
 //! query of its own, so the badge, the Git view and the chrome never run two
 //! `git status` processes for the same tick (#6565). The badge is re-read
 //! every `REFRESH_SECS` seconds; the read takes the probe's cached snapshot
@@ -34,15 +34,15 @@ pub(crate) struct WorkspaceContextSnapshot {
 /// refresh after something that may have changed the tree.
 fn collect_snapshot(workspace: &Path, force: bool) -> WorkspaceContextSnapshot {
     let snap = if force {
-        crate::tui::git_status::force_refresh(workspace)
+        crate::git_status::force_refresh(workspace)
     } else {
-        crate::tui::git_status::refresh_if_stale(workspace)
+        crate::git_status::refresh_if_stale(workspace)
     };
     let current = snap.probed_workspace.as_deref() == Some(workspace);
     WorkspaceContextSnapshot {
         workspace: workspace.to_path_buf(),
         context: current
-            .then(|| crate::tui::git_status::context_line(&snap))
+            .then(|| crate::git_status::context_line(&snap))
             .flatten(),
         is_linked_worktree: current && snap.is_linked_worktree,
         notes: crate::commands::read_notes(workspace, &crate::commands::notes_path(workspace))
@@ -166,18 +166,6 @@ pub(super) fn refresh_now(app: &mut App, now: Instant) {
     }
     app.workspace_context_refreshed_at = None;
     refresh_inner(app, now, true, true);
-}
-
-/// Build the human-readable workspace context string ("branch | status")
-/// from one `git status --porcelain=v2 --branch` call, through the same
-/// parser and formatter the Git view uses. Returns `None` if the workspace is
-/// not a git repository or git itself is unavailable. The engine's per-turn
-/// git line reads this.
-pub(crate) fn collect(workspace: &Path) -> Option<String> {
-    crate::tui::git_status::probe_workspace_status(workspace)
-        .ok()
-        .as_ref()
-        .and_then(crate::tui::git_status::status_line)
 }
 
 pub(crate) fn branch_from_context(context: &str) -> Option<&str> {
@@ -410,7 +398,7 @@ mod tests {
         );
         run_git(&linked, &["checkout", "--detach"]).unwrap();
         // The badge reads the shared probe's cache; a checkout forces it.
-        crate::tui::git_status::force_refresh(&linked);
+        crate::git_status::force_refresh(&linked);
         let detached = collect_snapshot(&linked, false);
         assert!(detached.is_linked_worktree);
         assert!(

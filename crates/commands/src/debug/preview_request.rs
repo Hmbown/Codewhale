@@ -48,7 +48,7 @@ use codewhale_command_contract::metadata::{
     CommandInfo as ContractInfo, RegisterCommand as ContractRegisterCommand,
 };
 
-pub(in crate::commands) struct PreviewRequestCmd;
+pub struct PreviewRequestCmd;
 
 const CONTRACT_INFO: ContractInfo = ContractInfo {
     name: "preview-request",

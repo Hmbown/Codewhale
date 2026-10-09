@@ -1,6 +1,6 @@
 //! Preserved snapshot/history safety tests outside the portable debug group.
 use super::CommandResult;
-use super::groups::debug::undo;
+use codewhale_commands::debug::undo;
 fn patch_undo(app: &mut App) -> CommandResult {
     super::debug_group::host_result(undo::patch_result(
         super::contract::debug_operations::undo_files(app, false),
@@ -1554,7 +1554,7 @@ fn whole_debug_registry_matches_portable_inventory_and_exact_host_authority() {
         CommandCapabilities as Caps, CommandHandler, ContextParts,
     };
     let mut app = create_test_app();
-    let portable = super::groups::debug::portable_handlers();
+    let portable = codewhale_commands::debug::portable_handlers();
     assert_eq!(portable.len(), 14);
     for (info, portable_handler) in portable {
         for spelling in std::iter::once(info.name).chain(info.aliases.iter().copied()) {

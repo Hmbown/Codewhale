@@ -6,6 +6,7 @@ members = [
     "crates/cli",
     "crates/cloud-facts",
     "crates/command-contract",
+    "crates/commands",
     "crates/config",
     "crates/core",
     "crates/execpolicy",
@@ -28,7 +29,6 @@ members = [
     "crates/tui",
     "crates/workflow",
     "crates/workflow-js",
-    "tests/portable-debug-diagnostics",
     "tests/portable-session",
     "tests/portable-config-policy",
 ]

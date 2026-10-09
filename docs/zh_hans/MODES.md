@@ -54,7 +54,7 @@ Operate 改变的是调度重点，而不是权限。它既不增加特定于模
 
 生命周期声明保持精确：已派发 ≠ 已定案 ≠ 已验证。
 
-`allow_shell` 控制 `bash` 是否可以执行；它不重命名工具，也不让模式成为审批权威。持久任务与自动化在字段省略时保持保守的默认值，只有其设置显式授予时才获得 shell 权限。有状态的终端/后台控制是专门的延迟加载工具，而不是精简的前台 `bash` schema 上的字段。Full Access 改变的是权限姿态，硬性安全拦截和仓库策略拦截仍然具有最终效力。
+`allow_shell` 控制 `bash` 是否可以执行；它不重命名工具，也不让模式成为审批权威。持久任务与自动化在字段省略时保持保守的默认值，只有其设置显式授予时才获得 shell 权限。有状态的终端/后台控制是专门的延迟加载工具，而不是精简的前台 `bash` schema 上的字段。Full Access 改变的是权限姿态：确定性的 Auto-Review 底线只在会审查的姿态中生效，在 Full Access 下会被跳过，而仓库策略拦截仍然具有最终效力。
 
 具备行动能力的模式可以通过 `tool_search` 发现延迟的 `rlm` 工具族；它的 `open`、`eval`、`configure` 和 `close` 动作拥有持久的 RLM 会话。旧的拆分式 `rlm_*` 名称仍是仅用于回放的别名。在 RLM Python REPL 内部，`sub_query_batch` 会扇出 1-16 个固定使用 `deepseek-v4-flash` 的低成本并行子调用。
 
@@ -115,7 +115,7 @@ LLM 审查器最接近 OpenAI Codex 的实验性 Auto-Review，对应提交 [`6f
 Kimi Code 在提交 [`1414d4602898f406e540b23342cb18db23ff9efc`](https://github.com/MoonshotAI/kimi-code/tree/1414d4602898f406e540b23342cb18db23ff9efc) 也没有 LLM 审查器。它的有序[权限策略](https://github.com/MoonshotAI/kimi-code/blob/1414d4602898f406e540b23342cb18db23ff9efc/packages/agent-core-v2/src/agent/permissionPolicy/permissionPolicyService.ts)先应用显式拒绝规则，然后它的 [Auto 策略](https://github.com/MoonshotAI/kimi-code/blob/1414d4602898f406e540b23342cb18db23ff9efc/packages/agent-core-v2/src/agent/permissionPolicy/policies/auto-mode-approve.ts)直接返回 `approve`。Codewhale 使用上述确定性安全底线与模型守护者，同时保留模型有意向用户提问的能力。
 
 沙箱与升级基线参照 DeepSeek Harness `0.1.0-rc.5`，对应提交 [`47f943859bef60e4160492346772ded9b24f765a`](https://github.com/deepseek-ai/deepseek-harness/tree/47f943859bef60e4160492346772ded9b24f765a)：它的[sandbox 契约](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/docs/subsystems/sandbox.md)为每次调用定义 `read-only`、`workspace-write` 和 `danger-full-access` 边界，并禁止静默回退到无约束模式；它的[approval 契约](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/docs/subsystems/approval.md)只授予 `allowed-once`，并在被拒绝、被取消或没有可用的应答者时失败关闭；它的[sandbox 结果契约](https://github.com/deepseek-ai/deepseek-harness/blob/47f943859bef60e4160492346772ded9b24f765a/packages/shell/bash-sandbox/README.md)告诉模型：被拒绝的命令只重试一次，改用刚好够用的更宽模式，并附上理由。DeepSeek Harness 没有在这条路径上加入 LLM 审查器。Codewhale 的自主姿态只额外增加了上文所述的单次无状态守护者请求；确定性硬阻断仍然无法绕过。
-- `bypass`（**Full Access**）：普通工具调用不显示审批提示，而用户有意发起的提问仍然可用。不可绕过的已注册拦截会自动批准，而不是弹出自相矛盾的弹窗。仓库规则拦截和托管策略拦截则作为硬阻断失败关闭，而不是用审批弹窗与 Full Access 自相矛盾。
+- `bypass`（**Full Access**）：普通工具调用不显示审批提示，而用户有意发起的提问仍然可用。确定性的 Auto-Review 底线会被跳过——发布类命令、破坏性的后台/无头工作，以及 Windows npm 启动器平台拦截，都不会再拦下用户已经授予的调用。不可绕过的已注册拦截会自动批准，而不是弹出自相矛盾的弹窗。仓库规则拦截和托管策略拦截则作为硬阻断失败关闭，而不是用审批弹窗与 Full Access 自相矛盾。
 - `never`：阻止任何不被视为安全/只读的工具；用户有意发起的提问仍然可用。
 
 当前生效的姿态及其提问纪律，由门控工具的同一个运行时权威投射到每个回合，因此模式/姿态的更改在下一回合即可见。不可信的运行时生成输入会在构建元数据之前被收窄，无法凭空捏造审批权限。显式的 Full Access 子智能体交接会保留父会话的既定姿态，所以普通的子智能体工作不会重新开始弹出提示。
@@ -126,7 +126,7 @@ Kimi Code 在提交 [`1414d4602898f406e540b23342cb18db23ff9efc`](https://github.
 
 - **Auto-Review**：worker 被拦截的调用走同一套确定性策略（已证明安全的调用运行；发布类和破坏性的后台工作被硬阻断）；对于无法证明安全的拦截，则使用该子智能体自己的会话客户端，交给同一个一次性的模型守护者。绝不会为子智能体弹出提示；守护者不可用时拒绝，即失败关闭。
 - **Ask**：该角色可以委托的调用直接运行。被拦截的调用，在宿主是交互式 TUI 时，会作为审批提示在父会话的界面中提出（`agent:<id>:approval:<n>`）；worker 会明显地处于等待状态（`waiting for user`），用户的回答会被路由回它——无论父回合当时是空闲还是自己也在等待审批。无法弹出提示的宿主会拒绝，并说明原因。
-- **Full Access**：普通调用运行；破坏性的分离式工作仍然失败关闭，因为子智能体属于后台 worker。
+- **Full Access**：调用会运行，包括破坏性的分离式工作——Auto-Review 底线与父回合一样被跳过。执行包络仍然生效，且永远不会放宽。
 
 角色姿态和执行边界在这道关卡之前和之后都会被检查，且绝不会被放宽。凡是人没有在提示处亲自做出的决定，都会写入审计日志和子智能体的对话记录，作为一行说明（`Auto-Review allowed 'bash' (low risk, model guardian): …`），在聚焦该 worker 时可见。
 

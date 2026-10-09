@@ -5,7 +5,7 @@ import type { DocsMcpDict } from "../types";
  * ("Connect tools with MCP"). Commands and flags are checked against
  * `McpCommand` in crates/tui/src/lib.rs and docs/MCP.md; the code-mode
  * section against crates/tui/src/tools/codemode.rs and
- * crates/tui/src/features.rs (`code_mode`: Experimental, default off).
+ * crates/tui/src/features.rs (`code_mode`: Experimental stage, on by default).
  */
 export const docsMcp: DocsMcpDict = {
   metaTitle: "Connect tools with MCP · Codewhale Docs",
@@ -114,21 +114,21 @@ codewhale mcp tools codewhale`,
       title: "Compose tool calls with code mode (experimental)",
       blocks: [
         {
-          p: "Code mode lets the model write one short JavaScript program that calls several tools, loops, and filters results, instead of making each call as a separate step. Only the program's final value goes back to the model, which keeps long lookups compact. It is off by default. Try it for one session, or turn it on in config:",
+          p: "Code mode lets the model write one short JavaScript program that calls several tools, loops, and filters results, instead of making each call as a separate step. Only the program's final value goes back to the model, which keeps long lookups compact. It is on by default — `execute_tools` is advertised from the first request — and MCP and plugin tools compose inside a program the same way built-in ones do. To turn it off for one session, or in config:",
         },
         {
-          code: `codewhale --enable code_mode
+          code: `codewhale --disable code_mode
 
 # ~/.codewhale/config.toml
 [features]
-code_mode = true`,
+code_mode = false`,
           lang: "Terminal / config.toml",
         },
         {
           list: [
-            "Only read-only tools that need no approval can run inside a program. Anything that writes, runs a shell command, or would ask you stops the program and reports which call it refused.",
-            "MCP tools cannot be called from a program yet. Use them as ordinary tool calls.",
-            "Limits per program: 50 tool calls, 4 at a time, 30 seconds, and 16 KiB returned.",
+            "Nested native, MCP and plugin calls pass the same gate as a direct call: allow/deny lists, ask-rules, and review still apply. A call that needs approval raises the normal approval card and pauses the program; allow resumes it, deny fails only that call. Approving the program itself grants nothing.",
+            "MCP calls run through the session's MCP pool, and plugin tools are callable inside a program just like built-in ones.",
+            "Limits per program: 50 nested calls, 4 at a time, and 16 KiB returned. There is no fixed 30-second cap: a program runs on the turn's remaining wall clock, unbounded unless `[tui].turn_wall_clock_secs` is set.",
             "Code mode is not available in Plan mode.",
           ],
         },

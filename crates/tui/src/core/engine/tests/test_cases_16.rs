@@ -649,7 +649,7 @@ async fn execute_tools_dispatches_through_common_executor() {
 }
 
 #[tokio::test]
-async fn dispatch_reports_typed_operation_activity_without_names_or_arguments() {
+async fn dispatch_reports_typed_operation_activity_with_safe_identity_without_arguments() {
     use crate::tools::file_tool::ReadTool;
     use crate::tools::registry::ToolRegistryBuilder;
     use crate::tools::spec::ToolContext;
@@ -702,13 +702,12 @@ async fn dispatch_reports_typed_operation_activity_without_names_or_arguments() 
         matches!(
             events.as_slice(),
             [
-                Event::OperationActivityStarted { span_id: started, activity_kind: OwnerActivityKind::Reading },
+                Event::OperationActivityStarted { span_id: started, activity_kind: OwnerActivityKind::Reading, action_id: Some(action) },
                 Event::OperationActivityCompleted {
                     span_id: completed,
                     activity_kind: OwnerActivityKind::Reading,
-                    outcome: OwnerOperationOutcome::Succeeded,
-                },
-            ] if started == completed && started.starts_with("call-1#")
+                    outcome: OwnerOperationOutcome::Succeeded, action_id: Some(completed_action) },
+            ] if started == completed && started.starts_with("call-1#") && action == "read_file" && completed_action == action
         ),
         "unexpected activity: {events:?}"
     );
@@ -798,9 +797,10 @@ async fn dropped_operation_span_completes_as_cancelled() {
     // opened must still close, or every host leaks an active operation.
     let (tx_event, mut rx_event) = mpsc::channel(16);
     let span = super::tool_execution::OperationSpanGuard::start(
-        tx_event,
+        &tx_event,
         "call-x",
         OwnerActivityKind::Editing,
+        Some("edit_file".into()),
         None,
     )
     .await;
@@ -814,6 +814,7 @@ async fn dropped_operation_span_completes_as_cancelled() {
             span_id,
             activity_kind: OwnerActivityKind::Editing,
             outcome: OwnerOperationOutcome::Cancelled,
+            ..
         }) => assert_eq!(span_id, started),
         other => panic!("unexpected event: {other:?}"),
     }

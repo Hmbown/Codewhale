@@ -57,6 +57,8 @@ mod external_credentials;
 mod features;
 mod fleet;
 mod fs_confined;
+mod git_status;
+use crate::fleet::executor::exec_stream_final_answer_excerpt;
 mod hooks;
 mod image_attach;
 mod import_claude;
@@ -73,6 +75,7 @@ mod model_profile;
 mod model_relevance;
 mod model_routing;
 mod models_dev_live;
+pub use models_dev_live::maybe_load_persisted_cache;
 mod network_policy;
 mod notify;
 mod oauth;
@@ -86,6 +89,7 @@ mod project_context_cache;
 mod prompts;
 mod provider_catalog_live;
 mod provider_lake;
+pub use provider_lake::all_catalog_models_for_provider;
 mod provider_readiness;
 mod purge;
 pub mod reasoning_preference;
@@ -145,12 +149,11 @@ use codewhale_release::tls;
 // re-exports; the split deletes it by rewriting these paths to
 // `codewhale_runtime::` (docs/design/TUI_DECONSTRUCTION.md).
 use codewhale_runtime::{
-    context_budget, continual_harness, elapsed, fast_hash, goal_loop, hashing, host_terminal,
+    context_budget, continual_harness, fast_hash, goal_loop, hashing, host_terminal,
     llm_response_cache, media_originals, model_context, native_memory, prompt_zones, regex_cache,
     retry_status, safe_label, session_tree, skill_state, sleep_guard, tool_history_repair,
     workspace_discovery,
 };
-mod diagnostics_reports;
 mod todo_snapshot;
 mod tool_inspection;
 mod tool_output_receipts;
@@ -170,6 +173,7 @@ mod workspace_trust;
 
 use crate::config::{
     Config, DEFAULT_MAX_SUBAGENTS, DEFAULT_TEXT_MODEL, MAX_SUBAGENTS, effective_home_dir,
+    initialize_cloud_facts,
 };
 use crate::eval::{EvalHarness, EvalHarnessConfig, ScenarioStepKind};
 use crate::features::{Feature, render_feature_table};
@@ -1810,8 +1814,6 @@ enum SandboxCommand {
     },
 }
 
-const CODEWHALE_MAIN_STACK_BYTES: usize = 32 * 1024 * 1024;
-
 /// Pre-clap seam feeding `apply_process_hardening` (#5723): resolve only the
 /// *startup* sandbox posture — `CODEWHALE_SANDBOX_MODE` /
 /// `DEEPSEEK_SANDBOX_MODE` first, then the config file's `sandbox_mode` key —
@@ -2036,7 +2038,7 @@ fn run_with_args(options: RuntimeOptions, args: Vec<String>) -> Result<()> {
     // address space only, since thread stacks commit lazily.
     let runtime_thread = std::thread::Builder::new()
         .name("codewhale-main".to_string())
-        .stack_size(CODEWHALE_MAIN_STACK_BYTES)
+        .stack_size(codewhale_runtime::CODEWHALE_MAIN_STACK_BYTES)
         .spawn(move || run_async_main(cli, command, plugin_discovery, plugin_registry))
         .context("Failed to start the Codewhale runtime thread")?;
     match runtime_thread.join() {
@@ -2145,7 +2147,7 @@ fn tokio_runtime_builder() -> tokio::runtime::Builder {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder
         .enable_all()
-        .thread_stack_size(CODEWHALE_MAIN_STACK_BYTES);
+        .thread_stack_size(codewhale_runtime::CODEWHALE_MAIN_STACK_BYTES);
     builder
 }
 
@@ -9492,17 +9494,6 @@ fn resolve_workspace(cli: &Cli) -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
-/// Activate facts only at accepted inference runtime settings boundaries.
-/// Identical settings preserve the shared ticket; readers track its generation.
-pub(crate) fn initialize_cloud_facts(config: &Config) {
-    let settings = config.cloud_facts_config().settings();
-    codewhale_cloud_facts::configure(&settings);
-    codewhale_cloud_facts::maybe_load_persisted_cache(&settings);
-    if tokio::runtime::Handle::try_current().is_ok() {
-        codewhale_cloud_facts::spawn_background_refresh(settings, None);
-    }
-}
-
 async fn plugin_auth_entry_from_cli(
     cli: &Cli,
     provider: &str,
@@ -14744,13 +14735,6 @@ fn exec_stream_resume_hint(session_id: &str) -> String {
     }
 }
 
-/// Character bound for `metadata.visible_final_answer_excerpt`. The excerpt
-/// is a status surface (fleet receipts, event labels, runtime API payloads),
-/// not the transcript: the full answer lives in the saved session and the
-/// worker's stream-json log, and `visible_final_answer_chars` carries the real
-/// length so a consumer can tell a bounded excerpt from a short answer.
-const EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS: usize = 4_000;
-
 /// The final visible assistant reply for the terminal receipt: the text
 /// blocks of the last assistant-like message after the current user prompt.
 /// Tool results also use the user role, so they must not start a new turn.
@@ -14786,22 +14770,6 @@ fn exec_stream_final_answer_text(
         .trim()
         .to_string();
     (!text.is_empty()).then_some(text)
-}
-
-/// Bound and secret-redact the visible final answer once, at the emitter, so
-/// every downstream consumer reads the same excerpt.
-fn exec_stream_final_answer_excerpt(output: &str) -> String {
-    let redacted = codewhale_config::persistence::redact_secrets(output.trim());
-    let mut chars = redacted.chars();
-    let excerpt: String = chars
-        .by_ref()
-        .take(EXEC_STREAM_FINAL_ANSWER_EXCERPT_CHARS)
-        .collect();
-    if chars.next().is_some() {
-        format!("{excerpt}...")
-    } else {
-        excerpt
-    }
 }
 
 #[derive(Clone, Copy)]

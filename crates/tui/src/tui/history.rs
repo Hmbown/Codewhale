@@ -1157,7 +1157,7 @@ impl ExecCell {
             {
                 lines.extend(render_compact_kv(
                     "time",
-                    &crate::elapsed::format_elapsed_ms(duration_ms),
+                    &codewhale_command_contract::elapsed::format_elapsed_ms(duration_ms),
                     Style::default().fg(palette::TEXT_DIM),
                     width,
                 ));
@@ -1222,7 +1222,7 @@ impl ExecCell {
             if mode == RenderMode::Transcript || duration_ms >= 1000 {
                 lines.extend(render_compact_kv(
                     "time",
-                    &crate::elapsed::format_elapsed_ms(duration_ms),
+                    &codewhale_command_contract::elapsed::format_elapsed_ms(duration_ms),
                     Style::default().fg(palette::TEXT_DIM),
                     width,
                 ));
@@ -2820,7 +2820,7 @@ pub(crate) fn running_status_label_with_elapsed(elapsed_secs: u64) -> String {
 pub(crate) fn stale_shell_status_label(elapsed_since_output_ms: u64) -> String {
     format!(
         "running · stale · no output {}",
-        crate::elapsed::format_elapsed_ms(elapsed_since_output_ms)
+        codewhale_command_contract::elapsed::format_elapsed_ms(elapsed_since_output_ms)
     )
 }
 

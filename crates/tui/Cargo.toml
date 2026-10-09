@@ -48,6 +48,7 @@ codewhale-app-server = { path = "../app-server", version = "0.10.2" }
 codewhale-config = { path = "../config", version = "0.10.2" }
 codewhale-cloud-facts = { path = "../cloud-facts", version = "0.10.2" }
 codewhale-command-contract = { path = "../command-contract", version = "0.10.2" }
+codewhale-commands = { path = "../commands", version = "0.10.2" }
 codewhale-core = { path = "../core", version = "0.10.2" }
 codewhale-execpolicy = { path = "../execpolicy", version = "0.10.2" }
 codewhale-hooks = { path = "../hooks", version = "0.10.2" }

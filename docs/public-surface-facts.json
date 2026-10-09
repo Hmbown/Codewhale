@@ -103,6 +103,7 @@
       "read",
       "write",
       "edit",
+      "file_search",
       "bash",
       "agent",
       "workflow",

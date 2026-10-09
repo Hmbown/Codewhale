@@ -468,6 +468,7 @@ fn messages_from_thread_detail_batches_tool_results() {
         duration_ms: Some(0),
         usage: None,
         model_request_diagnostics: None,
+        operation_activity: None,
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: Some("ask".to_string()),
@@ -1137,7 +1138,7 @@ fn spawn_product_stack_server(
         .clone();
     std::thread::Builder::new()
         .name("runtime-api-test-server".to_string())
-        .stack_size(crate::CODEWHALE_MAIN_STACK_BYTES)
+        .stack_size(codewhale_runtime::CODEWHALE_MAIN_STACK_BYTES)
         .spawn(move || {
             // Adopted for the thread's lifetime; the scope's generation check
             // refuses enrollment once the sealing test has ended.
@@ -9797,6 +9798,7 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
             ..Usage::default()
         }),
         model_request_diagnostics: None,
+        operation_activity: None,
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
@@ -9996,6 +9998,7 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
             ..Usage::default()
         }),
         model_request_diagnostics: None,
+        operation_activity: None,
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
@@ -11344,6 +11347,7 @@ fn seed_summary_search_transcript(
             duration_ms: Some(0),
             usage: None,
             model_request_diagnostics: None,
+            operation_activity: None,
             routing_settlement: false,
             effective_route_usage: None,
             permission_posture: None,

@@ -3752,9 +3752,12 @@ fn get_owned_credentials_with(
 fn validate_saved_claude_generation(config: &Config, name: &str, locked: bool) -> Result<()> {
     let path = crate::config_persistence::config_toml_path(config.loaded_config_path.as_deref())?;
     let validate = |path: &Path| {
-        let contents = std::fs::read_to_string(path)
+        let store = codewhale_config::ConfigStore::load(Some(path.to_path_buf()))
             .context("Could not verify current Claude sign-in configuration")?;
-        let saved = Config::from_saved_document(&contents, config.account_profile.as_deref())
+        let contents = store
+            .original_body()
+            .context("Current Claude sign-in configuration is missing")?;
+        let saved = Config::from_saved_document(contents, config.account_profile.as_deref())
             .map_err(|_| anyhow::anyhow!("Current Claude sign-in configuration is invalid"))?;
         let identity = saved
             .builtin_provider_identity(ProviderKind::Anthropic)

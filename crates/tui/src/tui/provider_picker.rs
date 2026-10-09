@@ -8344,9 +8344,7 @@ mod tests {
                 assert_eq!(app.model, "gpui-fixture");
                 assert_eq!(app.active_route_base_url, "http://127.0.0.1:4880/v1");
                 assert_eq!(app.onboarding, crate::tui::app::OnboardingState::None);
-                assert!(!crate::local_ollama::should_adopt_live_local_ollama(
-                    &mut app
-                ));
+                assert!(!app.should_adopt_live_local_ollama());
 
                 let runtime = tokio::runtime::Runtime::new().unwrap();
                 runtime
@@ -8390,9 +8388,7 @@ mod tests {
         with_first_run_config("", |mut app, config| {
             assert_eq!(app.onboarding, crate::tui::app::OnboardingState::Provider);
             assert!(!app.onboarding_recovers_configured_route());
-            assert!(crate::local_ollama::should_adopt_live_local_ollama(
-                &mut app
-            ));
+            assert!(app.should_adopt_live_local_ollama());
             let picker =
                 ProviderPickerView::new_for_onboarding(app.api_provider, None, &config, None);
             assert_eq!(picker.stage, Stage::List);

@@ -15,10 +15,10 @@ use super::CommandResult;
 use super::DebugAction as AppAction;
 use crate::diagnostics_reports as reports;
 
-pub(in crate::commands) struct TokensCmd;
-pub(in crate::commands) struct CostCmd;
-pub(in crate::commands) struct SystemCmd;
-pub(in crate::commands) struct ContextCmd;
+pub struct TokensCmd;
+pub struct CostCmd;
+pub struct SystemCmd;
+pub struct ContextCmd;
 
 const TOKENS_INFO: ContractInfo = ContractInfo {
     name: "tokens",

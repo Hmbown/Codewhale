@@ -880,16 +880,22 @@ fn pressure_label(percent: Option<f64>) -> &'static str {
 
 #[cfg(test)]
 pub fn format_context_report(report: &PromptSourceMap) -> String {
-    crate::diagnostics_reports::format_context_report(&project_source_map(report.clone()))
+    codewhale_commands::diagnostics_reports::format_context_report(&project_source_map(
+        report.clone(),
+    ))
 }
 
 #[cfg(test)]
 pub fn format_context_summary(report: &PromptSourceMap) -> String {
-    crate::diagnostics_reports::format_context_summary(&project_source_map(report.clone()))
+    codewhale_commands::diagnostics_reports::format_context_summary(&project_source_map(
+        report.clone(),
+    ))
 }
 
 pub fn context_report_json(report: &PromptSourceMap) -> String {
-    crate::diagnostics_reports::context_report_json(&project_source_map(report.clone()))
+    codewhale_commands::diagnostics_reports::context_report_json(&project_source_map(
+        report.clone(),
+    ))
 }
 
 #[cfg(test)]
