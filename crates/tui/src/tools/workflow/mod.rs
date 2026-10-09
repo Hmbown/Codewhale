@@ -349,11 +349,14 @@ fn finish_workflow_controller(state: &WorkflowWorkspaceState, record: &WorkflowR
         let payload =
             format!("{summary}\n<codewhale:subagent.done>{receipt}</codewhale:subagent.done>");
         debug_assert!(payload.len() <= WORKFLOW_COMPLETION_MAX_BYTES);
-        let _ = tx.try_send(SubAgentCompletion {
-            owner_session_id: controller.driver.owner_session_id.clone(),
-            agent_id: record.run_id.clone(),
-            payload,
-        });
+        send_terminal_event(
+            tx,
+            SubAgentCompletion {
+                owner_session_id: controller.driver.owner_session_id.clone(),
+                agent_id: record.run_id.clone(),
+                payload,
+            },
+        );
     }
     controllers.remove(&record.run_id);
 }

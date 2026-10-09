@@ -538,6 +538,7 @@ const DEFAULT_STEP_API_TIMEOUT: Duration =
 const COMPLETED_AGENT_RETENTION: Duration = Duration::from_secs(60 * 60);
 const MAX_AGENT_WORKER_RECORDS: usize = 256;
 const MAX_AGENT_WORKER_EVENTS_PER_RECORD: usize = 128;
+const MAX_QUEUED_PARENT_MESSAGES: usize = 64;
 /// Byte budget for the message tail retained in a [`SubAgentCheckpoint`]
 /// (#3882). Checkpoints fire on every step of every worker and are cloned
 /// into snapshots, projections, and `subagents.v1.json`; an unbounded
@@ -7263,6 +7264,11 @@ impl SubAgentManager {
             wake,
         };
         let queue = self.queued_mail.entry(agent_id.clone()).or_default();
+        if queue.len() >= MAX_QUEUED_PARENT_MESSAGES {
+            return Err(anyhow!(
+                "Agent {agent_id} already has {MAX_QUEUED_PARENT_MESSAGES} queued parent messages; wait for it to read them before sending more"
+            ));
+        }
         queue.push_back(entry);
         let queue_depth = queue.len();
         Ok(ParentMailReceipt {
@@ -10832,13 +10838,9 @@ fn instant_from_duration(duration: Duration) -> Instant {
         .unwrap_or_else(Instant::now)
 }
 
-/// Per-write sequence so each `write_json_atomic` uses a distinct temp file.
 /// `persist_state_best_effort` fires a fresh thread per call, so multiple
-/// persists of the same `state.json` can be in flight at once; keying the temp
-/// name only on the pid (as before) made every thread write the *same*
-/// `state.<pid>.tmp` and a rename could publish a half-written file — corrupt
-/// state that fails to parse on reload.
-static WRITE_JSON_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// persists of the same `state.json` can be in flight at once; the publish
+/// sequence below keeps an older snapshot from replacing a newer one.
 static STATE_PUBLISH_SEQUENCES: std::sync::OnceLock<parking_lot::Mutex<HashMap<PathBuf, u64>>> =
     std::sync::OnceLock::new();
 
@@ -10849,10 +10851,6 @@ fn write_json_atomic(state_root: &Path, path: &Path, value: &PersistedSubAgentSt
         fs::create_dir_all(parent)?;
     }
     let payload = serde_json::to_string_pretty(value)?;
-    let seq = WRITE_JSON_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = path.with_extension(format!("{}.{seq}.tmp", std::process::id()));
-    reject_root_relative_symlinks(&state_root, &tmp_path)?;
-    fs::write(&tmp_path, payload)?;
     let publish_sequences =
         STATE_PUBLISH_SEQUENCES.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
     let mut published = publish_sequences.lock();
@@ -10860,14 +10858,9 @@ fn write_json_atomic(state_root: &Path, path: &Path, value: &PersistedSubAgentSt
         .get(path)
         .is_some_and(|sequence| *sequence > value.snapshot_sequence)
     {
-        let _ = fs::remove_file(&tmp_path);
         return Ok(());
     }
-    if let Err(err) = fs::rename(&tmp_path, path) {
-        // Don't leave a stray temp behind if the publish failed.
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err.into());
-    }
+    crate::utils::write_atomic(path, payload.as_bytes())?;
     published.insert(path.to_path_buf(), value.snapshot_sequence);
     Ok(())
 }

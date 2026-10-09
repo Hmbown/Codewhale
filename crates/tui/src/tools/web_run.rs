@@ -1126,9 +1126,12 @@ async fn run_image_search(
             .await
             .map_err(ToolError::from)?
     } else {
-        seed_resp.text().await.map_err(|e| {
-            ToolError::execution_failed(format!("Failed to read image seed response: {e}"))
-        })?
+        let bytes = crate::utils::read_response_body_capped(seed_resp, HARD_MAX_BYTES)
+            .await
+            .map_err(|e| {
+                ToolError::execution_failed(format!("Failed to read image seed response: {e}"))
+            })?;
+        String::from_utf8_lossy(&bytes).into_owned()
     };
 
     if !seed_status.is_success() {
@@ -1159,9 +1162,12 @@ async fn run_image_search(
             .await
             .map_err(ToolError::from)?
     } else {
-        api_resp.text().await.map_err(|e| {
-            ToolError::execution_failed(format!("Failed to read image response: {e}"))
-        })?
+        let bytes = crate::utils::read_response_body_capped(api_resp, HARD_MAX_BYTES)
+            .await
+            .map_err(|e| {
+                ToolError::execution_failed(format!("Failed to read image response: {e}"))
+            })?;
+        String::from_utf8_lossy(&bytes).into_owned()
     };
 
     if !api_status.is_success() {
