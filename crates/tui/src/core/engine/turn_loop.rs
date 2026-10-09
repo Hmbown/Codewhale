@@ -1431,8 +1431,7 @@ impl Engine {
             .terminal_chrome_enabled
             .then(crate::sleep_guard::SleepGuard::hold);
         if self.config.terminal_chrome_enabled {
-            crate::tui::notifications::set_taskbar_progress_busy();
-            crate::tui::notifications::start_title_animation("codewhale");
+            crate::host_terminal::host().begin_turn_chrome();
         }
 
         let client = self

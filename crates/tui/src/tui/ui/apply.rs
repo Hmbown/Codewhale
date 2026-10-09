@@ -2416,7 +2416,7 @@ async fn apply_command_result_inner(
             AppAction::OpenWorktreeManager => {
                 if app.view_stack.top_kind() != Some(ModalKind::WorktreeManager) {
                     // Non-blocking: git_status caches; manager never shells on paint.
-                    crate::tui::git_status::refresh_if_stale(&app.workspace);
+                    crate::git_status::refresh_if_stale(&app.workspace);
                     app.view_stack
                         .push(crate::tui::worktree_manager::WorktreeManagerView::new(
                             app.workspace.clone(),

@@ -8106,13 +8106,17 @@ fn root_deepseek_model_is_foreign_to_direct_provider(provider: ProviderKind, mod
 // the workspace-trust/config-load logic that stays in this file (#3311).
 mod home;
 mod paths;
+#[cfg(test)]
+pub(crate) use paths::clipboard_images_dir_for_home;
 use paths::{
     canonicalize_or_keep, codewhale_home_dir, default_config_path, default_managed_config_path,
     default_mcp_config_path, default_memory_path, default_notes_path, default_requirements_path,
     default_skills_dir, env_config_path, expand_pathbuf, try_default_config_path,
     workspace_config_key,
 };
-pub(crate) use paths::{effective_home_dir, expand_path, home_config_path, is_home_config_path};
+pub(crate) use paths::{
+    clipboard_images_dir, effective_home_dir, expand_path, home_config_path, is_home_config_path,
+};
 
 pub(crate) fn workspace_trust_config_candidate_paths() -> Vec<PathBuf> {
     #[cfg(test)]

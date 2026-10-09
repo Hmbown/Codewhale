@@ -57,6 +57,7 @@ mod external_credentials;
 mod features;
 mod fleet;
 mod fs_confined;
+mod git_status;
 mod hooks;
 mod image_attach;
 mod import_claude;
