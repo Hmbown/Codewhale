@@ -1,0 +1,38 @@
+name: Native plugin integration review
+on:
+  push:
+    branches: [feat/native-plugin-login-install]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: TokenNotIncluded/codewhale-lmm-provider
+          ref: 954fc45b360204915f5f37fe8d8fbebeabc88294
+          path: .review-plugin
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: TokenNotIncluded/api.lmm.best
+          path: .review-server
+          persist-credentials: false
+      - name: Archive tracked source without credentials
+        run: |
+          mkdir -p "$RUNNER_TEMP/native-review"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/native-review/codewhale.tar.gz"
+          git -C .review-plugin archive --format=tar.gz HEAD > "$RUNNER_TEMP/native-review/plugin.tar.gz"
+          git -C .review-server archive --format=tar.gz HEAD apps/api-go packages/pi-lmm-provider > "$RUNNER_TEMP/native-review/server.tar.gz"
+          git rev-parse HEAD > "$RUNNER_TEMP/native-review/codewhale.sha"
+          git -C .review-plugin rev-parse HEAD > "$RUNNER_TEMP/native-review/plugin.sha"
+          git -C .review-server rev-parse HEAD > "$RUNNER_TEMP/native-review/server.sha"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-plugin-review-source
+          path: ${{ runner.temp }}/native-review
+          retention-days: 1
