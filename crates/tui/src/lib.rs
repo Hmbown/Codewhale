@@ -58,6 +58,7 @@ mod features;
 mod fleet;
 mod fs_confined;
 mod git_status;
+mod keybinding_table;
 use crate::fleet::executor::exec_stream_final_answer_excerpt;
 mod hooks;
 mod image_attach;
