@@ -905,7 +905,7 @@ async fn collect_guardian_journey_with_receipts(
 
 #[cfg(windows)]
 #[test]
-fn windows_full_access_node_image_kill_is_denied_before_any_shell_effect() {
+fn windows_auto_review_node_image_kill_is_denied_before_any_shell_effect() {
     use crate::llm_client::mock::{MockLlmClient, canned};
 
     with_artifact_home(|home| {
@@ -940,12 +940,9 @@ fn windows_full_access_node_image_kill_is_denied_before_any_shell_effect() {
                 let (engine, handle) = Engine::new_with_model_client(
                     deterministic_engine_config(&workspace), &config, mock.clone(),
                 );
-                let mut op = external_user_message_op("Attempt the supplied cleanup.", AppMode::Agent, &config);
-                let Op::SendMessage(turn) = &mut op else { unreachable!("model turn fixture") };
-                turn.auto_approve = true;
-                turn.approval_mode = ApprovalMode::Bypass;
+                let op = auto_review_message_op("Attempt the supplied cleanup.", &config);
                 let task = tokio::spawn(engine.run());
-                handle.send(op).await.expect("send Full Access trajectory");
+                handle.send(op).await.expect("send Auto-Review trajectory");
                 let (completion, _, _, receipts) = collect_guardian_journey_with_receipts(&handle, "windows-node-kill").await;
                 let error = completion.expect_err("runtime safety floor must deny before shell execution");
                 assert!(matches!(error, crate::tools::spec::ToolError::PermissionDenied { .. }));
