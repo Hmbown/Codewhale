@@ -10,9 +10,9 @@ Codewhale Engine 是现有 Rust 执行运行时。[Runtime API](RUNTIME_API.md) 
 当前边界说明（工作区版本以 `Cargo.toml` 为准；该边界自 v0.9.1 起保持不变）：
 - `crates/tui` 仍是 TUI、运行时 API、任务管理器和工具执行循环的现行终端用户运行时。
 - 其他工作区 crate 正在逐步拆出，但它们还不是唯一的权威运行时。
-- 运行时正按照 `docs/design/TUI_DECONSTRUCTION.md` 记录的顺序迁往 `crates/runtime`
-  （`codewhale-runtime`）：引擎、工具、配置、客户端与各存储一起迁移，绝不迁进
-  `crates/core`，而 TUI 始终是唯一写终端的 crate。在某个模块迁走之前，
+- `crates/tui` 正按照 `docs/design/TUI_DECONSTRUCTION.md` 记录的顺序拆分为以智能体
+  工作分区为单位的 crate：契约、工具库、服务、提供方、运行时、叶子功能 crate、TUI 视图
+  与宿主。TUI 始终是唯一写终端的 crate。在某个模块迁走之前，
   它仍位于 `crates/tui/src` 下的原路径。
 - LSP 子系统（`crates/tui/src/lsp/`）已完整接入引擎的工具执行后路径
   （`core/engine/lsp_hooks.rs`），在 `File` 写入、编辑和补丁动作之后提供内联诊断。
