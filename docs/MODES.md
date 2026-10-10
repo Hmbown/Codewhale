@@ -31,7 +31,8 @@ Press `Shift+Tab` to cycle permission posture (Ask → Auto-Review → Full Acce
 Entering Full Access (`Shift+Tab`, `Alt+Y`, `/config approval_mode full-access`)
 asks first: `Enter` turns it on for this session, `R` keeps it on for this repo
 (`full_access_repos` in `settings.toml`), `Esc` cancels. Full Access is never
-saved as the startup posture; `--yolo` and `CODEWHALE_YOLO` skip the question.
+saved as the startup posture; the legacy launch flag and its environment variable
+skip the question.
 Every change of effective permission writes a `Permissions changed to …` line
 in the transcript, and the footer chip reads `Full Access · session` or
 `Full Access · this repo`. A runtime `PATCH /v1/threads/{id}` that turns on
