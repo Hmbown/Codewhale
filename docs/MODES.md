@@ -36,6 +36,8 @@ Every change of effective permission writes a `Permissions changed to …` line
 in the transcript, and the footer chip reads `Full Access · session` or
 `Full Access · this repo`. A runtime `PATCH /v1/threads/{id}` that turns on
 Full Access must send `full_access_confirmation` (`session` or `repo`).
+Cycling away from a repo-kept Full Access with `Shift+Tab` removes that repo
+from `full_access_repos` and says so in the transcript.
 Press `Ctrl+T` to cycle reasoning effort.
 Run `/mode` to open the mode picker, or switch directly with `/mode work`,
 `/mode plan`, or `/mode operate`.
