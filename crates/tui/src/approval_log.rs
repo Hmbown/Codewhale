@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::fleet::files::WorkspaceFile;
 use crate::sandbox::SandboxPolicy;
 
 const APPROVAL_LOG_FILE: &str = "approval_receipts.jsonl";
@@ -37,6 +38,10 @@ pub(crate) enum ApprovalReceipt {
         tool_call_id: String,
         tool_name: String,
         created_at: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
     },
     Decided {
         approval_id: String,
@@ -56,6 +61,40 @@ impl ApprovalReceipt {
             tool_call_id,
             tool_name: tool_name.into(),
             created_at: Utc::now(),
+            target: None,
+            summary: None,
+        }
+    }
+
+    pub(crate) fn asked_with(
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        input: &serde_json::Value,
+        description: &str,
+        workspace: &Path,
+    ) -> Self {
+        let mut ask = Self::asked(tool_call_id, tool_name);
+        if let Self::Asked {
+            target, summary, ..
+        } = &mut ask
+        {
+            *target = ask_target(input, workspace);
+            *summary = ask_summary(input, description, workspace);
+        }
+        ask
+    }
+
+    pub(crate) fn target(&self) -> Option<&str> {
+        match self {
+            Self::Asked { target, .. } => target.as_deref(),
+            Self::Decided { .. } => None,
+        }
+    }
+
+    pub(crate) fn summary(&self) -> Option<&str> {
+        match self {
+            Self::Asked { summary, .. } => summary.as_deref(),
+            Self::Decided { .. } => None,
         }
     }
 
@@ -105,6 +144,93 @@ impl ApprovalReceipt {
             Self::Asked { created_at, .. } | Self::Decided { created_at, .. } => *created_at,
         }
     }
+}
+
+const ASK_TEXT_CAP: usize = 120;
+
+fn cap_ask_text(text: &str) -> Option<String> {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    if collapsed.chars().count() <= ASK_TEXT_CAP {
+        return Some(collapsed);
+    }
+    let head: String = collapsed.chars().take(ASK_TEXT_CAP - 1).collect();
+    Some(format!("{head}…"))
+}
+
+fn relativize(text: &str, workspace: &Path) -> String {
+    let root = workspace.to_string_lossy();
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(root) {
+        let after = &rest[at + root.len()..];
+        if after.is_empty() || after.starts_with('/') {
+            out.push_str(&rest[..at]);
+            out.push('.');
+        } else {
+            out.push_str(&rest[..at + root.len()]);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn mask_env_assignments(text: &str) -> String {
+    text.split(' ')
+        .map(|word| match word.split_once('=') {
+            Some((key, value))
+                if !value.is_empty()
+                    && key
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                format!("{key}=[redacted]")
+            }
+            _ => word.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_ask_text(text: &str, workspace: &Path) -> Option<String> {
+    let masked = mask_env_assignments(text);
+    let (redacted, _) = crate::session_peek::redact(&masked);
+    cap_ask_text(&relativize(&redacted, workspace))
+}
+
+fn ask_target(input: &serde_json::Value, workspace: &Path) -> Option<String> {
+    for key in ["url", "uri"] {
+        if let Some(raw) = input.get(key).and_then(|v| v.as_str())
+            && let Ok(url) = reqwest::Url::parse(raw.trim())
+            && let Some(host) = url.host_str()
+        {
+            return cap_ask_text(host);
+        }
+    }
+    for key in ["path", "file_path", "filepath", "filename"] {
+        if let Some(raw) = input.get(key).and_then(|v| v.as_str()) {
+            return redact_ask_text(raw, workspace);
+        }
+    }
+    None
+}
+
+fn ask_summary(input: &serde_json::Value, description: &str, workspace: &Path) -> Option<String> {
+    let source = input
+        .get("command")
+        .and_then(|v| v.as_str())
+        .filter(|c| !c.trim().is_empty())
+        .unwrap_or(description);
+    redact_ask_text(source, workspace)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,22 +328,12 @@ struct ApprovalLogRead {
     needs_newline: bool,
 }
 
-fn preserve_torn_tail(parent: &Path, bytes: &[u8]) -> io::Result<()> {
-    // A unique sibling retains the original bytes without replacing earlier
-    // recovery evidence. Tempfiles are owner-only on Unix; elsewhere they
-    // inherit the session directory's access controls. Never log the payload.
-    let mut recovery = tempfile::Builder::new()
-        .prefix("approval_receipts-torn-")
-        .suffix(".recovery")
-        .tempfile_in(parent)?;
-    recovery.write_all(bytes)?;
-    recovery.as_file().sync_all()?;
-    let (_file, _path) = recovery.keep().map_err(|error| error.error)?;
-    // Unlike ordinary append's best-effort directory sync, losing this name
-    // after truncation would lose the only copy of the damaged bytes.
-    #[cfg(unix)]
-    File::open(parent)?.sync_all()?;
-    Ok(())
+fn preserve_torn_tail(log: &WorkspaceFile, bytes: &[u8]) -> io::Result<()> {
+    log.sibling(&format!(
+        "approval_receipts-torn-{}.recovery",
+        uuid::Uuid::new_v4()
+    ))?
+    .publish(bytes)
 }
 
 impl ApprovalReceiptStore {
@@ -249,42 +365,28 @@ impl ApprovalReceiptStore {
         Ok(self.sessions_dir.join(session_id).join(APPROVAL_LOG_FILE))
     }
 
-    fn lock_path(&self, session_id: &str) -> io::Result<PathBuf> {
+    fn log_file(&self, session_id: &str, create: bool) -> io::Result<WorkspaceFile> {
         let session_id = Self::validated_session_id(session_id)?;
-        Ok(self.sessions_dir.join(session_id).join(APPROVAL_LOCK_FILE))
-    }
-
-    fn open_lock_file(&self, session_id: &str) -> io::Result<File> {
-        let path = self.lock_path(session_id)?;
-        let parent = path.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "approval lock has no parent")
-        })?;
-        fs::create_dir_all(parent)?;
-        let file = crate::utils::private_log_options()
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)?;
-        crate::utils::restrict_to_owner(&file)?;
-        Ok(file)
-    }
-
-    fn open_existing_lock_file(&self, session_id: &str) -> io::Result<Option<File>> {
-        let path = self.lock_path(session_id)?;
-        match OpenOptions::new().read(true).open(path) {
-            Ok(file) => Ok(Some(file)),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(err),
+        if create {
+            fs::create_dir_all(&self.sessions_dir)?;
         }
+        WorkspaceFile::open(
+            &self.sessions_dir,
+            &PathBuf::from(session_id).join(APPROVAL_LOG_FILE),
+            create,
+        )
     }
 
-    fn load_unlocked(&self, session_id: &str) -> io::Result<Option<ApprovalLogRead>> {
-        let path = self.log_path(session_id)?;
-        let file = match File::open(path) {
+    fn load_unlocked(log: &WorkspaceFile) -> io::Result<Option<ApprovalLogRead>> {
+        let file = match log.open_file_shared() {
             Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
+        Self::decode_log(file).map(Some)
+    }
+
+    fn decode_log(file: File) -> io::Result<ApprovalLogRead> {
         let mut reader = BufReader::new(file);
         let mut loaded = ApprovalLogRead::default();
         let mut line = Vec::new();
@@ -319,7 +421,7 @@ impl ApprovalReceiptStore {
         }
         ApprovalReplay::from_receipts(&loaded.receipts)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        Ok(Some(loaded))
+        Ok(loaded)
     }
 
     pub(crate) fn load(&self, session_id: &str) -> io::Result<Vec<ApprovalReceipt>> {
@@ -332,19 +434,21 @@ impl ApprovalReceiptStore {
         &self,
         session_id: &str,
     ) -> io::Result<Option<Vec<ApprovalReceipt>>> {
-        let Some(lock_file) = self.open_existing_lock_file(session_id)? else {
-            // Imported or legacy snapshots can contain a receipt log without
-            // its ephemeral lock file. Preserve read-only session loading;
-            // live writers always publish the lock before creating the log.
-            return Ok(self
-                .load_unlocked(session_id)?
-                .map(|loaded| loaded.receipts));
+        let log = match self.log_file(session_id, false) {
+            Ok(log) => log,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let lock_file = match log.sibling(APPROVAL_LOCK_FILE)?.open_file_shared() {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Self::load_unlocked(&log)?.map(|loaded| loaded.receipts));
+            }
+            Err(error) => return Err(error),
         };
         let lock = fd_lock::RwLock::new(lock_file);
         let _guard = lock.read()?;
-        Ok(self
-            .load_unlocked(session_id)?
-            .map(|loaded| loaded.receipts))
+        Ok(Self::load_unlocked(&log)?.map(|loaded| loaded.receipts))
     }
 
     pub(crate) fn replay(&self, session_id: &str) -> io::Result<ApprovalReplay> {
@@ -382,21 +486,18 @@ impl ApprovalReceiptStore {
         &self,
         session_id: &str,
         receipt: &ApprovalReceipt,
-        preserve: impl FnOnce(&Path, &[u8]) -> io::Result<()>,
+        preserve: impl FnOnce(&WorkspaceFile, &[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
-        let lock_file = self.open_lock_file(session_id)?;
+        let log = self.log_file(session_id, true)?;
+        let lock_file = log.sibling(APPROVAL_LOCK_FILE)?.open_update(true, false)?;
+        crate::utils::restrict_to_owner(&lock_file)?;
         let mut lock = fd_lock::RwLock::new(lock_file);
         let _guard = lock.write()?;
-        let path = self.log_path(session_id)?;
-        let mut loaded = self.load_unlocked(session_id)?.unwrap_or_default();
+        let mut loaded = Self::load_unlocked(&log)?.unwrap_or_default();
         loaded.receipts.push(receipt.clone());
         ApprovalReplay::from_receipts(&loaded.receipts)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
-        let parent = path.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "approval log has no parent")
-        })?;
-        fs::create_dir_all(parent)?;
         let mut line = serde_json::to_vec(receipt)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         if loaded.needs_newline {
@@ -405,24 +506,20 @@ impl ApprovalReceiptStore {
         }
         line.push(b'\n');
         // Approval receipts are owner-only and never written through a link.
-        let mut file = crate::utils::private_log_options()
-            .append(true)
-            .open(&path)?;
+        let mut file = log.open_update(true, true)?;
         crate::utils::restrict_to_owner(&file)?;
         if let Some(tail) = &loaded.torn_tail {
             // Validate the candidate and preserve evidence before touching the
             // live log. Any preservation error leaves the original intact.
             // Windows append handles lack the write access set_len requires.
-            let repair = OpenOptions::new().write(true).open(&path)?;
-            preserve(parent, tail)?;
+            let repair = log.open_update(false, false)?;
+            preserve(&log, tail)?;
             repair.set_len(loaded.valid_bytes)?;
             repair.sync_all()?;
         }
         file.write_all(&line)?;
         file.sync_all()?;
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
+        let _ = log.sync_parent();
         Ok(())
     }
 
@@ -435,6 +532,145 @@ impl ApprovalReceiptStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_keeps_evidence_and_mutations_in_the_opened_parent() -> io::Result<()> {
+        for fail_preservation in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().canonicalize()?;
+            let selected = root.join("sessions");
+            let retained = root.join("retained-sessions");
+            let store = ApprovalReceiptStore::new(selected.clone());
+            let ask = ApprovalReceipt::asked("original-tool", "exec_shell");
+            store.append("target", &ask)?;
+            let path = store.log_path("target")?;
+            let tail = b"{\"phase\":\"decided\"";
+            OpenOptions::new()
+                .append(true)
+                .open(&path)?
+                .write_all(tail)?;
+            let original = fs::read(&path)?;
+            let decision = ApprovalReceipt::decided("original-tool", ApprovalOutcome::Denied);
+            let mut replacement_snapshot = None;
+            let result = store.append_with_preservation("target", &decision, |log, bytes| {
+                assert_eq!(bytes, tail);
+                fs::rename(&selected, &retained)?;
+                let replacement = ApprovalReceiptStore::new(selected.clone());
+                replacement.append(
+                    "target",
+                    &ApprovalReceipt::asked("replacement-tool", "read_file"),
+                )?;
+                let replacement_path = replacement.log_path("target")?;
+                replacement_snapshot =
+                    Some((replacement_path.clone(), fs::read(replacement_path)?));
+                fs::write(selected.join("canary"), b"unrelated replacement")?;
+                if fail_preservation {
+                    return Err(io::Error::other("simulated preservation failure"));
+                }
+                preserve_torn_tail(log, bytes)?;
+                assert_eq!(
+                    fs::read(retained.join("target").join(APPROVAL_LOG_FILE))?,
+                    original,
+                    "evidence publication must precede truncation"
+                );
+                Ok(())
+            });
+            if fail_preservation {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "simulated preservation failure"
+                );
+                assert_eq!(
+                    fs::read(retained.join("target").join(APPROVAL_LOG_FILE))?,
+                    original
+                );
+            } else {
+                result?;
+            }
+            let (replacement_path, bytes) = replacement_snapshot.unwrap();
+            assert_eq!(fs::read(replacement_path)?, bytes);
+            assert_eq!(fs::read(selected.join("canary"))?, b"unrelated replacement");
+            let preserved = ApprovalReceiptStore::new(retained.clone());
+            assert_eq!(
+                preserved.load("target")?,
+                if fail_preservation {
+                    vec![ask]
+                } else {
+                    vec![ask, decision]
+                }
+            );
+            let recovery = fs::read_dir(retained.join("target"))?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<io::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|path| path.extension().is_some_and(|ext| ext == "recovery"))
+                .collect::<Vec<_>>();
+            assert_eq!(recovery.len(), usize::from(!fail_preservation));
+            if !fail_preservation {
+                assert_eq!(fs::read(&recovery[0])?, tail);
+            }
+            assert!(fs::read_dir(selected.join("target"))?.all(|entry| {
+                !entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "recovery")
+            }));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reads_preserve_absent_roots_and_legacy_logs_without_locks() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let selected = temp.path().join("sessions");
+        let store = ApprovalReceiptStore::new(selected.clone());
+        assert!(store.load_if_present("missing")?.is_none());
+        assert!(store.load("missing")?.is_empty());
+        assert!(!selected.try_exists()?);
+        assert!(
+            store
+                .append("../invalid", &ApprovalReceipt::asked("tool", "read_file"))
+                .is_err()
+        );
+        assert!(!selected.try_exists()?);
+        let ask = ApprovalReceipt::asked("legacy-tool", "read_file");
+        let log = store.log_path("legacy")?;
+        fs::create_dir_all(log.parent().unwrap())?;
+        let mut bytes = serde_json::to_vec(&ask).map_err(io::Error::other)?;
+        bytes.push(b'\n');
+        fs::write(&log, &bytes)?;
+        assert_eq!(store.load("legacy")?, vec![ask]);
+        assert_eq!(fs::read(&log)?, bytes);
+        assert_eq!(fs::read_dir(log.parent().unwrap())?.count(), 1);
+        assert!(store.load_if_present("still-missing")?.is_none());
+        assert!(!selected.join("still-missing").try_exists()?);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_session_directory_is_not_an_approval_transaction_parent() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let selected = temp.path().join("sessions");
+        let foreign = temp.path().join("foreign");
+        fs::create_dir_all(&selected)?;
+        fs::create_dir(&foreign)?;
+        fs::write(foreign.join("canary"), b"unrelated owner")?;
+        std::os::unix::fs::symlink(&foreign, selected.join("target"))?;
+        let store = ApprovalReceiptStore::new(selected);
+        assert!(
+            store
+                .append("target", &ApprovalReceipt::asked("tool", "read_file"))
+                .is_err()
+        );
+        assert!(store.load_if_present("target").is_err());
+        assert_eq!(fs::read(foreign.join("canary"))?, b"unrelated owner");
+        assert_eq!(fs::read_dir(foreign)?.count(), 1);
+        Ok(())
+    }
 
     fn completed_receipts(outcome: ApprovalOutcome) -> Vec<ApprovalReceipt> {
         vec![
@@ -563,7 +799,6 @@ mod tests {
     fn reader_distinguishes_missing_empty_and_torn_first_logs() {
         let tmp = tempfile::tempdir().unwrap();
         let store = ApprovalReceiptStore::new(tmp.path().join("sessions"));
-        assert!(store.load_unlocked("session-missing").unwrap().is_none());
         assert!(store.load_if_present("session-missing").unwrap().is_none());
         for (id, bytes) in [
             ("session-empty", b"".as_slice()),
@@ -572,7 +807,9 @@ mod tests {
             let path = store.log_path(id).unwrap();
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, bytes).unwrap();
-            let loaded = store.load_unlocked(id).unwrap().expect("existing log");
+            let loaded = ApprovalReceiptStore::load_unlocked(&store.log_file(id, false).unwrap())
+                .unwrap()
+                .expect("existing log");
             assert!(loaded.receipts.is_empty());
             assert_eq!(store.load_if_present(id).unwrap(), Some(Vec::new()));
             assert_eq!(loaded.valid_bytes, 0);

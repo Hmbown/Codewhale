@@ -615,6 +615,7 @@ mod tests {
             updated_at: now,
             next_run_at: None,
             last_run_at: None,
+            revision: 0,
         }
     }
 

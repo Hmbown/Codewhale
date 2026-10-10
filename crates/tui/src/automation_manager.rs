@@ -197,6 +197,9 @@ pub struct AutomationRecord {
     /// Bound by the trusted service, independently of visibility ownership.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_scope: Option<String>,
+    /// Increments on every definition mutation; absent on legacy records (0).
+    #[serde(default)]
+    pub revision: u64,
 }
 
 impl AutomationRecord {
@@ -318,6 +321,54 @@ pub struct UpdateAutomationRequest {
     pub auto_approve: Option<bool>,
     pub delivery_mode: Option<AutomationDeliveryMode>,
     pub status: Option<AutomationStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+}
+
+#[derive(Debug)]
+pub struct RevisionConflict {
+    pub current: u64,
+}
+
+impl std::fmt::Display for RevisionConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Automation revision conflict: current revision is {}",
+            self.current
+        )
+    }
+}
+
+impl std::error::Error for RevisionConflict {}
+
+fn check_expected_revision(record: &AutomationRecord, expected: Option<u64>) -> Result<()> {
+    match expected {
+        Some(expected) if expected != record.revision => Err(RevisionConflict {
+            current: record.revision,
+        }
+        .into()),
+        _ => Ok(()),
+    }
+}
+
+pub const IDEMPOTENCY_TTL_HOURS: i64 = 24;
+pub const IDEMPOTENCY_MAX_ENTRIES: usize = 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IdempotencyEntry {
+    key: String,
+    fingerprint: String,
+    status: u16,
+    body: serde_json::Value,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+pub enum IdempotencyLookup {
+    Miss,
+    Replay { status: u16, body: serde_json::Value },
+    KeyReused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1254,6 +1305,7 @@ impl AutomationManager {
             updated_at: now,
             next_run_at,
             last_run_at: None,
+            revision: 1,
         };
 
         self.save_automation(&record)?;
@@ -1316,6 +1368,7 @@ impl AutomationManager {
         req: UpdateAutomationRequest,
     ) -> Result<AutomationRecord> {
         let mut existing = self.get_automation(id)?;
+        check_expected_revision(&existing, req.expected_revision)?;
         let adopting = existing.execution_scope.is_none()
             && self.execution_scope.is_some()
             && req.status != Some(AutomationStatus::Paused);
@@ -1391,8 +1444,69 @@ impl AutomationManager {
         }
 
         existing.updated_at = Utc::now();
+        existing.revision = existing.revision.saturating_add(1);
         self.save_automation_unlocked(&existing)?;
         Ok(existing)
+    }
+
+    fn idempotency_path(&self) -> Result<PathBuf> {
+        Ok(self
+            .automations_dir
+            .parent()
+            .context("automation root")?
+            .join("idempotency.json"))
+    }
+
+    fn read_idempotency_unlocked(&self, now: DateTime<Utc>) -> Result<Vec<IdempotencyEntry>> {
+        let path = self.idempotency_path()?;
+        let mut entries: Vec<IdempotencyEntry> = match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+        };
+        let cutoff = now - Duration::hours(IDEMPOTENCY_TTL_HOURS);
+        entries.retain(|entry| entry.created_at > cutoff);
+        Ok(entries)
+    }
+
+    pub fn idempotency_lookup(&self, key: &str, fingerprint: &str) -> Result<IdempotencyLookup> {
+        self.with_transaction(|| {
+            let entries = self.read_idempotency_unlocked(Utc::now())?;
+            Ok(match entries.into_iter().find(|entry| entry.key == key) {
+                None => IdempotencyLookup::Miss,
+                Some(entry) if entry.fingerprint == fingerprint => IdempotencyLookup::Replay {
+                    status: entry.status,
+                    body: entry.body,
+                },
+                Some(_) => IdempotencyLookup::KeyReused,
+            })
+        })
+    }
+
+    pub fn idempotency_store(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        status: u16,
+        body: serde_json::Value,
+    ) -> Result<()> {
+        self.with_transaction(|| {
+            let now = Utc::now();
+            let mut entries = self.read_idempotency_unlocked(now)?;
+            entries.retain(|entry| entry.key != key);
+            entries.push(IdempotencyEntry {
+                key: key.to_string(),
+                fingerprint: fingerprint.to_string(),
+                status,
+                body,
+                created_at: now,
+            });
+            if entries.len() > IDEMPOTENCY_MAX_ENTRIES {
+                let excess = entries.len() - IDEMPOTENCY_MAX_ENTRIES;
+                entries.drain(..excess);
+            }
+            write_json_atomic(&self.idempotency_path()?, &entries)
+        })
     }
 
     pub fn pause_automation(&self, id: &str) -> Result<AutomationRecord> {
@@ -2287,12 +2401,22 @@ pub async fn run_now_shared(
     automation_id: &str,
     task_manager: &SharedTaskManager,
 ) -> Result<AutomationRunRecord> {
+    run_now_shared_if(automations, automation_id, None, task_manager).await
+}
+
+pub async fn run_now_shared_if(
+    automations: &SharedAutomationManager,
+    automation_id: &str,
+    expected_revision: Option<u64>,
+    task_manager: &SharedTaskManager,
+) -> Result<AutomationRunRecord> {
     automations.lock().await.bind_task_manager(task_manager)?;
     let task_manager = Arc::clone(task_manager);
     let task_data_dir = task_manager.data_dir();
-    run_now_with(
+    run_now_inner(
         automations,
         automation_id,
+        expected_revision,
         &task_data_dir,
         move |_, mut run| async move {
             enqueue_run_task(&mut run, &task_manager).await;
@@ -2302,10 +2426,25 @@ pub async fn run_now_shared(
     .await
 }
 
-/// Keep the process-wide dispatch claim over the await, never the manager mutex.
+#[cfg(test)]
 async fn run_now_with<F, Fut>(
     automations: &SharedAutomationManager,
     automation_id: &str,
+    task_data_dir: &Path,
+    enqueue: F,
+) -> Result<AutomationRunRecord>
+where
+    F: FnOnce(AutomationRecord, AutomationRunRecord) -> Fut,
+    Fut: Future<Output = AutomationRunRecord>,
+{
+    run_now_inner(automations, automation_id, None, task_data_dir, enqueue).await
+}
+
+/// Keep the process-wide dispatch claim over the await, never the manager mutex.
+async fn run_now_inner<F, Fut>(
+    automations: &SharedAutomationManager,
+    automation_id: &str,
+    expected_revision: Option<u64>,
     task_data_dir: &Path,
     enqueue: F,
 ) -> Result<AutomationRunRecord>
@@ -2321,6 +2460,7 @@ where
         let manager = automations.lock().await;
         manager.with_transaction(|| {
             let mut automation = manager.get_automation(automation_id)?;
+            check_expected_revision(&automation, expected_revision)?;
             manager.adopt_for_run(&mut automation)?;
             let now = Utc::now();
             let mut run = new_run_record(&automation.id, now, now);
@@ -3903,6 +4043,7 @@ mod tests {
             updated_at: now,
             next_run_at: None,
             last_run_at: None,
+            revision: 0,
         }
     }
 
