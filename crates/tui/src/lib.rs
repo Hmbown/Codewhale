@@ -33,7 +33,6 @@ mod commands;
 mod compaction;
 mod composer_history;
 mod composer_stash;
-pub mod computer_meter;
 mod config;
 pub mod config_keys;
 mod config_persistence;
@@ -54,7 +53,6 @@ mod error_taxonomy;
 mod eval;
 mod extension_host;
 mod external_credentials;
-mod features;
 mod fleet;
 mod fs_confined;
 mod git_status;
@@ -64,10 +62,8 @@ mod hooks;
 mod image_attach;
 mod import_claude;
 mod integrations;
-mod lane_control;
 mod llm_client;
 mod local_ollama;
-mod logging;
 mod lsp;
 mod mcp;
 mod mcp_server;
@@ -101,7 +97,6 @@ pub mod repl;
 mod repo_law;
 mod request_manifest;
 mod request_tuning;
-mod resource_telemetry;
 pub mod rlm;
 mod route_billing;
 mod route_budget;
@@ -112,7 +107,6 @@ mod runtime_api;
 mod runtime_chat_relay;
 mod runtime_handoff;
 mod runtime_log;
-mod runtime_policy;
 mod runtime_threads;
 mod sandbox;
 mod scorecard;
@@ -136,7 +130,6 @@ mod settings;
 mod shell_dispatcher;
 mod skills;
 mod snapshot;
-mod startup_trace;
 mod superfast;
 mod task_manager;
 mod telemetry_notice;
@@ -150,9 +143,10 @@ use codewhale_release::tls;
 // re-exports; the split deletes it by rewriting these paths to
 // `codewhale_runtime::` (docs/design/TUI_DECONSTRUCTION.md).
 use codewhale_runtime::{
-    context_budget, continual_harness, fast_hash, goal_loop, hashing, host_terminal,
-    llm_response_cache, media_originals, model_context, native_memory, prompt_zones, regex_cache,
-    retry_status, safe_label, session_tree, skill_state, sleep_guard, tool_history_repair,
+    computer_meter, context_budget, continual_harness, fast_hash, features, goal_loop, hashing,
+    host_terminal, lane_control, llm_response_cache, logging, media_originals, model_context,
+    native_memory, prompt_zones, regex_cache, resource_telemetry, retry_status, runtime_policy,
+    safe_label, session_tree, skill_state, sleep_guard, startup_trace, tool_history_repair,
     workspace_discovery,
 };
 mod todo_snapshot;
@@ -19889,7 +19883,7 @@ mod setup_helper_tests {
 
         let sources = [
             include_str!("config.rs"),
-            include_str!("logging.rs"),
+            include_str!("../../runtime/src/logging.rs"),
             include_str!("../../config/src/lib.rs"),
             include_str!("../../config/src/provider.rs"),
             include_str!("../../config/assets/provider_descriptors.json"),

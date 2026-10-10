@@ -22,7 +22,7 @@
 #   since     first release that shipped it ("unreleased" before a release).
 #             Optional until backfilled; when set it must be a CHANGELOG
 #             heading.
-#   flag      a `[features]` key from `crates/tui/src/features.rs`. Each key
+#   flag      a `[features]` key from `crates/runtime/src/features.rs`. Each key
 #             is owned by exactly one row, and the row's status follows the
 #             flag: off by default -> flagged; on and Stable -> stable; on and
 #             Experimental/Beta -> experimental.
@@ -34,7 +34,7 @@
 # repository is private, so its unreleased features stay out of this public
 # file until that is decided.
 
-# --- Flag-backed tools (crates/tui/src/features.rs) ---
+# --- Flag-backed tools (crates/runtime/src/features.rs) ---
 
 [[feature]]
 id = "shell-tool"
