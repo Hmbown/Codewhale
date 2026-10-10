@@ -3030,8 +3030,8 @@ impl Engine {
         // authoritative schedule makes that token fail closed when drained.
         self.scheduled_goal_continuation = None;
         // Runtime-added MCP servers are conversation capabilities even when
-        // both conversations use the same workspace. Configured servers can
-        // reconnect lazily after the new session is installed.
+        // both conversations use the same workspace. The sync handler restarts
+        // the session boot once the new session is installed.
         self.drop_mcp_pool();
         // C02-17: cumulative usage belongs to the conversation that spent
         // it. The sync carries no prior total for the installed session, so
@@ -3939,6 +3939,16 @@ impl Engine {
                         };
                         self.session.rebuild_working_set();
                         self.reconcile_restored_work_bindings().await;
+                        if self.mcp_pool.is_none()
+                            && let Err(error) = self
+                                .start_mcp_session_boot(McpConnectRefresh::IfChanged)
+                                .await
+                        {
+                            tracing::debug!(
+                                "MCP session boot failed: {}",
+                                crate::mcp::format_mcp_error_for_display(&error)
+                            );
+                        }
                         // SessionUpdated acknowledges the sync. A generic status
                         // would immediately cover the host's confirmed resume receipt.
                         self.emit_session_updated().await;
