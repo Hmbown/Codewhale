@@ -2426,6 +2426,7 @@ pub async fn run_now_shared_if(
     .await
 }
 
+#[cfg(test)]
 async fn run_now_with<F, Fut>(
     automations: &SharedAutomationManager,
     automation_id: &str,
