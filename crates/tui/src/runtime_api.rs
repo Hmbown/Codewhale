@@ -5624,6 +5624,10 @@ struct ApprovalHistoryRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
     outcome: String,
+    /// `allow` or `deny` when a standing session rule or grant answered the
+    /// ask rather than a person; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    standing_rule: Option<&'static str>,
     /// Who resolved it: `user`, `session_rule`, `posture`, or `host`.
     /// Absent while pending and on records written before deciders were kept.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5632,15 +5636,15 @@ struct ApprovalHistoryRow {
     decided_at: Option<chrono::DateTime<Utc>>,
 }
 
-fn approval_row_outcome(
+fn approval_row_standing_rule(
     outcome: &crate::approval_log::ApprovalOutcome,
     decided_by: Option<crate::approval_log::ApprovalDecider>,
-) -> &'static str {
+) -> Option<&'static str> {
     use crate::approval_log::{ApprovalDecider, ApprovalOutcome};
     match (outcome, decided_by) {
-        (ApprovalOutcome::ApprovedOnce, Some(ApprovalDecider::SessionRule)) => "always_allow",
-        (ApprovalOutcome::Denied, Some(ApprovalDecider::SessionRule)) => "blocked",
-        _ => approval_outcome_label(outcome),
+        (ApprovalOutcome::ApprovedOnce, Some(ApprovalDecider::SessionRule)) => Some("allow"),
+        (ApprovalOutcome::Denied, Some(ApprovalDecider::SessionRule)) => Some("deny"),
+        _ => None,
     }
 }
 
@@ -5670,7 +5674,8 @@ fn approval_history_rows(replay: &crate::approval_log::ApprovalReplay) -> Vec<Ap
                 tool_name: completed.ask.tool_name().unwrap_or("unknown").to_string(),
                 target: completed.ask.target().map(str::to_string),
                 summary: completed.ask.summary().map(str::to_string),
-                outcome: approval_row_outcome(&completed.outcome, completed.decided_by).to_string(),
+                outcome: approval_outcome_label(&completed.outcome).to_string(),
+                standing_rule: approval_row_standing_rule(&completed.outcome, completed.decided_by),
                 decided_by: completed.decided_by,
                 asked_at,
                 decided_at: Some(completed.decided_at),
@@ -5682,6 +5687,7 @@ fn approval_history_rows(replay: &crate::approval_log::ApprovalReplay) -> Vec<Ap
             target: ask.target().map(str::to_string),
             summary: ask.summary().map(str::to_string),
             outcome: "pending".to_string(),
+            standing_rule: None,
             decided_by: None,
             asked_at: ask.created_at(),
             decided_at: None,
@@ -6727,7 +6733,20 @@ struct AutomationPreconditionQuery {
     expected_revision: Option<u64>,
 }
 
-static AUTOMATION_IDEMPOTENCY_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static AUTOMATION_IDEMPOTENCY_GATES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+async fn lock_automation_idempotency_key(scoped_key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let gate = {
+        let mut gates = AUTOMATION_IDEMPOTENCY_GATES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        gates.retain(|_, gate| std::sync::Arc::strong_count(gate) > 1);
+        gates.entry(scoped_key.to_string()).or_default().clone()
+    };
+    gate.lock_owned().await
+}
 
 fn automation_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
     let Some(value) = headers.get("idempotency-key") else {
@@ -6807,9 +6826,14 @@ where
         hasher.update(operation.as_bytes());
         hasher.update([0]);
         hasher.update(serde_json::to_vec(request).unwrap_or_default());
-        hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     };
-    let _gate = AUTOMATION_IDEMPOTENCY_GATE.lock().await;
+    let key = format!("{operation}\n{key}");
+    let _gate = lock_automation_idempotency_key(&key).await;
     let lookup = state
         .automations
         .lock()
@@ -6835,12 +6859,18 @@ where
     };
     let body = serde_json::to_value(value)
         .map_err(|e| ApiError::internal(format!("Failed to encode response: {e}")))?;
-    state
-        .automations
-        .lock()
-        .await
-        .idempotency_store(&key, &fingerprint, ok_status.as_u16(), body.clone())
-        .map_err(|e| ApiError::internal(format!("Idempotency store unavailable: {e}")))?;
+    if let Err(error) = state.automations.lock().await.idempotency_store(
+        &key,
+        &fingerprint,
+        ok_status.as_u16(),
+        body.clone(),
+    ) {
+        tracing::error!(
+            %error,
+            operation,
+            "automation mutation committed but its idempotency record could not be stored"
+        );
+    }
     Ok(respond(ok_status, body, false))
 }
 
@@ -6856,7 +6886,13 @@ async fn create_automation(
         &req,
         StatusCode::CREATED,
         |e| ApiError::bad_request(e.to_string()),
-        async { state.automations.lock().await.create_automation(req.clone()) },
+        async {
+            state
+                .automations
+                .lock()
+                .await
+                .create_automation(req.clone())
+        },
     )
     .await
 }
@@ -6885,7 +6921,13 @@ async fn update_automation(
         &req,
         StatusCode::OK,
         map_automation_err,
-        async { state.automations.lock().await.update_automation(&id, req.clone()) },
+        async {
+            state
+                .automations
+                .lock()
+                .await
+                .update_automation(&id, req.clone())
+        },
     )
     .await
 }
@@ -8664,13 +8706,24 @@ async fn list_goals(
             .map_err(|_| ApiError::bad_request(format!("unknown goal status '{raw}'")))?,
         ),
     };
+    let status_key = query.status.as_deref().unwrap_or("-");
     let after = match query.cursor.as_deref() {
         None => None,
         Some(raw) => {
-            let (updated_at, thread_id) = raw
-                .split_once(':')
-                .and_then(|(at, id)| Some((at.parse::<i64>().ok()?, id.to_string())))
-                .ok_or_else(|| ApiError::bad_request("invalid cursor"))?;
+            let mut parts = raw.splitn(3, ':');
+            let (cursor_status, updated_at, thread_id) = match (
+                parts.next(),
+                parts.next().and_then(|at| at.parse::<i64>().ok()),
+                parts.next(),
+            ) {
+                (Some(cursor_status), Some(at), Some(id)) => (cursor_status, at, id.to_string()),
+                _ => return Err(ApiError::bad_request("invalid cursor")),
+            };
+            if cursor_status != status_key {
+                return Err(ApiError::bad_request(
+                    "cursor does not match the status filter",
+                ));
+            }
             Some((updated_at, thread_id))
         }
     };
@@ -8691,11 +8744,21 @@ async fn list_goals(
                 || (goal.updated_at == updated_at && goal.thread_id > thread_id)
         });
     }
-    let next_cursor = (goals.len() > limit).then(|| {
-        let last = &goals[limit - 1];
-        format!("{}:{}", last.updated_at, last.thread_id)
+    let mut page = Vec::with_capacity(limit.min(goals.len()) + 1);
+    for goal in goals {
+        if state.runtime_threads.thread_exists(&goal.thread_id).await {
+            page.push(goal);
+            if page.len() > limit {
+                break;
+            }
+        }
+    }
+    let next_cursor = (page.len() > limit).then(|| {
+        let last = &page[limit - 1];
+        format!("{status_key}:{}:{}", last.updated_at, last.thread_id)
     });
-    goals.truncate(limit);
+    page.truncate(limit);
+    let goals = page;
     Ok(Json(GoalsPage { goals, next_cursor }))
 }
 

@@ -10,11 +10,11 @@ Current boundary note (read the workspace version from `Cargo.toml`; this
 boundary has held since v0.9.1):
 - `crates/tui` is still the live end-user runtime for the TUI, runtime API, task manager, and tool execution loop.
 - Other workspace crates are being split out incrementally, but they are not yet the sole runtime source of truth.
-- The runtime is moving into `crates/runtime` (`codewhale-runtime`) in the
-  order `docs/design/TUI_DECONSTRUCTION.md` records: engine, tools, config,
-  client and stores move there together, never into `crates/core`, and the
-  TUI stays the only crate that writes to the terminal. Until a module has
-  moved, its path under `crates/tui/src` is still where it lives.
+- `crates/tui` is being split into crates sized as agent work partitions:
+  contracts, utilities, services, providers, runtime, leaf feature crates,
+  TUI views and hosts, in the order `docs/design/TUI_DECONSTRUCTION.md`
+  records. The TUI stays the only crate that writes to the terminal. Until a
+  module has moved, its path under `crates/tui/src` is still where it lives.
 - The LSP subsystem (`crates/tui/src/lsp/`) is fully wired into the engine's
   post-tool-execution path (`core/engine/lsp_hooks.rs`), providing inline
   diagnostics after `File` write, edit, and patch actions.
