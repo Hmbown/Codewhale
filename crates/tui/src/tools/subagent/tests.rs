@@ -11612,6 +11612,142 @@ fn persist_state_rejects_state_path_outside_state_root() {
     assert!(format!("{err:#}").contains("must stay within state root"));
 }
 
+/// A user who keeps application state on another volume makes the workspace's
+/// `.codewhale` a junction, so `.codewhale/state/...` resolves inside that
+/// target. That target is where the state lives; refusing it failed every
+/// child at step 0.
+#[cfg(windows)]
+#[test]
+fn state_path_accepts_a_state_root_relocated_behind_a_junction() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().join("workspace");
+    let relocated = tmp.path().join("relocated-state");
+    std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+    std::fs::create_dir_all(&relocated).expect("mkdir relocated");
+    let link = workspace.join(".codewhale");
+    let output = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&relocated)
+        .output()
+        .expect("invoke Windows junction creation");
+    assert!(
+        output.status.success(),
+        "failed to create junction: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let state_path = checked_subagent_state_path(
+        &workspace,
+        &std::path::Path::new(".codewhale")
+            .join("state")
+            .join(SUBAGENT_STATE_FILE),
+    )
+    .expect("a relocated state root must pass containment");
+
+    let resolved_target = relocated.canonicalize().expect("canonical target");
+    assert!(
+        state_path.starts_with(&resolved_target),
+        "state must land in the junction target {}: {}",
+        resolved_target.display(),
+        state_path.display()
+    );
+
+    // The re-root covers that one user-owned link, not the boundary: a path
+    // that resolves outside both roots is still refused.
+    let escaped = std::path::Path::new("..")
+        .join("escaped")
+        .join(SUBAGENT_STATE_FILE);
+    assert!(
+        checked_subagent_state_path(&workspace, &escaped).is_err(),
+        "an escape past both roots must still fail"
+    );
+
+    // `mklink /J` accepts a target that does not exist yet, and creating the
+    // junction before the first run is a normal setup order. Both sides then
+    // resolve to the link's own spelling, so containment holds until the
+    // target exists.
+    let dangling_workspace = tmp.path().join("dangling");
+    let dangling_target = tmp.path().join("not-created-yet");
+    std::fs::create_dir_all(&dangling_workspace).expect("mkdir dangling workspace");
+    let output = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(dangling_workspace.join(".codewhale"))
+        .arg(&dangling_target)
+        .output()
+        .expect("invoke Windows junction creation");
+    assert!(
+        output.status.success(),
+        "failed to create dangling junction: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !dangling_target.exists(),
+        "the probe needs a target that does not exist yet"
+    );
+    checked_subagent_state_path(
+        &dangling_workspace,
+        &std::path::Path::new(".codewhale")
+            .join("state")
+            .join(SUBAGENT_STATE_FILE),
+    )
+    .expect("a junction whose target is not created yet must pass containment");
+}
+
+/// The guards that run after `checked_subagent_state_path` must reach the same
+/// root decision it did. Before they did, the containment check passed and the
+/// write still failed with the same message on the child's first step.
+#[cfg(windows)]
+#[test]
+fn state_writes_follow_a_relocated_state_root() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().join("workspace");
+    let relocated = tmp.path().join("relocated-state");
+    std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+    std::fs::create_dir_all(&relocated).expect("mkdir relocated");
+    let link = workspace.join(".codewhale");
+    let output = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&relocated)
+        .output()
+        .expect("invoke Windows junction creation");
+    assert!(
+        output.status.success(),
+        "failed to create junction: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The manager state file: write_json_atomic and read_subagent_state_file.
+    let mut manager = SubAgentManager::new(workspace.clone(), 1);
+    manager
+        .persist_state()
+        .expect("persist under a relocated state root");
+    manager
+        .load_state()
+        .expect("load under a relocated state root");
+
+    // The child's transcript: the pre-create and append guards.
+    let state_root = normalize_subagent_workspace(&workspace);
+    let writer = SubAgentTranscriptArtifactWriter::create(&state_root, "agent_relocated")
+        .expect("transcript create under a relocated state root");
+    append_private_subagent_transcript(
+        &state_root,
+        &writer.path,
+        b"{\"kind\":\"message\"}\n",
+        true,
+    )
+    .expect("transcript append under a relocated state root");
+
+    let resolved_target = relocated.canonicalize().expect("canonical target");
+    assert!(
+        writer.path.starts_with(&resolved_target),
+        "the transcript must land in the junction target {}: {}",
+        resolved_target.display(),
+        writer.path.display()
+    );
+}
+
 #[test]
 fn explicit_state_roots_isolate_managers_for_the_same_execution_workspace() {
     let tmp = tempdir().expect("tempdir");
