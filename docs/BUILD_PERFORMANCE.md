@@ -10,7 +10,7 @@ average 10–27, recorded next to each number), so treat them as relative
 before/after evidence, not benchmarks.
 
 > Split plan: [TUI deconstruction](design/TUI_DECONSTRUCTION.md) contains the
-> September 9 source audit and current proposed extraction order. Measurements
+> current source audit, target crate map and extraction order. Measurements
 > below are historical; the B3/deferred candidate lists are not an execution queue.
 
 ## Where the time goes (baseline, commit 533c530b)
