@@ -239,7 +239,7 @@ enum CloudAgentsCommand {
         #[arg(long, default_value_t = 0)]
         since_seq: u64,
     },
-    /// Give a named Agent durable repository Work. This records a request; it does not start compute.
+    /// Give a named Agent durable Work. This records a request; it does not start compute.
     ///
     /// The Agent reads the message first: a plain instruction becomes Work, a
     /// command such as "stop" is applied to its active Work, a correction
@@ -254,6 +254,13 @@ enum CloudAgentsCommand {
         /// Stable message ID for safe retry after an uncertain response.
         #[arg(long)]
         message_id: String,
+        #[arg(long, help = "UTF-8 source context file, at most 64000 UTF-16 units")]
+        context_file: Option<PathBuf>,
+        #[arg(
+            long = "file",
+            help = "Saved account file reference FILE_ID@VERSION; repeat for up to ten files"
+        )]
+        file_refs: Vec<String>,
     },
     /// Read the account-owned status of a Work request.
     WorkStatus { id: String },
@@ -280,7 +287,7 @@ enum CloudAgentsCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Quote bounded Boat trial computer time for queued Work. Nothing starts.
+    /// Quote offered computer time for Work. Nothing starts.
     ///
     /// Prints the funding, EU placement and time disclosure plus a short-lived
     /// confirmation for `work-launch`. Reuse one --operation-key for the quote
@@ -290,12 +297,22 @@ enum CloudAgentsCommand {
         /// Stable launch ID, reused by `work-launch` so a retry cannot start two computers.
         #[arg(long)]
         operation_key: String,
+        #[arg(
+            long,
+            help = "Whole seconds within the served offer; defaults to its maximum"
+        )]
+        seconds: Option<u64>,
+        #[arg(
+            long,
+            help = "Failed workspace ID to recover on a fresh computer with the same Work ID"
+        )]
+        recovery_from: Option<String>,
     },
-    /// Start quoted Boat trial Work on EU compute (five minutes at most, $0 Codewhale charge).
+    /// Start quoted Work on EU compute using the reviewed computer balance or trial.
     ///
     /// Requires the confirmation printed by `work-quote` and --confirm-eu-compute,
-    /// which agrees that repository code and Work files run on Boat's EU
-    /// compute. Re-running with the same --operation-key and --confirmation is
+    /// which agrees that repository code and Work files run on a cloud
+    /// computer in the EU. Re-running with the same --operation-key and --confirmation is
     /// safe: it replays the launch instead of starting another computer.
     WorkLaunch {
         id: String,
@@ -307,6 +324,13 @@ enum CloudAgentsCommand {
         /// Agree that repository code and Work files run on EU compute.
         #[arg(long)]
         confirm_eu_compute: bool,
+        #[arg(
+            long,
+            help = "Exact whole seconds printed by work-quote; legacy trial default is 300"
+        )]
+        seconds: Option<u64>,
+        #[arg(long, help = "Exact failed workspace ID used for the recovery quote")]
+        recovery_from: Option<String>,
     },
 }
 
@@ -327,11 +351,11 @@ enum CloudComputersCommand {
     /// Save a Computer identity; compute is allocated only when it starts.
     Create {
         name: String,
-        /// Try Boat compute in the EU for this Computer.
-        #[arg(long, requires = "eu_compute_opt_in")]
-        boat_trial: bool,
-        /// Confirm that Boat trial code and files run on EU compute.
-        #[arg(long, requires = "boat_trial")]
+        /// Try cloud compute in the EU for this Computer.
+        #[arg(long, alias = "boat-trial", requires = "eu_compute_opt_in")]
+        computer_trial: bool,
+        /// Confirm that trial code and files run on EU compute.
+        #[arg(long, requires = "computer_trial")]
         eu_compute_opt_in: bool,
     },
     /// Show one Computer; --json includes allowance and meter data.
@@ -340,7 +364,7 @@ enum CloudComputersCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Read Boat trial usage receipts for one Computer.
+    /// Read trial usage receipts for one Computer.
     Usage {
         id: String,
         /// Print the full metering response.
@@ -628,6 +652,22 @@ struct AccountAgentWork {
     status: String,
     #[serde(default)]
     objective: String,
+    #[serde(default)]
+    task_context_digest: String,
+}
+
+#[derive(Serialize)]
+struct WorkTaskContext {
+    text: String,
+    #[serde(rename = "fileRefs")]
+    file_refs: Vec<WorkFileRef>,
+}
+
+#[derive(Serialize)]
+struct WorkFileRef {
+    #[serde(rename = "fileId")]
+    file_id: String,
+    version: u64,
 }
 
 #[derive(Deserialize)]
@@ -1248,20 +1288,22 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
         agent_id: &str,
         objective: &str,
         message_id: &str,
+        task_context: Option<&WorkTaskContext>,
     ) -> Result<AgentWorkMessageResponse> {
         let agent_id = validate_resource_id(agent_id, "Agent")?;
         let objective = objective.trim();
-        if objective.is_empty() || objective.chars().count() > 32_000 {
+        if objective.is_empty() || objective.encode_utf16().count() > 32_000 {
             bail!("Work objective must contain 1-32000 characters");
         }
         let message_id = validate_operation_key(message_id)?;
+        let mut body = serde_json::json!({ "messageId": message_id, "text": objective });
+        if let Some(context) = task_context {
+            body["taskContext"] = serde_json::to_value(context)?;
+        }
         let response = self.execute_authenticated(
             HttpMethod::Post,
             &format!("/api/agents/{agent_id}/messages"),
-            Some(json_body(&serde_json::json!({
-                "messageId": message_id,
-                "text": objective,
-            }))?),
+            Some(json_body(&body)?),
         )?;
         if ![200, 201, 202].contains(&response.status) {
             return Err(response_error(&response));
@@ -1304,11 +1346,11 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
     fn create_computer(
         &self,
         name: &str,
-        boat_trial: bool,
+        computer_trial: bool,
         eu_compute_opt_in: bool,
     ) -> Result<AccountComputer> {
-        if boat_trial != eu_compute_opt_in {
-            bail!("Boat trial requires both --boat-trial and --eu-compute-opt-in");
+        if computer_trial != eu_compute_opt_in {
+            bail!("A computer trial requires both --computer-trial and --eu-compute-opt-in");
         }
         let name = validate_computer_name(name)?;
         let response = self.execute_authenticated(
@@ -1316,8 +1358,8 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
             "/api/computers",
             Some(json_body(&ComputerCreateRequest {
                 name: &name,
-                provider: boat_trial.then_some("boat"),
-                boat_eu_compute_opt_in: boat_trial.then_some(true),
+                provider: computer_trial.then_some("boat"),
+                boat_eu_compute_opt_in: computer_trial.then_some(true),
             })?),
         )?;
         let result: ComputerResponse = expect_json(response, &[200, 201])?;
@@ -2331,17 +2373,57 @@ fn run_agents<T: CloudTransport, W: Write>(
             agent,
             objective,
             message_id,
+            context_file,
+            file_refs,
         } => {
+            let objective = objective.trim();
+            if objective.is_empty() || objective.encode_utf16().count() > 32_000 {
+                bail!("Work objective must contain 1-32000 UTF-16 units");
+            }
+            validate_operation_key(&message_id)?;
+            let mut context = work::task_context(context_file.as_deref(), &file_refs)?;
+            if objective.encode_utf16().count() > 12_000 {
+                let context = context.get_or_insert_with(|| WorkTaskContext {
+                    text: String::new(),
+                    file_refs: Vec::new(),
+                });
+                context.text = if context.text.is_empty() {
+                    objective.to_string()
+                } else {
+                    format!("{objective}\n\n{}", context.text)
+                };
+                if context.text.encode_utf16().count() > 64_000 {
+                    bail!("Task source context exceeds 64000 UTF-16 units");
+                }
+            }
             let listing: AgentListResponse = serde_json::from_value(client.agents()?)
                 .context("The Codewhale service returned an invalid Agent list")?;
-            let selected = resolve_account_agent(&listing.agents, &agent)?;
+            let mut selected = resolve_account_agent(&listing.agents, &agent)?.clone();
             if selected.project_id.is_empty() {
-                bail!(
-                    "Agent {} needs a repository Project before it can do Work",
-                    printable(&selected.name)
-                );
+                let response: AgentResponse = expect_json(
+                    client.execute_authenticated(
+                        HttpMethod::Post,
+                        "/api/work-box",
+                        Some(json_body(&serde_json::json!({}))?),
+                    )?,
+                    &[200],
+                )?;
+                if response.agent.id != selected.id || response.agent.project_id.is_empty() {
+                    bail!(
+                        "This Agent cannot use the account's repository-free task context. Use Agent {}",
+                        printable(&response.agent.name)
+                    );
+                }
+                selected = response.agent;
             }
-            work::assign(client, out, &selected, &objective, &message_id)
+            work::assign(
+                client,
+                out,
+                &selected,
+                objective,
+                &message_id,
+                context.as_ref(),
+            )
         }
         CloudAgentsCommand::WorkStatus { id } => {
             let result = client.agent_work_status(&id)?;
@@ -2367,20 +2449,39 @@ fn run_agents<T: CloudTransport, W: Write>(
             if let Some(title) = run.get("title").and_then(|value| value.as_str()) {
                 writeln!(out, "Objective: {}", printable(title))?;
             }
+            if let Some(workspace) = run
+                .get("workspaceId")
+                .and_then(|value| value.as_str())
+                .filter(|id| !id.is_empty())
+            {
+                writeln!(out, "Workspace ID: {}", printable(workspace))?;
+            }
             Ok(())
         }
         CloudAgentsCommand::WorkCancel { id, queue, reason } => {
             work::cancel(client, out, &id, queue, reason.as_deref())
         }
         CloudAgentsCommand::WorkResult { id, json } => work::result(client, out, &id, json),
-        CloudAgentsCommand::WorkQuote { id, operation_key } => {
-            work::quote(client, out, &id, &operation_key)
-        }
+        CloudAgentsCommand::WorkQuote {
+            id,
+            operation_key,
+            seconds,
+            recovery_from,
+        } => work::quote(
+            client,
+            out,
+            &id,
+            &operation_key,
+            seconds,
+            recovery_from.as_deref(),
+        ),
         CloudAgentsCommand::WorkLaunch {
             id,
             operation_key,
             confirmation,
             confirm_eu_compute,
+            seconds,
+            recovery_from,
         } => {
             let confirmation = if confirmation == "-" && confirm_eu_compute {
                 if io::stdin().is_terminal() {
@@ -2399,6 +2500,8 @@ fn run_agents<T: CloudTransport, W: Write>(
                 &operation_key,
                 &confirmation,
                 confirm_eu_compute,
+                seconds,
+                recovery_from.as_deref(),
             )
         }
     }
@@ -2454,10 +2557,10 @@ fn run_computers<T: CloudTransport, W: Write>(
         }
         CloudComputersCommand::Create {
             name,
-            boat_trial,
+            computer_trial,
             eu_compute_opt_in,
         } => {
-            let computer = client.create_computer(&name, boat_trial, eu_compute_opt_in)?;
+            let computer = client.create_computer(&name, computer_trial, eu_compute_opt_in)?;
             write_computer(out, &computer)?;
             writeln!(
                 out,
