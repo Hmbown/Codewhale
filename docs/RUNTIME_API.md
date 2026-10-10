@@ -1326,6 +1326,22 @@ an incomplete admission before a later lookup, but GET itself never does so.
 **Approvals**
 - `POST /v1/approvals/{approval_id}` with body
   `{ "decision": "allow" | "deny", "remember": false }`
+- `GET /v1/approvals?limit=` (1-500, default 100) is the read-only history:
+  decided and still-pending approvals across all sessions, newest ask first.
+
+Each history row carries `approval_id`, `tool_name`, `outcome`, `asked_at` and
+`decided_at` (null while pending), plus optional `decided_by` (`user`,
+`session_rule`, `posture`, `host`), `target` and `summary`. `outcome` is one of
+`allowed_once`, `denied`, `timeout`, `cancelled`, `unavailable`,
+`retry_with_policy`, `pending`, or the standing-rule outcomes `always_allow` and
+`blocked`: an approval or denial answered by a remembered session rule rather
+than a person (`decided_by: session_rule`). `target` is the host of a URL or a
+workspace-relative path; `summary` is a one-line description of what was asked
+(the shell command when there is one). Both are redacted when the ask is
+recorded: `KEY=VALUE` words become `KEY=[redacted]`, credentials, tokens and URL
+userinfo are masked, the workspace root becomes `.`, whitespace is collapsed and
+text is capped at 120 characters. Rows recorded before these fields existed
+omit `target` and `summary`.
 
 `approval_id` is minted by the Runtime, not by the model or the provider. It is
 an opaque `approval_<32 hex>` capability, unique per prompt, bound to the thread
