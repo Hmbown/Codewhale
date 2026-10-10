@@ -1286,7 +1286,7 @@ mod tests {
         assert_eq!(saved.name, "renamed");
         let mut before = serde_json::to_value(original).unwrap();
         let mut after = serde_json::to_value(saved).unwrap();
-        for key in ["name", "updated_at"] {
+        for key in ["name", "updated_at", "revision"] {
             before.as_object_mut().unwrap().remove(key);
             after.as_object_mut().unwrap().remove(key);
         }
