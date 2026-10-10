@@ -2978,6 +2978,22 @@ impl RuntimeThreadStore {
         Ok(Some(goal))
     }
 
+    pub fn list_goal_thread_ids(&self) -> Result<Vec<String>> {
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(&self.goals_dir)
+            .with_context(|| format!("Failed to read {}", self.goals_dir.display()))?
+        {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                ids.push(stem.to_string());
+            }
+        }
+        Ok(ids)
+    }
+
     /// A late turn can only update the revision admitted with that turn.
     /// Load/compare/write share the same guard as explicit save/delete.
     /// Mutate the goal only while it is still the revision the caller read:
@@ -8796,6 +8812,22 @@ impl RuntimeThreadManager {
                 .max(i64::from(progress.continuation_count));
         }
         Ok(goal)
+    }
+
+    /// Every readable goal record across threads, with live usage projected.
+    /// Unreadable records are skipped so one corrupt file cannot hide the rest.
+    pub async fn list_goals(&self) -> Result<Vec<codewhale_protocol::ThreadGoal>> {
+        let store = self.store.clone();
+        let ids = tokio::task::spawn_blocking(move || store.list_goal_thread_ids())
+            .await
+            .context("goal list task panicked")??;
+        let mut goals = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Ok(Some(goal)) = self.get_goal(&id).await {
+                goals.push(goal);
+            }
+        }
+        Ok(goals)
     }
 
     /// Persist (create or replace) the goal for a thread.
