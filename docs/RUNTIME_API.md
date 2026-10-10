@@ -1058,6 +1058,13 @@ and live state comes only from a resumed thread's SSE stream.
 - `GET /v1/threads?limit=50&include_archived=false&archived_only=false`
 - `GET /v1/threads/summary?limit=50&search=<optional>&include_archived=false&archived_only=false&thread_ids=<id>,<id>`
 - `GET /v1/threads/running`
+- `GET /v1/goals?limit=50&cursor=<opaque>&status=<status>` — read-only index of
+  the per-thread goal records across threads, newest update first. Returns
+  `{"goals": [ThreadGoal...], "next_cursor": "<opaque>"}`; `next_cursor` is
+  absent on the last page. `limit` is 1-200 (default 50); `status` is one of
+  `active`, `paused`, `blocked`, `usage_limited`, `budget_limited`, `complete`;
+  goals whose thread no longer exists are omitted; a bad `status` or `cursor`, or a cursor issued under a different `status`, is `400`. Same auth as every other `/v1` read.
+  Goal creation, completion and removal stay on `/v1/threads/{id}/goal`.
 - `GET /v1/threads/{id}/notices`
 - `DELETE /v1/threads/{id}/notices/{notice_id}`
 - `POST /v1/threads`
@@ -1220,6 +1227,19 @@ Without `model`, the turn uses that provider's default model (an `auto` thread
 stays `auto`). The override is always preflighted and is part of the
 `operation_key` fingerprint.
 
+Account-owned model turns require `capabilities.account_model_owner: true` before
+submission. Set `account_model_owner` to the signed-in account ID, both
+`model_provider` and `model_provider_id` to `codewhale`, and `model` to the exact
+`provider/model` account route. The Runtime requires current model access for
+that same secure account session and uses only that account credential; missing,
+expired or revoked access is refused. Local keys and other configured routes are
+not substitutes. A supplied profile constitution must belong to the same account.
+The owner participates in the durable operation fingerprint; replay of an
+already completed exact operation returns its receipt before fresh credential
+admission. The account gateway resolves the selected provider's current saved
+API key at use. Ordinary turns and saved Chat defaults retain their existing
+behavior. The Runtime Chat relay carries the same assertion as `accountModelOwner`.
+
 Resolution is deterministic: a turn override wins over the thread default,
 which wins over the Runtime's normal configuration. For tools, reaching normal
 configuration means the ordinary configured catalog; `[]` is never treated as
@@ -1313,6 +1333,24 @@ an incomplete admission before a later lookup, but GET itself never does so.
 **Approvals**
 - `POST /v1/approvals/{approval_id}` with body
   `{ "decision": "allow" | "deny", "remember": false }`
+- `GET /v1/approvals?limit=` (1-500, default 100) is the read-only history:
+  decided and still-pending approvals across all sessions, newest ask first.
+
+Each history row carries `approval_id`, `tool_name`, `outcome`, `asked_at` and
+`decided_at` (null while pending), plus optional `decided_by` (`user`,
+`session_rule`, `posture`, `host`), `target` and `summary`. `outcome` is one of
+`allowed_once`, `denied`, `timeout`, `cancelled`, `unavailable`,
+`retry_with_policy`, or `pending`. `standing_rule` (`allow` or `deny`) is present
+only when a remembered session rule or grant answered rather than a person
+(`decided_by: session_rule`); `outcome` is unchanged. `target` is the host of a
+URL or a workspace-relative path (absolute paths outside the workspace are
+reduced to `.../<basename>`); `summary` is a one-line description of what was
+asked. Both are redacted conservatively when the ask is recorded: a shell
+command keeps only the program name and plain arguments, and any quoted,
+`KEY=VALUE`, credential-like or unrecognised argument replaces all arguments
+with `[args redacted]`. Whitespace is collapsed and text is capped at 120
+characters. Rows recorded before these fields existed
+omit `target` and `summary`.
 
 `approval_id` is minted by the Runtime, not by the model or the provider. It is
 an opaque `approval_<32 hex>` capability, unique per prompt, bound to the thread
@@ -1664,6 +1702,34 @@ degrade with an explanation otherwise.
 Create and update requests accept an optional `model`. When present, each
 scheduled or manually triggered run uses that model; omitting it keeps the
 runtime's default task model.
+
+**Automation mutation preconditions.** `GET /v1/runtime/info` advertises
+`capabilities.automation_mutation_preconditions: true`; require it before
+relying on the behavior below (older Engines ignore both inputs).
+
+- Every `AutomationRecord` carries an integer `revision`: `1` on create, `+1`
+  on each `PATCH`, `pause` and `resume`; legacy records read as `0`. Scheduler
+  bookkeeping (`next_run_at`, `last_run_at`) does not change it.
+- `expected_revision` is an optional precondition on `PATCH`, `run`, `pause`
+  and `resume`: a JSON body field on `PATCH`, or the `?expected_revision=N`
+  query parameter on any of the four. On mismatch nothing is written and the
+  response is `409` with
+  `{"error":{"code":"revision_conflict","current_revision":N,...}}`. Omitting
+  it behaves as before.
+- `Idempotency-Key` (1-255 visible ASCII characters) is optional on `POST
+  /v1/automations`, `PATCH`, `run`, `pause` and `resume`. The first successful
+  response (2xx) is persisted in `idempotency.json` beside the automation
+  store, bounded to 1024 entries and a 24 hour TTL. A retry with the same key
+  and identical request returns the stored status and body with
+  `Idempotency-Replayed: true` and performs no second create or run. The same
+  key with a different request is `422` `idempotency_key_reuse`. Failed
+  attempts are not stored, so they can be retried. Keys are scoped to the
+  route and automation id. If the record cannot be persisted after the
+  mutation committed, the success response is still returned (the failure is
+  logged), so a retry of that request is not deduplicated. An unparseable
+  `idempotency.json` is renamed to `idempotency.corrupt-<timestamp>.json` and
+  that request fails with `500`; later requests start from an empty store.
+  `DELETE` is not covered.
 
 **Operate** (always-on named operation; same `OperateRecord` as CWC
 `20de981` / PR #284)

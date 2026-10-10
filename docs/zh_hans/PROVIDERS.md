@@ -37,7 +37,7 @@ OpenCode Zen 和 OpenCode Go 是一等提供商路由，配置方式与下文其
 - `crates/config/src/lib.rs` —— 共享的提供商 ID、默认值、环境变量优先级。
 - `crates/config/assets/provider_descriptors.json` —— 内置的 OpenAI 兼容主机描述符（即上文的已知可用主机表）。
 - `crates/tui/src/config.rs` —— TUI 提供商 ID、提供商能力元数据以及提供商特定的环境变量处理。
-- `crates/agent/src/lib.rs` —— `codewhale model list` 和 `codewhale model resolve` 使用的静态 `ModelRegistry`。
+- `crates/agent/src/lib.rs` —— `codewhale model resolve` 使用的静态 `ModelRegistry`（以及 `[model]` 配置面）。`codewhale model list` 则改为读取解析后的 provider lake，因此一次列表就能同时看到内置、实时与已配置的行。
 - `config.example.toml` 和 `docs/CONFIGURATION.md` —— 面向用户的配置示例和环境变量参考。
 - `scripts/check-provider-registry.py` —— 对规范提供商 ID、实时 TUI 提供商 ID、TOML 表名、静态注册表行和文档化默认值的漂移检查。
 
@@ -662,7 +662,7 @@ OpenRouter completions 和静态注册表行包括自 2026 年 4 月起通过 Op
 
 ## 静态模型注册表
 
-`codewhale model list` 和 `codewhale model resolve` 使用 `crates/agent/src/lib.rs` 中的静态注册表。这与实时 `/models` 发现不同。当端点支持模型列表时，使用 `/models` 或 `codewhale models` 从活动的 API 端点获取模型 ID。
+下表描述的是静态注册表；`codewhale model resolve`（以及 `[model]` 配置面）仍用它解析选择器别名。这与实时 `/models` 发现不同。当端点支持模型列表时，使用 `/models` 或 `codewhale models` 从活动的 API 端点获取模型 ID。
 
 | 提供商 | 静态注册表条目 | 工具调用 | 注册表推理标志 |
 | --- | --- | --- | --- |

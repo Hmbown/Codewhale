@@ -1,7 +1,6 @@
 //! Shared, host-bound test support for the FEAT-029 `debug::diagnostics` slice.
 //!
-//! This module lives at the `commands` root — outside `groups/debug`, which
-//! FEAT-045 later moves into `codewhale-commands` — so the public-surface and
+//! This module lives at the `commands` root — outside `codewhale-commands` — so the public-surface and
 //! host-regression suites share one harness and one normalisation contract
 //! instead of drifting copies.
 //!

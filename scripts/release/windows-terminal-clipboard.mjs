@@ -125,7 +125,10 @@ try {
   desktop.stdout.on('data', data => { void fs.appendFile(path.join(evidence, 'desktop.log'), data); });
   desktop.stderr.on('data', data => { desktopError += data; void fs.appendFile(path.join(evidence, 'desktop-error.log'), data); });
   desktopExit = new Promise((resolve, reject) => { desktop.once('error', reject); desktop.once('exit', resolve); });
+  await until(() => exists('ready.json'), 'Windows Terminal composer readiness', 120_000);
+  receipt.readyAt = new Date().toISOString();
   await until(() => exists('pasted.json'), 'actual clipboard paste');
+  receipt.pastedAt = new Date().toISOString();
   assert.equal(requests.length, 0, 'pasting must not submit any partial turn');
   receipt.requestsBeforeEnter = 0;
   await fs.writeFile(path.join(evidence, 'submit'), 'enter once');

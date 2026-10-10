@@ -11,23 +11,33 @@
 // Copied verbatim from the TUI crate root: moved code relies on it.
 #![allow(clippy::uninlined_format_args)]
 
+pub use codewhale_command_contract::elapsed;
+
+pub mod computer_meter;
 pub mod context_budget;
 pub mod continual_harness;
-pub mod elapsed;
 pub mod fast_hash;
+pub mod features;
 pub mod goal_loop;
 pub mod hashing;
 pub mod host_terminal;
+pub mod lane_control;
 pub mod llm_response_cache;
+pub mod logging;
 pub mod media_originals;
 pub mod model_context;
 pub mod native_memory;
 pub mod prompt_zones;
 pub mod regex_cache;
+pub mod resource_telemetry;
 pub mod retry_status;
+pub mod runtime_policy;
 pub mod safe_label;
 pub mod session_tree;
 pub mod skill_state;
 pub mod sleep_guard;
+pub mod startup_trace;
 pub mod tool_history_repair;
 pub mod workspace_discovery;
+
+pub const CODEWHALE_MAIN_STACK_BYTES: usize = 32 * 1024 * 1024;

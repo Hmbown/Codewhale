@@ -521,7 +521,9 @@ pub(super) fn settled_run_receipt(locale: Locale, run: &SettledRun) -> HistoryCe
         parts.push(error);
     }
     if let Some(duration_ms) = run.duration_ms {
-        parts.push(crate::elapsed::format_elapsed_ms(duration_ms));
+        parts.push(codewhale_command_contract::elapsed::format_elapsed_ms(
+            duration_ms,
+        ));
     }
     parts.push(format!(
         "{} {}",
@@ -613,6 +615,7 @@ mod tests {
             updated_at: now,
             next_run_at: None,
             last_run_at: None,
+            revision: 0,
         }
     }
 

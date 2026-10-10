@@ -6051,6 +6051,11 @@ pub(super) fn apply_reasoning_effort(
 }
 
 impl CodewhaleClient {
+    pub(crate) fn can_request_fim_completion(&self) -> bool {
+        self.api_provider != ProviderKind::OpencodeZen
+            && self.wire_format == WireFormat::ChatCompletions
+    }
+
     /// Call the DeepSeek `/beta/completions` FIM endpoint.
     pub async fn fim_completion(
         &self,
@@ -6061,9 +6066,7 @@ impl CodewhaleClient {
     ) -> anyhow::Result<String> {
         let _inference = self.acquire_remote_control_inference_permit().await;
         let _permit = self.acquire_provider_request_permit().await;
-        if self.api_provider == ProviderKind::OpencodeZen
-            || self.wire_format != WireFormat::ChatCompletions
-        {
+        if !self.can_request_fim_completion() {
             bail!(
                 "FIM completion is not supported for {} because the route has no proven FIM wire contract ({:?})",
                 self.api_provider.provider().display_name(),

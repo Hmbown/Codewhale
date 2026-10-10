@@ -293,7 +293,7 @@ fn turn_metadata_includes_git_workspace_snapshot_in_repo() {
         panic!("expected text metadata block");
     };
 
-    if let Some(snapshot) = crate::tui::workspace_context::collect(root) {
+    if let Some(snapshot) = crate::git_status::collect(root) {
         assert!(
             text.contains(&format!("Git workspace: {snapshot}")),
             "turn_meta should include git snapshot: {text}"
@@ -317,7 +317,7 @@ fn turn_metadata_git_snapshot_emitted_only_on_change() {
     if init.is_err() || !init.unwrap().status.success() {
         return;
     }
-    if crate::tui::workspace_context::collect(root).is_none() {
+    if crate::git_status::collect(root).is_none() {
         return;
     }
 

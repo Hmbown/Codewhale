@@ -29,6 +29,9 @@
 //! arithmetic remains saturating, and a concrete input limit clamps the final
 //! spendable ceiling and compaction trigger.
 
+pub const CONTEXT_WARNING_THRESHOLD_PERCENT: f64 = 85.0;
+pub const CONTEXT_CRITICAL_THRESHOLD_PERCENT: f64 = 95.0;
+
 // This module IS wired. `ContextBudget` is consumed by `route_budget.rs` and
 // `core/engine/context.rs`; `PressureLevel` by `context_report.rs`. It sits on
 // the do-not-delete list in AGENTS.md because a blanket `allow(dead_code)` here,

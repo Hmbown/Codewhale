@@ -24,6 +24,8 @@ pub struct Style {
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Pose {
     pub points: Vec<[f64; 2]>,
+    #[serde(default)]
+    pub materials: Option<Vec<[f64; 4]>>,
     pub style: Style,
     pub state: Value,
 }
@@ -46,6 +48,8 @@ pub struct Scene {
     pub audio_owner: Option<String>,
     pub audio_unavailable: bool,
     pub points: Vec<[f64; 2]>,
+    #[serde(default)]
+    pub materials: Option<Vec<[f64; 4]>>,
     pub style: Style,
     pub state: Value,
     pub still: Pose,
@@ -83,6 +87,18 @@ impl Scene {
             && self.time_ms.is_finite()
             && self.points.len() == 980
             && self.still.points.len() == 980
+            && [&self.materials, &self.still.materials]
+                .into_iter()
+                .all(|materials| {
+                    materials.as_ref().is_none_or(|values| {
+                        values.len() == 980
+                            && values.iter().all(|m| {
+                                m.iter().all(|v| v.is_finite())
+                                    && m[..3].iter().all(|v| (0.0..=255.0).contains(v))
+                                    && (0.0..=1.0).contains(&m[3])
+                            })
+                    })
+                })
             && self
                 .points
                 .iter()
@@ -96,6 +112,7 @@ pub struct Presentation {
     pub client: String,
     pub scene: Scene,
     pub cells: Vec<u8>,
+    pub colors: Vec<[u8; 3]>,
     pub image: Option<Vec<u8>>,
     pub width: u16,
     pub height: u16,
@@ -591,6 +608,7 @@ fn run(
             let mut pose = if view.motion {
                 Pose {
                     points: s.points.clone(),
+                    materials: s.materials.clone(),
                     style: s.style.clone(),
                     state: s.state.clone(),
                 }
@@ -619,6 +637,7 @@ fn run(
                     client: id.clone(),
                     scene: s.clone(),
                     cells,
+                    colors: renderer.colors.clone(),
                     image,
                     width: view.width,
                     height: view.height,

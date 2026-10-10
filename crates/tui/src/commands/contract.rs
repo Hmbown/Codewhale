@@ -318,6 +318,10 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         self.host.app.borrow().session_transition_blocked()
     }
 
+    fn transition_blockers(&self) -> Vec<String> {
+        self.host.app.borrow().session_transition_blockers()
+    }
+
     fn branch_current_leaf_hint(&self) -> Option<String> {
         let app = self.host.app.borrow();
         let session_id = app.current_session_id.as_deref()?;
@@ -1050,6 +1054,10 @@ pub(crate) struct SessionControlAdapter<'a> {
 impl CommandSessionControlContext for SessionControlAdapter<'_> {
     fn transition_blocked(&self) -> bool {
         self.host.app.borrow().session_transition_blocked()
+    }
+
+    fn transition_blockers(&self) -> Vec<String> {
+        self.host.app.borrow().session_transition_blockers()
     }
 
     fn relay_projection(&self) -> RelayProjection {

@@ -174,7 +174,7 @@ async fn auto_review_asks_the_user_and_returns_the_answer() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floor() {
+async fn full_access_permission_allow_runs_background_destructive_shell_without_a_hold() {
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -183,11 +183,9 @@ async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floo
     let server = MockServer::start().await;
     let victim = workspace.path().join("must-survive");
     fs::write(&victim, "guarded\n").expect("write guarded fixture");
-    // Keep the engine-boundary regression intrinsically harmless on every
-    // runner: the quoted payload trips the same built-in catastrophic-command
-    // detector, while an execution regression would only overwrite the
-    // sentinel. The policy-level sibling tests exercise real destructive
-    // command shapes directly without ever dispatching them to a shell.
+    // Full Access owns the call: neither a remembered workspace grant nor the
+    // built-in hold may strand it. The fixture writes its own sentinel, so an
+    // execution regression is visible without any destructive command running.
     let command = format!("echo \"rm -rf /\" > \"{}\"", victim.display());
     let allow_rule = codewhale_execpolicy::ToolAskRule::exec_shell(command.clone())
         .into_exact_workspace_allow(workspace.path().to_string_lossy().into_owned());
@@ -226,7 +224,7 @@ async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floo
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .and(body_string_contains("destructive background/headless"))
+        .and(body_string_contains("call_bg"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
@@ -271,7 +269,7 @@ async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floo
             ApprovalMode::Bypass,
         ),
         Some(ToolAskRuleDecision::Allow),
-        "precondition: the remembered grant must match before the safety floor tightens the plan"
+        "precondition: the remembered grant matches and Full Access adds no hold"
     );
     let (engine, handle) = Engine::new(engine_config, &api_config);
     let run_task = tokio::spawn(engine.run());
@@ -316,16 +314,13 @@ async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floo
     {
         match event {
             Event::ApprovalRequired { .. } => {
-                panic!("Full Access safety holds must fail closed without prompting")
+                panic!("Full Access must not prompt for a remembered grant")
             }
             Event::ToolCallComplete { name, result, .. } => {
                 if name == "Bash" {
                     saw_tool_result = true;
-                    let err = result.expect_err("blocked shell should not execute");
-                    assert!(
-                        err.to_string().contains("Built-in safety gate"),
-                        "unexpected shell denial: {err:?}"
-                    );
+                    let result = result.expect("Full Access runs the granted command");
+                    assert!(result.success, "unexpected shell failure: {result:?}");
                 }
             }
             Event::TurnComplete { status, .. } => {
@@ -338,14 +333,25 @@ async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floo
     }
     drop(rx);
 
+    let granted = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            let text = crate::test_support::read_shell_sentinel(&victim);
+            if !text.is_empty() && text != "guarded" {
+                break text;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the granted command never wrote its sentinel");
+
     handle.send(Op::Shutdown).await.expect("shutdown engine");
     run_task.await.expect("engine task");
     assert!(saw_tool_result);
     assert!(saw_complete);
     assert_eq!(
-        fs::read_to_string(&victim).expect("read guarded fixture"),
-        "guarded\n",
-        "blocked command must not touch its target"
+        granted, "rm -rf /",
+        "the granted command must run to completion"
     );
 }
 
@@ -354,8 +360,8 @@ async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floo
 async fn yolo_mode_does_not_prompt_for_background_shell() {
     // #3883: the durable-review floor keys on what the command does, not on
     // "not provably read-only". An ordinary background command in YOLO must
-    // run without a prompt; genuinely destructive and publish-like background
-    // work still holds (see the sibling tests).
+    // run without a prompt. Full Access skips the floor entirely; the
+    // reviewing postures keep it (see the policy-level tests).
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

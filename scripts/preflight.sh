@@ -5,7 +5,8 @@
 #   scripts/preflight.sh            regenerate what can be regenerated, check the rest
 #   scripts/preflight.sh --check    change nothing; fail if anything is stale
 #   scripts/preflight.sh --full     also run the cargo-backed runtime-contract and
-#                                   persistence-backlog ratchets (minutes, offline)
+#                                   persistence-backlog ratchets and the two
+#                                   version-stamped fixture tests (minutes, offline)
 #   scripts/preflight.sh --base REF compare feature receipts against REF
 #                                   (default: merge base with origin/main)
 #
@@ -13,6 +14,8 @@
 #   ln -s ../../scripts/preflight.sh "$(git rev-parse --git-path hooks)/pre-push"
 #
 # What it covers, and the command that fixes each one:
+#   - rustfmt (the Lint job's first    cargo fmt --all (written here)
+#     step, required on every PR)
 #   - crates/tui/CHANGELOG.md slice    scripts/sync-changelog.sh (written here)
 #   - README locale stamps and links    retranslate; check-readme-translations.py
 #                                       prints the new sha256 stamp to use
@@ -57,8 +60,10 @@ step() {
 }
 
 if [[ "${mode}" == "write" ]]; then
+  step "rustfmt" "cargo fmt --all" cargo fmt --all
   step "TUI changelog slice" "scripts/sync-changelog.sh" ./scripts/sync-changelog.sh
 else
+  step "rustfmt" "cargo fmt --all" cargo fmt --all -- --check
   step "TUI changelog slice" "scripts/sync-changelog.sh" ./scripts/sync-changelog.sh --check
 fi
 step "README translations in sync" \
@@ -81,6 +86,10 @@ if [[ "${full}" == "1" ]]; then
   step "persistence-backlog budget" \
     "python3 scripts/check-persistence-backlog-budget.py --update" \
     python3 scripts/check-persistence-backlog-budget.py
+  step "version-stamped fixtures" \
+    "regenerate the stale fixture the failing test names, then commit it" \
+    scripts/dev-cargo.sh nextest run --locked --lib -p codewhale-config -p codewhale-tui \
+    -E 'test(golden_providers_export_matches_registry) | test(status_public_output_and_read_only_state_match_baseline)'
 fi
 
 if [[ -z "${base}" ]]; then

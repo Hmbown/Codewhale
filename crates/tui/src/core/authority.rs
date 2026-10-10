@@ -4,6 +4,12 @@
 //! in one place so prompt metadata, tool catalogs, and runtime gates cannot
 //! drift independently.
 
+pub mod auto_review;
+pub mod grants;
+pub mod risk;
+
+pub use risk::{RiskLevel, classify_risk};
+
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 

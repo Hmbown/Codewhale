@@ -7,7 +7,7 @@ use codewhale_command_contract::facets::DebugReceiptError;
 use codewhale_command_contract::handler::{CommandCapabilities, CommandContexts, CommandHandler};
 use codewhale_command_contract::metadata::{CommandInfo, RegisterCommand};
 
-pub(in crate::commands) struct ReceiptsCmd;
+pub struct ReceiptsCmd;
 impl RegisterCommand<CommandResult> for ReceiptsCmd {
     fn info() -> &'static CommandInfo {
         &CommandInfo {

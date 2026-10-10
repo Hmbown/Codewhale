@@ -2,7 +2,7 @@
 //!
 //! The Engine owns operation and turn facts: it emits
 //! `operation_activity_started` / `operation_activity_completed` with an
-//! [`OwnerActivityKind`] and [`OwnerOperationOutcome`], never a tool name,
+//! [`OwnerActivityKind`] and [`OwnerOperationOutcome`], a bounded canonical action identity, never an
 //! argument, command or result. Apps may bind this session-scoped projection
 //! to an authenticated account and serve it to another client; the account
 //! identity is intentionally not supplied by the Engine.
@@ -17,7 +17,6 @@
 //!   validated here on the way back. No Rust producer exists yet; a host
 //!   that needs it outside the pet must decide whether the runtime produces
 //!   it in Rust rather than adding a second reducer.
-//! - Code-mode (`execute_tools`) nested calls do not report activity yet.
 
 use serde::{Deserialize, Serialize};
 
@@ -91,6 +90,8 @@ pub enum OwnerFreshness {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OwnerActiveSpan {
     pub activity_kind: OwnerActivityKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
     pub started_at_ms: f64,
 }
 
@@ -98,6 +99,8 @@ pub struct OwnerActiveSpan {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OwnerFailedToolAge {
     pub activity_kind: OwnerActivityKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
     pub age_ms: f64,
 }
 
@@ -114,6 +117,8 @@ pub struct EngineOwnerProjection {
     pub freshness: OwnerFreshness,
     pub authoritative_presence: OwnerPresence,
     pub activity_kind: Option<OwnerActivityKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
     pub observed_at_ms: Option<f64>,
     pub parallel_agent_count: u32,
     pub active_spans: Vec<OwnerActiveSpan>,
@@ -126,7 +131,11 @@ pub struct EngineOwnerProjection {
 impl EngineOwnerProjection {
     #[must_use]
     pub fn is_valid(&self) -> bool {
+        let valid_action =
+            |id: &String| !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control);
         self.schema_version == 1
+            && self.action_id.as_ref().is_none_or(valid_action)
+            && (self.action_id.is_none() || self.activity_kind.is_some())
             && self.session_id.as_ref().is_none_or(|id| {
                 !id.is_empty() && id.len() <= 256 && id.bytes().all(|byte| !byte.is_ascii_control())
             })
@@ -139,16 +148,18 @@ impl EngineOwnerProjection {
                 .observed_at_ms
                 .is_none_or(|time| time.is_finite() && time >= 0.0)
             && self.active_spans.iter().all(|span| {
-                span.started_at_ms.is_finite()
+                span.action_id.as_ref().is_none_or(valid_action)
+                    && span.started_at_ms.is_finite()
                     && span.started_at_ms >= 0.0
                     && self
                         .observed_at_ms
                         .is_none_or(|observed_at| span.started_at_ms <= observed_at)
             })
-            && self
-                .failed_tool_age
-                .as_ref()
-                .is_none_or(|failure| failure.age_ms.is_finite() && failure.age_ms >= 0.0)
+            && self.failed_tool_age.as_ref().is_none_or(|failure| {
+                failure.action_id.as_ref().is_none_or(valid_action)
+                    && failure.age_ms.is_finite()
+                    && failure.age_ms >= 0.0
+            })
             && (self.turn_outcome.is_none() || self.turn_id.is_some())
             && match self.freshness {
                 OwnerFreshness::Missing => {
@@ -202,10 +213,12 @@ mod tests {
             freshness: OwnerFreshness::Fresh,
             authoritative_presence: OwnerPresence::Working,
             activity_kind: Some(OwnerActivityKind::Reading),
+            action_id: Some("read_file".into()),
             observed_at_ms: Some(100.0),
             parallel_agent_count: 0,
             active_spans: vec![OwnerActiveSpan {
                 activity_kind: OwnerActivityKind::Reading,
+                action_id: Some("read_file".into()),
                 started_at_ms: 50.0,
             }],
             turn_id: Some("turn-1".into()),
@@ -218,6 +231,11 @@ mod tests {
     #[test]
     fn projection_accepts_trusted_scoped_activity_and_rejects_bad_clocks() {
         assert!(projection().is_valid());
+        for invalid in ["", "bad\nname", &"鲸".repeat(86)] {
+            let mut invalid_action = projection();
+            invalid_action.action_id = Some(invalid.to_owned());
+            assert!(!invalid_action.is_valid());
+        }
 
         let mut future_span = projection();
         future_span.active_spans[0].started_at_ms = 101.0;
@@ -237,6 +255,7 @@ mod tests {
         let mut done = projection();
         done.authoritative_presence = OwnerPresence::Done;
         done.activity_kind = None;
+        done.action_id = None;
         done.active_spans.clear();
         done.turn_outcome = Some(TurnOutcomeStatus::Completed);
         done.done_effect_id = done.turn_id.clone();
@@ -258,6 +277,7 @@ mod tests {
             freshness: OwnerFreshness::Missing,
             authoritative_presence: OwnerPresence::Unknown,
             activity_kind: None,
+            action_id: None,
             observed_at_ms: None,
             parallel_agent_count: 0,
             active_spans: Vec::new(),
@@ -272,6 +292,7 @@ mod tests {
         stale.freshness = OwnerFreshness::Stale;
         stale.authoritative_presence = OwnerPresence::Unknown;
         stale.activity_kind = None;
+        stale.action_id = None;
         stale.parallel_agent_count = 0;
         stale.active_spans.clear();
         stale.failed_tool_age = None;

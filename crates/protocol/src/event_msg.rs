@@ -375,17 +375,15 @@ pub enum EventMsg {
         result: ToolCallOutcome,
     },
     /// Trusted Engine-owned activity for an operation that passed dispatch
-    /// and authority checks. No tool name, arguments, command, or result is
+    /// and authority checks. No arguments, command, or result is
     /// included in the pet-facing activity contract.
-    ///
-    /// Reserved on the wire: `protocol_parity` maps the engine event, but no
-    /// runtime thread emits the pair yet, so Runtime API and GPUI clients do
-    /// not receive it. The shared pet (`pet_watch`) is the only consumer today.
     OperationActivityStarted {
         thread_id: ThreadId,
         session_id: SessionId,
         span_id: String,
         activity_kind: crate::engine_owner::OwnerActivityKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action_id: Option<String>,
     },
     OperationActivityCompleted {
         thread_id: ThreadId,
@@ -393,6 +391,8 @@ pub enum EventMsg {
         span_id: String,
         activity_kind: crate::engine_owner::OwnerActivityKind,
         outcome: crate::engine_owner::OwnerOperationOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action_id: Option<String>,
     },
 
     // === Turn lifecycle ===
@@ -1133,12 +1133,14 @@ mod tests {
                 session_id: s.clone(),
                 span_id: "span-1".into(),
                 activity_kind: crate::engine_owner::OwnerActivityKind::Reading,
+                action_id: Some("read_file".into()),
             },
             EventMsg::OperationActivityCompleted {
                 thread_id: t.clone(),
                 session_id: s.clone(),
                 span_id: "span-1".into(),
                 activity_kind: crate::engine_owner::OwnerActivityKind::Reading,
+                action_id: Some("read_file".into()),
                 outcome: crate::engine_owner::OwnerOperationOutcome::Succeeded,
             },
             EventMsg::TurnStarted {

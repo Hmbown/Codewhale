@@ -261,3 +261,19 @@ fn default_user_state_path_from_environment(name: &str) -> Option<PathBuf> {
         primary
     })
 }
+
+/// Resolve the directory pasted images should land in. Prefers
+/// `~/.codewhale/clipboard-images/` so the path is stable across worktrees and
+/// matches the location described in user-facing docs; falls back to
+/// `<workspace>/clipboard-images/` if the home dir is unavailable.
+pub(crate) fn clipboard_images_dir(workspace: &Path) -> PathBuf {
+    let home = super::effective_home_dir();
+    clipboard_images_dir_for_home(workspace, home.as_deref())
+}
+
+pub(crate) fn clipboard_images_dir_for_home(workspace: &Path, home: Option<&Path>) -> PathBuf {
+    if let Some(home) = home {
+        return home.join(".codewhale").join("clipboard-images");
+    }
+    workspace.join("clipboard-images")
+}

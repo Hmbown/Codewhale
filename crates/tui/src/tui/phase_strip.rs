@@ -875,7 +875,7 @@ pub(crate) fn working_clock(
         (
             format!(
                 "{phase_label} {}",
-                crate::elapsed::format_elapsed_secs(turn.as_secs())
+                codewhale_command_contract::elapsed::format_elapsed_secs(turn.as_secs())
             ),
             ink,
         )
@@ -894,7 +894,7 @@ pub(crate) fn working_clock(
             (
                 tr(app.ui_locale, MessageId::FooterWorkedChip).replace(
                     "{duration}",
-                    &crate::elapsed::format_elapsed_secs(worked.as_secs()),
+                    &codewhale_command_contract::elapsed::format_elapsed_secs(worked.as_secs()),
                 ),
                 if turn.is_some() {
                     ink

@@ -23,7 +23,7 @@ use super::CommandResult;
 /// If the changelog section exceeds this, we truncate and show a notice.
 /// 4096 chars is large enough for most version entries.
 const MAX_INLINE_CHANGELOG_CHARS: usize = 4096;
-pub(in crate::commands) struct ChangeCmd;
+pub struct ChangeCmd;
 impl RegisterCommand<CommandResult> for ChangeCmd {
     fn info() -> &'static CommandInfo {
         &CommandInfo {
@@ -148,7 +148,7 @@ fn change_report(
     })
 }
 
-pub(in crate::commands) fn inline_changelog_section(section: &str) -> String {
+pub fn inline_changelog_section(section: &str) -> String {
     if section.len() <= MAX_INLINE_CHANGELOG_CHARS {
         return section.to_string();
     }
@@ -170,7 +170,7 @@ pub(in crate::commands) fn inline_changelog_section(section: &str) -> String {
 ///
 /// Skips empty sections (e.g. `## [Unreleased]` with no content) to find
 /// the first section that actually has content.
-pub(in crate::commands) fn extract_latest_changelog_section(content: &str) -> Option<String> {
+pub fn extract_latest_changelog_section(content: &str) -> Option<String> {
     let lines: Vec<&str> = content.lines().collect();
 
     // Find the first `## [` heading index
@@ -212,10 +212,7 @@ pub(in crate::commands) fn extract_latest_changelog_section(content: &str) -> Op
 ///
 /// Looks for `## [<version>]` or `## [<version> - date]` and returns all
 /// lines from that heading up to the next `## [` heading (or end of file).
-pub(in crate::commands) fn extract_changelog_section_by_version(
-    content: &str,
-    version: &str,
-) -> Option<String> {
+pub fn extract_changelog_section_by_version(content: &str, version: &str) -> Option<String> {
     let lines: Vec<&str> = content.lines().collect();
     let mut start_idx: Option<usize> = None;
 
@@ -255,7 +252,7 @@ pub(in crate::commands) fn extract_changelog_section_by_version(
 /// Walks past empty sections (e.g. `## [Unreleased]`) the same way
 /// [`extract_latest_changelog_section`] does, then returns the version from
 /// the next `## [version]` heading after the first contentful section.
-pub(in crate::commands) fn extract_previous_version_number(content: &str) -> Option<String> {
+pub fn extract_previous_version_number(content: &str) -> Option<String> {
     let lines: Vec<&str> = content.lines().collect();
     let first_idx = lines.iter().position(|l| l.trim().starts_with("## ["))?;
 
@@ -280,21 +277,18 @@ pub(in crate::commands) fn extract_previous_version_number(content: &str) -> Opt
     }
 }
 
-pub(in crate::commands) fn section_has_body_content(lines: &[&str]) -> bool {
+pub fn section_has_body_content(lines: &[&str]) -> bool {
     lines.iter().any(|line| !line.trim().is_empty())
 }
 
-pub(in crate::commands) fn previous_version_hint(
-    content: &str,
-    version: Option<&str>,
-) -> Option<String> {
+pub fn previous_version_hint(content: &str, version: Option<&str>) -> Option<String> {
     match version.map(str::trim).filter(|v| !v.is_empty()) {
         Some(version) => extract_previous_version_number_after_version(content, version),
         None => extract_previous_version_number(content),
     }
 }
 
-pub(in crate::commands) fn extract_previous_version_number_after_version(
+pub fn extract_previous_version_number_after_version(
     content: &str,
     version: &str,
 ) -> Option<String> {
@@ -317,10 +311,7 @@ pub(in crate::commands) fn extract_previous_version_number_after_version(
     next_contentful_version_after(&lines, current_end)
 }
 
-pub(in crate::commands) fn next_contentful_version_after(
-    lines: &[&str],
-    mut pos: usize,
-) -> Option<String> {
+pub fn next_contentful_version_after(lines: &[&str], mut pos: usize) -> Option<String> {
     while pos < lines.len() {
         let heading = lines[pos].trim();
         if !heading.starts_with("## [") {

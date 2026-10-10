@@ -1,19 +1,17 @@
 //! Portable debug command group. Real host registration, event conversion and
 //! I/O adapters live outside this movable source closure.
 
-pub(in crate::commands) use codewhale_command_contract::outcome::{
-    DebugAction, DebugCommandResult as CommandResult,
-};
+pub use codewhale_command_contract::outcome::{DebugAction, DebugCommandResult as CommandResult};
 
-pub(in crate::commands) mod balance;
-pub(in crate::commands) mod cache;
-pub(in crate::commands) mod cache_format;
-pub(in crate::commands) mod change;
-pub(in crate::commands) mod preview_request;
-pub(in crate::commands) mod receipts;
-pub(in crate::commands) mod tokens;
-pub(in crate::commands) mod tool_inspection;
-pub(in crate::commands) mod undo;
+pub mod balance;
+pub mod cache;
+pub mod cache_format;
+pub mod change;
+pub mod preview_request;
+pub mod receipts;
+pub mod tokens;
+pub mod tool_inspection;
+pub mod undo;
 
 #[cfg(test)]
 mod operations_tests;

@@ -2485,6 +2485,7 @@ fn sample_turn(thread_id: &str, turn_id: &str, status: RuntimeTurnStatus) -> Tur
         routed_usage_source_ids: Vec::new(),
         routed_usage_dropped_records: 0,
         model_request_diagnostics: None,
+        operation_activity: None,
         error: None,
         item_ids: Vec::new(),
         steer_count: 0,
@@ -9461,6 +9462,104 @@ async fn monitor_persists_request_snapshots_and_matching_terminal_diagnostics() 
             submission_id: None,
         })
         .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::ToolCallHeartbeat)
+        .await?;
+    for (span_id, activity_kind, action_id) in [
+        (
+            "outer-private-call",
+            codewhale_protocol::engine_owner::OwnerActivityKind::Executing,
+            "execute_tools",
+        ),
+        (
+            "nested-private-call",
+            codewhale_protocol::engine_owner::OwnerActivityKind::Reading,
+            "read_file",
+        ),
+    ] {
+        harness
+            .tx_event
+            .send(EngineEvent::OperationActivityStarted {
+                span_id: span_id.to_string(),
+                activity_kind,
+                action_id: Some(action_id.to_string()),
+            })
+            .await?;
+    }
+    harness
+        .tx_event
+        .send(EngineEvent::ToolCallHeartbeat)
+        .await?;
+    let active_detail = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let detail = manager.get_thread_detail(&thread.id).await?;
+            if detail.turns.iter().any(|turn| {
+                turn.operation_activity
+                    .as_ref()
+                    .is_some_and(|activity| activity.active.len() == 2)
+            }) {
+                break Ok::<_, anyhow::Error>(detail);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    let active = active_detail
+        .turns
+        .iter()
+        .find(|turn| turn.id == first.id)
+        .unwrap()
+        .operation_activity
+        .as_ref()
+        .unwrap();
+    assert!(!active.overflowed);
+    assert_eq!(active.active[1].action_id.as_deref(), Some("read_file"));
+    assert!(
+        active
+            .active
+            .iter()
+            .all(|span| span.span_id.starts_with("operation:")
+                && span.span_id.len() == 74
+                && span.started_at <= active.observed_at)
+    );
+    assert!(!serde_json::to_string(active)?.contains("private-call"));
+    assert!(
+        manager
+            .events_since(&thread.id, Some(active_detail.latest_seq))?
+            .iter()
+            .all(|event| event.event != "operation.activity_started")
+    );
+    for (span_id, activity_kind, action_id) in [
+        (
+            "nested-private-call",
+            codewhale_protocol::engine_owner::OwnerActivityKind::Reading,
+            "read_file",
+        ),
+        (
+            "outer-private-call",
+            codewhale_protocol::engine_owner::OwnerActivityKind::Executing,
+            "execute_tools",
+        ),
+    ] {
+        harness
+            .tx_event
+            .send(EngineEvent::OperationActivityCompleted {
+                span_id: span_id.to_string(),
+                activity_kind,
+                action_id: Some(action_id.to_string()),
+                outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome::Succeeded,
+            })
+            .await?;
+    }
+    harness
+        .tx_event
+        .send(EngineEvent::OperationActivityStarted {
+            span_id: "terminal-interruption".to_string(),
+            activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind::Tool,
+            action_id: Some("mcp_example_probe".to_string()),
+        })
+        .await?;
     let mut tool = catalog_tool("mcp_computer_get_app_state");
     tool.description = "Inspect app; api_key=sk-fixture-private-value".to_string();
     let pre_request = crate::tool_inspection::ToolInspectionSnapshot::from_prepared_request(
@@ -9537,6 +9636,56 @@ async fn monitor_persists_request_snapshots_and_matching_terminal_diagnostics() 
         .await?;
 
     let completed = wait_for_terminal_turn(&manager, &first.id).await?;
+    let operation_activity = completed
+        .operation_activity
+        .as_ref()
+        .expect("admitted operation snapshot");
+    assert!(operation_activity.active.is_empty());
+    assert_eq!(
+        operation_activity
+            .last_completed
+            .as_ref()
+            .unwrap()
+            .action_id
+            .as_deref(),
+        Some("execute_tools")
+    );
+    let operations = manager
+        .events_since(&thread.id, None)?
+        .into_iter()
+        .filter(|event| event.event.starts_with("operation."))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        operations
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "operation.activity_started",
+            "operation.activity_started",
+            "operation.heartbeat",
+            "operation.activity_completed",
+            "operation.activity_completed",
+            "operation.activity_started"
+        ]
+    );
+    assert!(operations.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+    assert_eq!(
+        operations[0].payload["span_id"],
+        operations[4].payload["span_id"]
+    );
+    assert_eq!(
+        operations[1].payload["span_id"],
+        operations[3].payload["span_id"]
+    );
+    assert_eq!(operations[3].payload["outcome"], "succeeded");
+    assert!(
+        operations
+            .iter()
+            .all(|event| event.turn_id.as_deref() == Some(first.id.as_str())
+                && event.payload["observed_at"].is_string())
+    );
+    assert!(operations[3].seq > active_detail.latest_seq);
     assert_eq!(
         completed.model_request_diagnostics,
         Some(RuntimeTurnRequestDiagnostics {
@@ -16923,12 +17072,6 @@ async fn archiving_or_deleting_a_thread_ends_its_session_grants() -> Result<()> 
         )
         .await?;
     assert!(manager.approval_grants_for_thread(&archived.id).is_empty());
-    assert!(
-        manager
-            .session_grant_for(&archived.id, "web:web.run:search_query")
-            .is_none(),
-        "the next matching call on an archived thread prompts again"
-    );
     let events = manager.events_since(&archived.id, None)?;
     assert!(events.iter().any(|event| {
         event.event == "approval.grant_revoked"
@@ -16950,7 +17093,7 @@ async fn archiving_or_deleting_a_thread_ends_its_session_grants() -> Result<()> 
             .is_none(),
         "an archived thread records no new grant"
     );
-    assert!(manager.approval_grants.lock().get(&archived.id).is_none());
+    assert!(manager.approval_grants_for_thread(&archived.id).is_empty());
     // Unarchiving does not bring the grant back.
     manager
         .update_thread(
@@ -16967,7 +17110,7 @@ async fn archiving_or_deleting_a_thread_ends_its_session_grants() -> Result<()> 
 
     // Deleting a thread drops its grants with it.
     manager.discard_empty_thread(&kept.id).await?;
-    assert!(manager.approval_grants.lock().get(&kept.id).is_none());
+    assert!(manager.approval_grants_for_thread(&kept.id).is_empty());
     Ok(())
 }
 
@@ -18026,6 +18169,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         routed_usage_source_ids: Vec::new(),
         routed_usage_dropped_records: 0,
         model_request_diagnostics: None,
+        operation_activity: None,
         error: None,
         item_ids: vec![completed_item.id.clone(), in_progress_item.id.clone()],
         steer_count: 0,
@@ -18065,6 +18209,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         routed_usage_source_ids: Vec::new(),
         routed_usage_dropped_records: 0,
         model_request_diagnostics: None,
+        operation_activity: None,
         error: None,
         item_ids: vec![queued_item.id.clone()],
         steer_count: 0,
@@ -18262,6 +18407,7 @@ fn seed_turns_with_user_messages(
             routed_usage_source_ids: Vec::new(),
             routed_usage_dropped_records: 0,
             model_request_diagnostics: None,
+            operation_activity: None,
             error: None,
             item_ids: vec![user_item_id, asst_item_id],
             steer_count: 0,
@@ -19082,6 +19228,7 @@ fn restart_rebuild_restores_tool_call_identity_from_persisted_items() -> Result<
         routed_usage_source_ids: Vec::new(),
         routed_usage_dropped_records: 0,
         model_request_diagnostics: None,
+        operation_activity: None,
         error: None,
         item_ids: vec![user_item.id.clone(), call_item.id.clone()],
         steer_count: 0,
@@ -19188,6 +19335,7 @@ fn restart_rebuild_keeps_in_flight_tool_call_identity() -> Result<()> {
         routed_usage_source_ids: Vec::new(),
         routed_usage_dropped_records: 0,
         model_request_diagnostics: None,
+        operation_activity: None,
         error: None,
         item_ids: vec![call_item.id.clone()],
         steer_count: 0,
@@ -19289,6 +19437,7 @@ fn restart_rebuild_skips_steers_the_engine_never_delivered() -> Result<()> {
         routed_usage_source_ids: Vec::new(),
         routed_usage_dropped_records: 0,
         model_request_diagnostics: None,
+        operation_activity: None,
         error: None,
         item_ids: vec![delivered.id.clone(), dropped.id.clone(), pending.id.clone()],
         steer_count: 0,
@@ -19391,6 +19540,7 @@ fn restart_rebuild_skips_legacy_tool_items_without_identity() -> Result<()> {
         routed_usage_source_ids: Vec::new(),
         routed_usage_dropped_records: 0,
         model_request_diagnostics: None,
+        operation_activity: None,
         error: None,
         item_ids: vec![user_item.id.clone(), legacy_tool_item.id.clone()],
         steer_count: 0,

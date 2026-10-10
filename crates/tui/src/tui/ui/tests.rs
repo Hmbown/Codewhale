@@ -11020,9 +11020,7 @@ fn first_run_route_starts_with_configured_provider_and_model() {
         let mut app = App::new(options, &config);
         assert_eq!(app.api_provider, ProviderKind::Openai);
         assert_eq!(app.model, "gpui-fixture");
-        assert!(!crate::local_ollama::should_adopt_live_local_ollama(
-            &mut app
-        ));
+        assert!(!app.should_adopt_live_local_ollama());
         assert!(codewhale_config::SetupState::load().unwrap().is_none());
         assert_eq!(
             Config::load(None, None).unwrap().default_model(),
@@ -11050,9 +11048,7 @@ async fn first_run_route_keeps_explicit_choice_when_credentials_are_missing() {
         app.onboarding_needs_api_key = true;
         app.onboarding_missing_key_recovery = true;
         sync_config_provider_from_app(&mut config, &app);
-        assert!(!crate::local_ollama::should_adopt_live_local_ollama(
-            &mut app
-        ));
+        assert!(!app.should_adopt_live_local_ollama());
 
         let mut engine = mock_engine_handle();
         super::event_loop::adopt_live_local_ollama_catalog(
@@ -11175,10 +11171,7 @@ async fn first_run_route_generated_config_restart_keeps_local_discovery() {
         app.onboarding_needs_api_key = true;
         sync_config_provider_from_app(&mut config, &app);
         assert!(!app.startup_route_configured, "launch {launch}");
-        assert!(
-            crate::local_ollama::should_adopt_live_local_ollama(&mut app),
-            "launch {launch}"
-        );
+        assert!(app.should_adopt_live_local_ollama(), "launch {launch}");
         if launch == 1 {
             let mut engine = mock_engine_handle();
             super::event_loop::adopt_live_local_ollama_catalog(
@@ -11224,9 +11217,7 @@ async fn first_run_route_endpoint_only_keeps_route_when_credentials_are_missing(
         app.onboarding_needs_api_key = true;
         app.onboarding_missing_key_recovery = true;
         assert!(app.startup_route_configured, "{document:?}");
-        assert!(!crate::local_ollama::should_adopt_live_local_ollama(
-            &mut app
-        ));
+        assert!(!app.should_adopt_live_local_ollama());
         let mut engine = mock_engine_handle();
         super::event_loop::adopt_live_local_ollama_catalog(
             &mut app,
@@ -11297,9 +11288,7 @@ async fn first_run_switch_to_keyed_route_clears_launch_missing_key_state() {
     assert_eq!(app.api_provider, ProviderKind::Openai);
     assert!(!app.onboarding_needs_api_key);
     assert!(!app.onboarding_missing_key_recovery);
-    assert!(!crate::local_ollama::should_adopt_live_local_ollama(
-        &mut app
-    ));
+    assert!(!app.should_adopt_live_local_ollama());
 }
 
 /// A key supplied only through the environment is a working hosted route:
@@ -11321,9 +11310,7 @@ fn first_run_route_env_key_only_is_not_replaced() {
     assert!(!app.onboarding_needs_api_key);
     assert!(!app.onboarding_missing_key_recovery);
     assert_eq!(app.api_provider, ProviderKind::Deepseek);
-    assert!(!crate::local_ollama::should_adopt_live_local_ollama(
-        &mut app
-    ));
+    assert!(!app.should_adopt_live_local_ollama());
 }
 
 #[tokio::test]
@@ -11840,7 +11827,7 @@ fn local_ollama_probe_leaves_a_picker_the_person_is_using_alone() {
         None,
     ));
     assert!(
-        crate::local_ollama::should_adopt_live_local_ollama(&mut app),
+        app.should_adopt_live_local_ollama(),
         "an untouched first-run picker still adopts a live local model"
     );
 
@@ -11848,7 +11835,7 @@ fn local_ollama_probe_leaves_a_picker_the_person_is_using_alone() {
         .view_stack
         .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     assert!(
-        !crate::local_ollama::should_adopt_live_local_ollama(&mut app),
+        !app.should_adopt_live_local_ollama(),
         "a picker the person has used is not closed by the background probe"
     );
     assert_eq!(app.view_stack.top_kind(), Some(ModalKind::ProviderPicker));
@@ -19814,7 +19801,7 @@ fn workspace_context_refresh_respects_ttl_before_requerying_git() {
     std::fs::write(repo.path().join("dirty.txt"), "dirty").expect("write dirty marker");
     // #6565: the badge reads the shared git probe, which the chrome tick
     // keeps fresh; stand in for that tick.
-    crate::tui::git_status::force_refresh(repo.path());
+    crate::git_status::force_refresh(repo.path());
 
     let before_ttl = start + Duration::from_secs(crate::tui::workspace_context::REFRESH_SECS - 1);
     crate::tui::workspace_context::refresh_if_needed(&mut app, before_ttl, true);
@@ -20673,6 +20660,168 @@ fn session_transition_waits_for_pending_dispatch_and_cancelled_turn() {
     app.suppress_stream_events_until_turn_complete = false;
     app.dispatch_in_flight = true;
     assert!(app.session_transition_blocked());
+}
+
+/// Every predicate that closes the gate must also name itself. A predicate
+/// added to the list without an explanation would ship a bare "runtime work is
+/// active" refusal — the defect this change removes — so each arm is driven
+/// alone and checked for its own wording.
+#[test]
+fn transition_blockers_follow_the_gate_and_name_every_predicate() {
+    fn assert_named(label: &str, arm: impl FnOnce(&mut App), expected: &str) {
+        let mut app = create_test_app();
+        arm(&mut app);
+        let blockers = app.session_transition_blockers();
+        assert!(
+            app.session_transition_blocked(),
+            "{label}: the gate must be closed"
+        );
+        assert!(
+            blockers.iter().any(|blocker| blocker.contains(expected)),
+            "{label}: expected a blocker mentioning {expected:?}, got {blockers:?}"
+        );
+    }
+
+    let app = create_test_app();
+    assert!(!app.session_transition_blocked());
+    assert!(app.session_transition_blockers().is_empty());
+
+    assert_named(
+        "is_loading",
+        |app| app.is_loading = true,
+        "still busy with the current turn",
+    );
+    assert_named(
+        "dispatch_in_flight",
+        |app| app.dispatch_in_flight = true,
+        "still resolving its route",
+    );
+    assert_named(
+        "suppress_stream_events_until_turn_complete",
+        |app| app.suppress_stream_events_until_turn_complete = true,
+        "cancelled turn is still settling",
+    );
+    assert_named(
+        "runtime_turn_status",
+        |app| app.runtime_turn_status = Some("in_progress".to_string()),
+        "turn in progress",
+    );
+    assert_named(
+        "is_compacting",
+        |app| app.is_compacting = true,
+        "compaction is running",
+    );
+    assert_named(
+        "manual_compaction_queued",
+        |app| app.manual_compaction_queued = true,
+        "manual compaction is queued",
+    );
+    assert_named(
+        "is_purging",
+        |app| app.is_purging = true,
+        "cleanup is running",
+    );
+    assert_named(
+        "task_panel",
+        |app| {
+            app.task_panel.push(crate::tui::app::TaskPanelEntry {
+                exit_code: None,
+                id: "shell_a3f2".to_string(),
+                status: "running".to_string(),
+                prompt_summary: "shell: cw-leftovers.ps1".to_string(),
+                duration_ms: Some(5 * 60 * 60 * 1_000 + 18 * 60 * 1_000),
+                kind: crate::tui::app::TaskPanelEntryKind::Shell,
+                stale: false,
+                elapsed_since_output_ms: None,
+                owner_agent_id: None,
+                owner_agent_name: None,
+                current_tool: None,
+                role: None,
+                files_touched: 0,
+            });
+        },
+        "cw-leftovers.ps1",
+    );
+}
+
+/// The row names the shell, its state, how long it has run, and its command —
+/// stripped of the panel's `shell: ` prefix, with its owner when a sub-agent
+/// owns it.
+#[test]
+fn transition_blocker_rows_name_the_command_and_its_owner() {
+    let mut app = create_test_app();
+    app.task_panel.push(crate::tui::app::TaskPanelEntry {
+        exit_code: None,
+        id: "shell_a3f2".to_string(),
+        status: "running".to_string(),
+        prompt_summary: "shell: cw-leftovers.ps1".to_string(),
+        duration_ms: Some(5 * 60 * 60 * 1_000 + 18 * 60 * 1_000),
+        kind: crate::tui::app::TaskPanelEntryKind::Shell,
+        stale: false,
+        elapsed_since_output_ms: None,
+        owner_agent_id: Some("agent_9c81".to_string()),
+        owner_agent_name: Some("verifier".to_string()),
+        current_tool: None,
+        role: None,
+        files_touched: 0,
+    });
+    let blockers = app.session_transition_blockers();
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    let row = &blockers[0];
+    assert!(row.contains("shell_a3f2"), "{row:?}");
+    assert!(row.contains("running"), "{row:?}");
+    assert!(row.contains("5h 18m"), "{row:?}");
+    assert!(row.contains("(by verifier) cw-leftovers.ps1"), "{row:?}");
+    assert!(
+        !row.contains("shell: "),
+        "the panel prefix is stripped: {row:?}"
+    );
+}
+
+#[test]
+fn transition_blockers_summarize_past_the_fifth_task_and_bound_each_summary() {
+    use unicode_width::UnicodeWidthStr as _;
+
+    let mut app = create_test_app();
+    for index in 0..6 {
+        app.task_panel.push(crate::tui::app::TaskPanelEntry {
+            exit_code: None,
+            id: format!("shell_{index:04}"),
+            status: "queued".to_string(),
+            // 100 CJK characters are 200 display columns: a character-count
+            // budget cannot keep this row inside a terminal, display width
+            // can.
+            prompt_summary: "汉".repeat(100),
+            duration_ms: None,
+            kind: crate::tui::app::TaskPanelEntryKind::Shell,
+            stale: false,
+            elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+            current_tool: None,
+            role: None,
+            files_touched: 0,
+        });
+    }
+    let blockers = app.session_transition_blockers();
+    assert_eq!(
+        blockers.len(),
+        6,
+        "five rows plus the remainder line: {blockers:?}"
+    );
+    assert_eq!(blockers[5], "…and 1 more");
+    assert!(
+        blockers[..5].iter().all(|row| row.as_str().width() <= 74),
+        "rows must fit the 74-column Note body: {blockers:?}"
+    );
+    assert!(
+        blockers[..5].iter().all(|row| row.contains("...")),
+        "an over-long summary is truncated, not dropped: {blockers:?}"
+    );
+    assert!(
+        blockers[..5].iter().all(|row| row.contains("  -  ")),
+        "a missing duration keeps its column with the shared placeholder: {blockers:?}"
+    );
 }
 
 #[test]

@@ -123,8 +123,9 @@ floor and one-shot model guardian decide a worker's held calls (never a
 prompt; an unavailable guardian denies, fail closed); under Ask a held call
 the role cannot delegate is raised as an approval prompt in the parent's
 UI and the worker waits visibly (`waiting for user`), or is denied with the
-reason on hosts that cannot prompt; Full Access still fails closed on the
-non-bypassable safety floor. Each decision nobody was prompted for is a
+reason on hosts that cannot prompt; Full Access applies
+exactly as it does to the parent turn, so a call the person granted is not
+stranded by the Auto-Review floor. Each decision nobody was prompted for is a
 one-line note in that worker's transcript (visible when it is focused) and
 an audit-log record. See `docs/MODES.md`.
 

@@ -319,7 +319,7 @@ fn describe_run(line: &crate::tools::workflow::HostWorkflowRunLine, now_ms: u64)
         line.run_id,
         line.status,
         line.label,
-        crate::elapsed::format_elapsed_secs(elapsed),
+        codewhale_command_contract::elapsed::format_elapsed_secs(elapsed),
         line.child_count
     );
     if let Some(progress) = line.last_progress.as_deref() {

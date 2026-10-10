@@ -353,7 +353,7 @@ New integrations should prefer `codewhale app-server`.")]
     )]
     Login(LoginArgs),
     /// Remove saved authentication state (every provider key, OAuth login,
-    /// the account session and the Daytona token). Asks before deleting.
+    /// the Codewhale account session). Asks before deleting.
     Logout(LogoutArgs),
     /// Manage authentication credentials and provider mode.
     Auth(AuthArgs),
@@ -2934,7 +2934,7 @@ fn reject_legacy_login_provider_args(args: &LoginArgs) -> Result<()> {
 }
 
 const LOGOUT_CONFIRM_PROMPT: &str = "This deletes every saved provider API key and OAuth login, \
-the Codewhale account session and the Daytona token. Type 'yes' to log out: ";
+the Codewhale account session. Type 'yes' to log out: ";
 
 /// `codewhale logout` wipes every provider credential at once, so it must not
 /// run on a stray keystroke. Non-interactive callers opt in with `--yes`.
@@ -5694,19 +5694,23 @@ fn run_model_command(
     top_level_provider: Option<ProviderKind>,
     resolved_runtime: &ResolvedRuntimeOptions,
 ) -> Result<()> {
-    let registry = ModelRegistry::default();
     match command {
         ModelCommand::List { provider } => {
             let filter = model_command_provider_hint(provider, top_level_provider);
-            for model in registry.list().into_iter().filter(|m| match filter {
-                Some(p) => m.provider == p,
-                None => true,
-            }) {
-                println!("{} ({})", model.id, model.provider.as_str());
+            codewhale_tui::maybe_load_persisted_cache();
+            let providers: &[ProviderKind] = match &filter {
+                Some(provider) => std::slice::from_ref(provider),
+                None => ProviderKind::all(),
+            };
+            for provider in providers {
+                for model in codewhale_tui::all_catalog_models_for_provider(*provider) {
+                    println!("{model} ({})", provider.as_str());
+                }
             }
             Ok(())
         }
         ModelCommand::Resolve { model, provider } => {
+            let registry = ModelRegistry::default();
             // Only `model resolve --provider X` is a hypothetical. The
             // top-level `--provider` is the route this process is actually on,
             // and it is already folded into `resolved_runtime` — treating it as

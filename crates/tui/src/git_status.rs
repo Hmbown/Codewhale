@@ -11,7 +11,7 @@
 //! `rev-parse --git-dir --git-common-dir` (repository name and linked
 //! worktree), `log -5` for recent commits, `worktree list --porcelain`, and
 //! `remote get-url origin` by way of
-//! [`crate::remote_control::observed_git_repo`]. Git older than 2.11 has no
+//! [`observed_git_repo`]. Git older than 2.11 has no
 //! porcelain v2; the probe then falls back to the old three calls. There is
 //! no `gix` dependency and no per-invocation timeout. All of these run with
 //! `GIT_OPTIONAL_LOCKS=0` so a read never contends for `.git/index.lock` in
@@ -39,7 +39,7 @@ pub struct GitStatusSnapshot {
     pub branch: Option<String>,
     /// `owner/name` when `origin` resolves to a recognised forge, from the
     /// one normalizer that owns that judgement
-    /// ([`crate::remote_control::normalize_observed_git_repo`]): paths,
+    /// ([`normalize_observed_git_repo`]): paths,
     /// credentials, and unknown hosts are dropped rather than displayed.
     /// Cached here so chrome can name the repository without probing on the
     /// render path.
@@ -548,10 +548,9 @@ pub(crate) fn probe_status(workspace: &Path) -> GitStatusSnapshot {
         }
     }
 
-    // The forge slug (`owner/name`), reusing the remote-control probe rather
-    // than parsing `origin` a second time. Rides this cached probe so the
-    // topbar never shells out per frame.
-    snap.remote_slug = crate::remote_control::observed_git_repo(&root);
+    // The forge slug (`owner/name`). Rides this cached probe so the topbar
+    // never shells out per frame.
+    snap.remote_slug = observed_git_repo(&root);
 
     if let Ok(log) = git_output(&root, &["log", RECENT_COMMITS, "--format=%h%x1f%s%x1f%cr"]) {
         snap.recent_commits = parse_recent_commits(&log);
@@ -775,6 +774,89 @@ pub fn create_worktree(
     git_write(repo, &args).map(|_| ())?;
     force_refresh(repo);
     Ok(())
+}
+
+/// Build the human-readable workspace context string ("branch | status")
+/// from one `git status --porcelain=v2 --branch` call, through the same
+/// parser and formatter the Git view uses. Returns `None` if the workspace is
+/// not a git repository or git itself is unavailable. The engine's per-turn
+/// git line reads this.
+pub(crate) fn collect(workspace: &Path) -> Option<String> {
+    probe_workspace_status(workspace)
+        .ok()
+        .as_ref()
+        .and_then(status_line)
+}
+
+/// Collapse a git remote to `owner/name`. Paths, credentials, and unknown
+/// hosts are dropped so the control plane never receives a folder identity.
+pub(crate) fn normalize_observed_git_repo(input: &str) -> Option<String> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let allowed_host = |host: &str| {
+        matches!(
+            host.to_ascii_lowercase().as_str(),
+            "github.com" | "www.github.com" | "gitee.com" | "cnb.cool"
+        )
+    };
+    let path = if let Some((authority, path)) = raw.split_once(':')
+        && !raw.contains("://")
+        && authority.starts_with("git@")
+        && allowed_host(authority.trim_start_matches("git@"))
+    {
+        path.to_string()
+    } else {
+        let url = reqwest::Url::parse(raw).ok()?;
+        if url.scheme() != "https"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.port().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !allowed_host(url.host_str()?)
+        {
+            return None;
+        }
+        url.path().trim_start_matches('/').to_string()
+    };
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let name = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if owner.len() > 80 || name.len() > 80 {
+        return None;
+    }
+    if !owner
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    if matches!(owner, "." | "..") || matches!(name, "." | "..") {
+        return None;
+    }
+    Some(format!("{owner}/{name}"))
+}
+
+pub(crate) fn observed_git_repo(workspace: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    normalize_observed_git_repo(std::str::from_utf8(&output.stdout).ok()?)
 }
 
 #[cfg(test)]
@@ -1353,7 +1435,7 @@ locked
         );
         // The engine's per-turn line reads the same parser and formatter.
         assert_eq!(
-            crate::tui::workspace_context::collect(repo).as_deref(),
+            crate::git_status::collect(repo).as_deref(),
             Some("main | 1 modified, 1 untracked")
         );
     }

@@ -24,6 +24,7 @@ release_crates=(
   codewhale-core
   # Shared command shapes depend on protocol, never on core/runtime services.
   codewhale-command-contract
+  codewhale-commands
   # TUI support crates added in 0.9.13: localization (i18n), models (catalog
   # facade), palette (design tokens). Only tui consumes them, so they sit
   # after core/config/build-support and before tui.

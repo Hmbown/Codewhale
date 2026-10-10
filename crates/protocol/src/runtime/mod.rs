@@ -59,6 +59,8 @@ pub struct RuntimeCapabilities {
     pub client_token_intents: bool,
     #[serde(default)]
     pub account_session: bool,
+    #[serde(default)]
+    pub account_model_owner: bool,
     pub threads: bool,
     /// Explicit per-thread shell opt-in is checked against loaded policy and
     /// cannot broaden a conversation while it has an active turn.
@@ -72,6 +74,12 @@ pub struct RuntimeCapabilities {
     /// Read-only exact accepted-turn lookup by thread and operation key.
     #[serde(default)]
     pub turn_operation_lookup: bool,
+    /// Automation patch/run/pause/resume honor `expected_revision` (409
+    /// `revision_conflict` carrying `current_revision`); create/patch/run/pause/
+    /// resume honor a bounded, persisted `Idempotency-Key`. Delete honors
+    /// neither.
+    #[serde(default)]
+    pub automation_mutation_preconditions: bool,
     /// Bounded inline image inputs, persisted and replayed with their turn.
     #[serde(default)]
     pub turn_image_inputs: bool,
@@ -435,11 +443,13 @@ mod tests {
             turn_output_token_limit: false,
             profile_constitution: false,
             account_session: true,
+            account_model_owner: false,
             threads: true,
             thread_shell_consent: true,
             turns: true,
             turn_operation_idempotency: true,
             turn_operation_lookup: true,
+            automation_mutation_preconditions: true,
             turn_image_inputs: true,
             turn_steer: true,
             turn_interrupt: true,

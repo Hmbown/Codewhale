@@ -8,8 +8,8 @@
 Xcode 26.2 `ld-1230`），采集时还跑着另外四个 cargo 任务（1 分钟负载均值 10–27，
 每个数字旁边都记了当时的负载），所以把这些数字当作前后对比的相对证据，不要当基准测试结果。
 
-> 拆分计划：[TUI_DECONSTRUCTION.md](../design/TUI_DECONSTRUCTION.md) 记录了 9 月 9 日的
-> 源码审计和当前建议的抽取顺序。下面的测量都是历史数据；B3 和“推迟”两处的候选清单
+> 拆分计划：[TUI_DECONSTRUCTION.md](../design/TUI_DECONSTRUCTION.md) 记录了当前的
+> 源码审计、目标 crate 地图和抽取顺序。下面的测量都是历史数据；B3 和“推迟”两处的候选清单
 > 不是执行队列。
 
 ## 时间花在哪里（基线，commit 533c530b）
@@ -141,7 +141,7 @@ build-dir + sccache 拓扑，所以新 worktree 仍然要往 `./target` 里做�
 export CODEWHALE_CACHE_ROOT=/path/to/cache/codewhale
 
 scripts/dev-cache.sh --self-check
-scripts/dev-test.sh crates/runtime/src/elapsed.rs
+scripts/dev-test.sh crates/command-contract/src/elapsed.rs
 CARGO_INCREMENTAL=0 scripts/dev-cargo.sh test -p codewhale-config --lib --locked --no-run
 ```
 

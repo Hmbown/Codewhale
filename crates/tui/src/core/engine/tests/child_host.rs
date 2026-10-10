@@ -206,6 +206,7 @@ async fn child_registry_rejects_context_override_identity_before_tool_effect() {
             "File",
             json!({"action":"write","path":"blocked.txt","content":"must not write"}),
             Some(&override_context),
+            || panic!("refused child admission must not publish activity"),
         )
         .await
         .unwrap_err();
@@ -1388,33 +1389,45 @@ async fn detached_child_catastrophic_shell_floor_uses_captured_origin_in_every_p
         .expect("detached safety floor never waits for a missing human host");
         result.unwrap();
         assert!(mock.call_count() >= 1);
-        assert!(
-            events.iter().any(|event| matches!(
-                event,
-                Event::ToolCallComplete { result: Err(error), .. }
-                    if error.to_string().contains("destructive background")
-                        || error.to_string().contains("no host that can answer this approval")
-            )),
-            "{approval_mode:?}: the canonical child planner must hold the call: {events:?}"
-        );
-        assert!(
-            !events.iter().any(|event| matches!(
-                event,
-                Event::ToolGateDecision {
-                    gate: crate::core::events::ToolGate::AutoReviewGuardian,
-                    ..
-                }
-            )),
-            "the deterministic catastrophic-action floor cannot become model self-approval"
-        );
-        assert!(
-            !events.iter().any(|event| matches!(
-                event,
-                Event::ToolCallComplete { result: Ok(result), .. }
-                    if result.content.contains("records out")
-            )),
-            "the harmless dd fixture must never reach the shell"
-        );
+        let held = !matches!(approval_mode, ApprovalMode::Bypass);
+        if held {
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    Event::ToolCallComplete { result: Err(error), .. }
+                        if error.to_string().contains("destructive background")
+                            || error.to_string().contains("no host that can answer this approval")
+                )),
+                "{approval_mode:?}: the canonical child planner must hold the call: {events:?}"
+            );
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    Event::ToolGateDecision {
+                        gate: crate::core::events::ToolGate::AutoReviewGuardian,
+                        ..
+                    }
+                )),
+                "the deterministic catastrophic-action floor cannot become model self-approval"
+            );
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    Event::ToolCallComplete { result: Ok(result), .. }
+                        if result.content.contains("records out")
+                )),
+                "the harmless dd fixture must never reach the shell"
+            );
+        } else {
+            // Full Access skips the floor: the captured origin does not
+            // strand the call, and the harmless fixture actually runs.
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::ToolCallComplete { result: Ok(_), .. })),
+                "Full Access runs the detached call: {events:?}"
+            );
+        }
     }
 }
 
