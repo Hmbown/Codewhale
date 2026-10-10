@@ -6733,7 +6733,20 @@ struct AutomationPreconditionQuery {
     expected_revision: Option<u64>,
 }
 
-static AUTOMATION_IDEMPOTENCY_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static AUTOMATION_IDEMPOTENCY_GATES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+async fn lock_automation_idempotency_key(scoped_key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let gate = {
+        let mut gates = AUTOMATION_IDEMPOTENCY_GATES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        gates.retain(|_, gate| std::sync::Arc::strong_count(gate) > 1);
+        gates.entry(scoped_key.to_string()).or_default().clone()
+    };
+    gate.lock_owned().await
+}
 
 fn automation_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
     let Some(value) = headers.get("idempotency-key") else {
@@ -6819,7 +6832,8 @@ where
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     };
-    let _gate = AUTOMATION_IDEMPOTENCY_GATE.lock().await;
+    let key = format!("{operation}\n{key}");
+    let _gate = lock_automation_idempotency_key(&key).await;
     let lookup = state
         .automations
         .lock()
@@ -6845,12 +6859,18 @@ where
     };
     let body = serde_json::to_value(value)
         .map_err(|e| ApiError::internal(format!("Failed to encode response: {e}")))?;
-    state
-        .automations
-        .lock()
-        .await
-        .idempotency_store(&key, &fingerprint, ok_status.as_u16(), body.clone())
-        .map_err(|e| ApiError::internal(format!("Idempotency store unavailable: {e}")))?;
+    if let Err(error) = state.automations.lock().await.idempotency_store(
+        &key,
+        &fingerprint,
+        ok_status.as_u16(),
+        body.clone(),
+    ) {
+        tracing::error!(
+            %error,
+            operation,
+            "automation mutation committed but its idempotency record could not be stored"
+        );
+    }
     Ok(respond(ok_status, body, false))
 }
 

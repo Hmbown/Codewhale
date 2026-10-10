@@ -1723,7 +1723,13 @@ relying on the behavior below (older Engines ignore both inputs).
   and identical request returns the stored status and body with
   `Idempotency-Replayed: true` and performs no second create or run. The same
   key with a different request is `422` `idempotency_key_reuse`. Failed
-  attempts are not stored, so they can be retried. `DELETE` is not covered.
+  attempts are not stored, so they can be retried. Keys are scoped to the
+  route and automation id. If the record cannot be persisted after the
+  mutation committed, the success response is still returned (the failure is
+  logged), so a retry of that request is not deduplicated. An unparseable
+  `idempotency.json` is renamed to `idempotency.corrupt-<timestamp>.json` and
+  that request fails with `500`; later requests start from an empty store.
+  `DELETE` is not covered.
 
 **Operate** (always-on named operation; same `OperateRecord` as CWC
 `20de981` / PR #284)

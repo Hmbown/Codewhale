@@ -1463,7 +1463,22 @@ impl AutomationManager {
     fn read_idempotency_unlocked(&self, now: DateTime<Utc>) -> Result<Vec<IdempotencyEntry>> {
         let path = self.idempotency_path()?;
         let mut entries: Vec<IdempotencyEntry> = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(entries) => entries,
+                Err(parse_error) => {
+                    let quarantine = path.with_file_name(format!(
+                        "idempotency.corrupt-{}.json",
+                        now.format("%Y%m%dT%H%M%S%.3f")
+                    ));
+                    fs::rename(&path, &quarantine)
+                        .with_context(|| format!("quarantine corrupt {}", path.display()))?;
+                    anyhow::bail!(
+                        "idempotency store {} was unparseable ({parse_error}); moved to {}",
+                        path.display(),
+                        quarantine.display()
+                    );
+                }
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
         };
