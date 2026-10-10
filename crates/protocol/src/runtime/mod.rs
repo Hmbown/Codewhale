@@ -74,9 +74,10 @@ pub struct RuntimeCapabilities {
     /// Read-only exact accepted-turn lookup by thread and operation key.
     #[serde(default)]
     pub turn_operation_lookup: bool,
-    /// Automation create/patch/delete/run/pause/resume honor `expected_revision`
-    /// (409 `revision_conflict` carrying `current_revision`) and a bounded,
-    /// persisted `Idempotency-Key`.
+    /// Automation patch/run/pause/resume honor `expected_revision` (409
+    /// `revision_conflict` carrying `current_revision`); create/patch/run/pause/
+    /// resume honor a bounded, persisted `Idempotency-Key`. Delete honors
+    /// neither.
     #[serde(default)]
     pub automation_mutation_preconditions: bool,
     /// Bounded inline image inputs, persisted and replayed with their turn.

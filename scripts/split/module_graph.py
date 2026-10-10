@@ -479,7 +479,7 @@ class Report:
     locations: dict[str, dict[str, list[str]]]
 
 
-def build_report(tui_src: Path = TUI_SRC, runtime_src: Path = RUNTIME_SRC) -> Report:
+def load_graph(tui_src: Path = TUI_SRC, runtime_src: Path = RUNTIME_SRC) -> tuple[Crate, Crate, list[Ref]]:
     tui = load_crate("codewhale-tui", tui_src)
     runtime = load_crate("codewhale-runtime", runtime_src)
     all_modules = tui.modules | runtime.modules
@@ -487,7 +487,12 @@ def build_report(tui_src: Path = TUI_SRC, runtime_src: Path = RUNTIME_SRC) -> Re
     resolve_root_names(runtime, runtime.modules)
     tui_refs = collect_refs(tui, all_modules, "crates/tui/src")
     rt_refs = collect_refs(runtime, runtime.modules, "crates/runtime/src")
-    refs = tui_refs + rt_refs
+    return tui, runtime, tui_refs + rt_refs
+
+
+def build_report(tui_src: Path = TUI_SRC, runtime_src: Path = RUNTIME_SRC) -> Report:
+    tui, runtime, refs = load_graph(tui_src, runtime_src)
+    all_modules = tui.modules | runtime.modules
 
     prod_edges: dict[str, set[str]] = collections.defaultdict(set)
     for r in refs:
