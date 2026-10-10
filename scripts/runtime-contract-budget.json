@@ -90,15 +90,16 @@
     "modes": {
       "act": {
         "active": {
-          "bytes": 36557,
-          "identity_sha256": "cc8f1f208bcf83261451f1ff67f7bf65534616cfd50be0102f50aba009a9e59d",
-          "tokens_est": 9140,
+          "bytes": 37873,
+          "identity_sha256": "e2d6dfb7168d48ee8d2a415feac7ff5b8864e18528c233a697055370144eb138",
+          "tokens_est": 9469,
           "tool_names": [
             "agent",
             "bash",
             "create_goal",
             "edit",
             "execute_tools",
+            "file_search",
             "get_goal",
             "load_skill",
             "read",
@@ -108,12 +109,12 @@
             "workflow",
             "write"
           ],
-          "tools": 13
+          "tools": 14
         },
         "full": {
-          "bytes": 85905,
-          "identity_sha256": "45e989bbe5ac0bb1f2d9084361c021009f30a06539f132ebd4fd2331a1bb1954",
-          "tokens_est": 21477,
+          "bytes": 85363,
+          "identity_sha256": "928e6417732837d26f1f26fe41ea6a11f5b8e3bfc4eeb3dd97a309379cffeff9",
+          "tokens_est": 21341,
           "tool_names": [
             "Git",
             "Run",
@@ -127,7 +128,6 @@
             "edit",
             "execute_tools",
             "file_search",
-            "fim_edit",
             "finance",
             "get_goal",
             "github",
@@ -169,20 +169,21 @@
             "workflow",
             "write"
           ],
-          "tools": 53
+          "tools": 52
         }
       },
       "operate": {
         "active": {
-          "bytes": 36557,
-          "identity_sha256": "cc8f1f208bcf83261451f1ff67f7bf65534616cfd50be0102f50aba009a9e59d",
-          "tokens_est": 9140,
+          "bytes": 37873,
+          "identity_sha256": "e2d6dfb7168d48ee8d2a415feac7ff5b8864e18528c233a697055370144eb138",
+          "tokens_est": 9469,
           "tool_names": [
             "agent",
             "bash",
             "create_goal",
             "edit",
             "execute_tools",
+            "file_search",
             "get_goal",
             "load_skill",
             "read",
@@ -192,12 +193,12 @@
             "workflow",
             "write"
           ],
-          "tools": 13
+          "tools": 14
         },
         "full": {
-          "bytes": 85905,
-          "identity_sha256": "45e989bbe5ac0bb1f2d9084361c021009f30a06539f132ebd4fd2331a1bb1954",
-          "tokens_est": 21477,
+          "bytes": 85363,
+          "identity_sha256": "928e6417732837d26f1f26fe41ea6a11f5b8e3bfc4eeb3dd97a309379cffeff9",
+          "tokens_est": 21341,
           "tool_names": [
             "Git",
             "Run",
@@ -211,7 +212,6 @@
             "edit",
             "execute_tools",
             "file_search",
-            "fim_edit",
             "finance",
             "get_goal",
             "github",
@@ -253,19 +253,20 @@
             "workflow",
             "write"
           ],
-          "tools": 53
+          "tools": 52
         }
       },
       "plan": {
         "active": {
-          "bytes": 35027,
-          "identity_sha256": "df6676989a677fb08fecc8bf7ae12caf4fa88e0cae3d143cea6a4da4382b746c",
-          "tokens_est": 8757,
+          "bytes": 36343,
+          "identity_sha256": "6c432c75bf776d95b367b17308b171c3eaba8e70aa0c2f76bac453b3c3368a21",
+          "tokens_est": 9086,
           "tool_names": [
             "agent",
             "bash",
             "create_goal",
             "edit",
+            "file_search",
             "get_goal",
             "load_skill",
             "read",
@@ -275,12 +276,12 @@
             "workflow",
             "write"
           ],
-          "tools": 12
+          "tools": 13
         },
         "full": {
-          "bytes": 54842,
+          "bytes": 55333,
           "identity_sha256": "ac8af1f4988199825be7b00b054c258724a44074b1d4e6de6c92ade7c1cffe63",
-          "tokens_est": 13711,
+          "tokens_est": 13834,
           "tool_names": [
             "Git",
             "Web",

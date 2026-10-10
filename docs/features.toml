@@ -519,7 +519,7 @@ summary = "Terminal key bindings, documented from the keybinding catalog."
 status = "stable"
 surfaces = { tui = "stable" }
 docs = "docs/KEYBINDINGS.md"
-owner = "crates/tui/src/tui/keybindings.rs"
+owner = "crates/tui/src/keybinding_table.rs"
 
 [[feature]]
 id = "settings"

@@ -905,7 +905,7 @@ async fn collect_guardian_journey_with_receipts(
 
 #[cfg(windows)]
 #[test]
-fn windows_full_access_node_image_kill_is_denied_before_any_shell_effect() {
+fn windows_auto_review_node_image_kill_is_denied_before_any_shell_effect() {
     use crate::llm_client::mock::{MockLlmClient, canned};
 
     with_artifact_home(|home| {
@@ -940,12 +940,9 @@ fn windows_full_access_node_image_kill_is_denied_before_any_shell_effect() {
                 let (engine, handle) = Engine::new_with_model_client(
                     deterministic_engine_config(&workspace), &config, mock.clone(),
                 );
-                let mut op = external_user_message_op("Attempt the supplied cleanup.", AppMode::Agent, &config);
-                let Op::SendMessage(turn) = &mut op else { unreachable!("model turn fixture") };
-                turn.auto_approve = true;
-                turn.approval_mode = ApprovalMode::Bypass;
+                let op = auto_review_message_op("Attempt the supplied cleanup.", &config);
                 let task = tokio::spawn(engine.run());
-                handle.send(op).await.expect("send Full Access trajectory");
+                handle.send(op).await.expect("send Auto-Review trajectory");
                 let (completion, _, _, receipts) = collect_guardian_journey_with_receipts(&handle, "windows-node-kill").await;
                 let error = completion.expect_err("runtime safety floor must deny before shell execution");
                 assert!(matches!(error, crate::tools::spec::ToolError::PermissionDenied { .. }));
@@ -1322,15 +1319,15 @@ async fn operate_conversation_reaches_provider_when_workers_are_disabled() {
 }
 
 fn auto_review_plan_decision(
-    policy: &crate::tui::auto_review::AutoReviewPolicy,
+    policy: &crate::core::authority::auto_review::AutoReviewPolicy,
     tool_name: &str,
     tool_input: &Value,
-    run_origin: crate::tui::auto_review::RunOrigin,
+    run_origin: crate::core::authority::auto_review::RunOrigin,
     approval_mode: ApprovalMode,
     workspace_trusted: bool,
     workspace: Option<&Path>,
 ) -> (AutoReviewPlanDecision, Value) {
-    let context = crate::tui::auto_review::AutoReviewContext::from_tool_call(
+    let context = crate::core::authority::auto_review::AutoReviewContext::from_tool_call(
         tool_name,
         tool_input,
         run_origin,
@@ -1347,10 +1344,10 @@ fn auto_review_scenario() {
     // from auto_review_classifies_publish_and_holds_without_prompting
     {
         let (decision, audit) = auto_review_plan_decision(
-            &crate::tui::auto_review::AutoReviewPolicy::default(),
+            &crate::core::authority::auto_review::AutoReviewPolicy::default(),
             "exec_shell",
             &json!({"command": "git push origin main"}),
-            crate::tui::auto_review::RunOrigin::Interactive,
+            crate::core::authority::auto_review::RunOrigin::Interactive,
             ApprovalMode::Auto,
             true,
             None,
@@ -1369,10 +1366,10 @@ fn auto_review_scenario() {
     // from auto_review_classifier_allow_executes_without_prompting
     {
         let (decision, audit) = auto_review_plan_decision(
-            &crate::tui::auto_review::AutoReviewPolicy::default(),
+            &crate::core::authority::auto_review::AutoReviewPolicy::default(),
             "read_file",
             &json!({"path": "Cargo.toml"}),
-            crate::tui::auto_review::RunOrigin::Interactive,
+            crate::core::authority::auto_review::RunOrigin::Interactive,
             ApprovalMode::Auto,
             true,
             None,
@@ -1384,10 +1381,10 @@ fn auto_review_scenario() {
     // from auto_review_allows_ordinary_shell_probe_without_prompting
     {
         let (decision, audit) = auto_review_plan_decision(
-            &crate::tui::auto_review::AutoReviewPolicy::default(),
+            &crate::core::authority::auto_review::AutoReviewPolicy::default(),
             "exec_shell",
             &json!({"command": "git remote -v && git rev-parse --show-toplevel && git branch --show-current && git rev-parse HEAD && git tag --list 'v0.8.65'"}),
-            crate::tui::auto_review::RunOrigin::Interactive,
+            crate::core::authority::auto_review::RunOrigin::Interactive,
             ApprovalMode::Auto,
             true,
             None,
@@ -1400,10 +1397,10 @@ fn auto_review_scenario() {
     // from auto_review_routes_unknown_tool_to_reviewer_in_auto
     {
         let (decision, audit) = auto_review_plan_decision(
-            &crate::tui::auto_review::AutoReviewPolicy::default(),
+            &crate::core::authority::auto_review::AutoReviewPolicy::default(),
             "mystery_tool",
             &json!({"value": true}),
-            crate::tui::auto_review::RunOrigin::Interactive,
+            crate::core::authority::auto_review::RunOrigin::Interactive,
             ApprovalMode::Auto,
             true,
             None,
@@ -1420,10 +1417,10 @@ fn auto_review_scenario() {
     // from auto_review_policy_blocks_publish_when_approval_is_never
     {
         let (decision, audit) = auto_review_plan_decision(
-            &crate::tui::auto_review::AutoReviewPolicy::default(),
+            &crate::core::authority::auto_review::AutoReviewPolicy::default(),
             "github_publish_release",
             &json!({"tag": "v0.8.64"}),
-            crate::tui::auto_review::RunOrigin::Interactive,
+            crate::core::authority::auto_review::RunOrigin::Interactive,
             ApprovalMode::Never,
             true,
             None,
@@ -1442,10 +1439,10 @@ fn auto_review_scenario() {
     // from auto_review_allows_ordinary_test_command_without_prompting
     {
         let (decision, audit) = auto_review_plan_decision(
-            &crate::tui::auto_review::AutoReviewPolicy::default(),
+            &crate::core::authority::auto_review::AutoReviewPolicy::default(),
             "exec_shell",
             &json!({"command": "cargo test"}),
-            crate::tui::auto_review::RunOrigin::Interactive,
+            crate::core::authority::auto_review::RunOrigin::Interactive,
             ApprovalMode::Auto,
             true,
             None,
@@ -1461,10 +1458,10 @@ fn auto_review_scenario() {
         std::fs::create_dir(tmp.path().join(".git")).expect("git marker");
         std::fs::create_dir(tmp.path().join("src")).expect("source directory");
         let (decision, audit) = auto_review_plan_decision(
-            &crate::tui::auto_review::AutoReviewPolicy::default(),
+            &crate::core::authority::auto_review::AutoReviewPolicy::default(),
             "write_file",
             &json!({"path": "src/lib.rs", "content": "pub fn ready() {}\n"}),
-            crate::tui::auto_review::RunOrigin::Interactive,
+            crate::core::authority::auto_review::RunOrigin::Interactive,
             ApprovalMode::Auto,
             true,
             Some(tmp.path()),
@@ -1480,10 +1477,10 @@ fn auto_review_scenario() {
         std::fs::create_dir(tmp.path().join(".git")).expect("git marker");
         for path in ["../outside.rs", "/etc/hostname", ".env", ".git/config"] {
             let (decision, audit) = auto_review_plan_decision(
-                &crate::tui::auto_review::AutoReviewPolicy::default(),
+                &crate::core::authority::auto_review::AutoReviewPolicy::default(),
                 "write_file",
                 &json!({"path": path, "content": "blocked"}),
-                crate::tui::auto_review::RunOrigin::Interactive,
+                crate::core::authority::auto_review::RunOrigin::Interactive,
                 ApprovalMode::Auto,
                 true,
                 Some(tmp.path()),

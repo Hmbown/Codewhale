@@ -37,6 +37,10 @@ pub(crate) enum ApprovalReceipt {
         tool_call_id: String,
         tool_name: String,
         created_at: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
     },
     Decided {
         approval_id: String,
@@ -56,6 +60,40 @@ impl ApprovalReceipt {
             tool_call_id,
             tool_name: tool_name.into(),
             created_at: Utc::now(),
+            target: None,
+            summary: None,
+        }
+    }
+
+    pub(crate) fn asked_with(
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        input: &serde_json::Value,
+        description: &str,
+        workspace: &Path,
+    ) -> Self {
+        let mut ask = Self::asked(tool_call_id, tool_name);
+        if let Self::Asked {
+            target, summary, ..
+        } = &mut ask
+        {
+            *target = ask_target(input, workspace);
+            *summary = ask_summary(input, description, workspace);
+        }
+        ask
+    }
+
+    pub(crate) fn target(&self) -> Option<&str> {
+        match self {
+            Self::Asked { target, .. } => target.as_deref(),
+            Self::Decided { .. } => None,
+        }
+    }
+
+    pub(crate) fn summary(&self) -> Option<&str> {
+        match self {
+            Self::Asked { summary, .. } => summary.as_deref(),
+            Self::Decided { .. } => None,
         }
     }
 
@@ -105,6 +143,93 @@ impl ApprovalReceipt {
             Self::Asked { created_at, .. } | Self::Decided { created_at, .. } => *created_at,
         }
     }
+}
+
+const ASK_TEXT_CAP: usize = 120;
+
+fn cap_ask_text(text: &str) -> Option<String> {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    if collapsed.chars().count() <= ASK_TEXT_CAP {
+        return Some(collapsed);
+    }
+    let head: String = collapsed.chars().take(ASK_TEXT_CAP - 1).collect();
+    Some(format!("{head}…"))
+}
+
+fn relativize(text: &str, workspace: &Path) -> String {
+    let root = workspace.to_string_lossy();
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(root) {
+        let after = &rest[at + root.len()..];
+        if after.is_empty() || after.starts_with('/') {
+            out.push_str(&rest[..at]);
+            out.push('.');
+        } else {
+            out.push_str(&rest[..at + root.len()]);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn mask_env_assignments(text: &str) -> String {
+    text.split(' ')
+        .map(|word| match word.split_once('=') {
+            Some((key, value))
+                if !value.is_empty()
+                    && key
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                format!("{key}=[redacted]")
+            }
+            _ => word.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_ask_text(text: &str, workspace: &Path) -> Option<String> {
+    let masked = mask_env_assignments(text);
+    let (redacted, _) = crate::session_peek::redact(&masked);
+    cap_ask_text(&relativize(&redacted, workspace))
+}
+
+fn ask_target(input: &serde_json::Value, workspace: &Path) -> Option<String> {
+    for key in ["url", "uri"] {
+        if let Some(raw) = input.get(key).and_then(|v| v.as_str())
+            && let Ok(url) = reqwest::Url::parse(raw.trim())
+            && let Some(host) = url.host_str()
+        {
+            return cap_ask_text(host);
+        }
+    }
+    for key in ["path", "file_path", "filepath", "filename"] {
+        if let Some(raw) = input.get(key).and_then(|v| v.as_str()) {
+            return redact_ask_text(raw, workspace);
+        }
+    }
+    None
+}
+
+fn ask_summary(input: &serde_json::Value, description: &str, workspace: &Path) -> Option<String> {
+    let source = input
+        .get("command")
+        .and_then(|v| v.as_str())
+        .filter(|c| !c.trim().is_empty())
+        .unwrap_or(description);
+    redact_ask_text(source, workspace)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

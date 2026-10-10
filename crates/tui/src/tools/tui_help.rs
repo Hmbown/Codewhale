@@ -2,7 +2,7 @@
 //!
 //! Every field is read back out of the registries the human-facing help
 //! renders from — `commands::command_infos()`, the user-command registry, and
-//! `tui::keybindings::KEYBINDINGS` — so the model-facing reference cannot
+//! `keybinding_table::KEYBINDINGS` — so the model-facing reference cannot
 //! drift from `/help` and the help overlay.
 
 use std::path::Path;
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::commands::{self, user_registry};
-use crate::tui::keybindings::KEYBINDINGS;
+use crate::keybinding_table::KEYBINDINGS;
 use codewhale_localization::{Locale, tr};
 
 use super::spec::{

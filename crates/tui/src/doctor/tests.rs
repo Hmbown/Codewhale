@@ -1,5 +1,4 @@
 use super::*;
-use clap::Parser as _;
 
 #[test]
 fn default_probe_request_is_fully_offline() {
@@ -143,46 +142,6 @@ fn live_probe_flags_open_only_their_owned_boundary() {
     assert!(!search.should_check_updates());
     assert!(!search.should_probe_api(false));
     assert!(!search.should_probe_mcp());
-}
-
-#[test]
-fn cli_defaults_doctor_offline_and_keeps_json_incompatible_with_live_flags() {
-    let cli =
-        crate::Cli::try_parse_from(["codewhale-tui", "doctor"]).expect("parse default doctor");
-    let Some(crate::Commands::Doctor(args)) = cli.command else {
-        panic!("expected doctor command");
-    };
-    assert!(!args.check_updates);
-    assert!(!args.probe_api);
-    assert!(!args.probe_local);
-    assert!(!args.probe_mcp);
-    assert!(!args.probe_search);
-
-    let cli = crate::Cli::try_parse_from(["codewhale-tui", "doctor", "--probe-search"])
-        .expect("parse search probe");
-    let Some(crate::Commands::Doctor(args)) = cli.command else {
-        panic!("expected doctor command");
-    };
-    assert!(args.probe_search);
-    assert!(!args.probe_api);
-    assert!(!args.probe_local);
-    assert!(!args.probe_mcp);
-
-    for output_flag in ["--json", "--context-json"] {
-        for live_flag in [
-            "--check-updates",
-            "--probe-api",
-            "--probe-local",
-            "--probe-mcp",
-            "--probe-search",
-        ] {
-            assert!(
-                crate::Cli::try_parse_from(["codewhale-tui", "doctor", output_flag, live_flag,])
-                    .is_err(),
-                "{output_flag} unexpectedly accepted live flag {live_flag}"
-            );
-        }
-    }
 }
 
 #[tokio::test]

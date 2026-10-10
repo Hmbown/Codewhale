@@ -1878,7 +1878,7 @@ pub(crate) async fn run_event_loop(
         tokio::task::JoinHandle<Option<crate::local_ollama::LiveLocalOllamaCatalog>>,
     > = crate::local_ollama::spawn_local_ollama_adoption_probe(
         config,
-        crate::local_ollama::should_adopt_live_local_ollama(app),
+        app.should_adopt_live_local_ollama(),
     );
 
     // Startup version-change hint: once per version, never on first run.
@@ -4791,7 +4791,7 @@ pub(crate) async fn run_event_loop(
             // The git cache TTL follows the same quiet clock, set every
             // iteration so a stale back-off can never outlive the activity
             // that ended it (a turn does not reach the probe block below).
-            crate::tui::git_status::set_probe_backoff(crate::tui::git_status::probe_is_backed_off(
+            crate::git_status::set_probe_backoff(crate::git_status::probe_is_backed_off(
                 git_probe_quiet_for(app, quiet_for),
             ));
         }
@@ -4941,8 +4941,7 @@ pub(crate) async fn run_event_loop(
             let should_probe = slot
                 .lock()
                 .map(|mut last| {
-                    let due =
-                        crate::tui::git_status::probe_due(last.map(|t| t.elapsed()), quiet_for);
+                    let due = crate::git_status::probe_due(last.map(|t| t.elapsed()), quiet_for);
                     if due {
                         *last = Some(Instant::now());
                     }
@@ -4952,7 +4951,7 @@ pub(crate) async fn run_event_loop(
             if should_probe {
                 let workspace = app.workspace.clone();
                 std::thread::spawn(move || {
-                    crate::tui::git_status::refresh_if_stale(&workspace);
+                    crate::git_status::refresh_if_stale(&workspace);
                 });
             }
         }
@@ -7378,7 +7377,7 @@ pub(super) async fn adopt_live_local_ollama_catalog(
     config: &mut Config,
     catalog: crate::local_ollama::LiveLocalOllamaCatalog,
 ) {
-    if !crate::local_ollama::should_adopt_live_local_ollama(app) {
+    if !app.should_adopt_live_local_ollama() {
         return;
     }
     let Some(tag) = catalog.preferred_tag().map(str::to_string) else {

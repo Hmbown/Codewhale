@@ -7406,7 +7406,7 @@ impl RuntimeThreadManager {
         let workshop_activation = crate::tools::large_output_router::WorkshopConfig::install_active(
             new_config.workshop.as_ref(),
         );
-        crate::initialize_cloud_facts(&new_config);
+        crate::config::initialize_cloud_facts(&new_config);
         crate::provider_catalog_live::maybe_load_persisted_cache_for_config(&new_config);
         let workflow_table = new_config.workflow_config();
         {
@@ -7655,7 +7655,7 @@ impl RuntimeThreadManager {
             binding.validate_existing_store()?;
         }
         let store = RuntimeThreadStore::open(manager_cfg.data_dir.clone())?;
-        crate::initialize_cloud_facts(&config);
+        crate::config::initialize_cloud_facts(&config);
         let (event_tx, _event_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let manager = Self {
             host_profile,

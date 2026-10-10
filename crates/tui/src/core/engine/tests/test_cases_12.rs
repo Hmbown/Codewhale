@@ -224,7 +224,7 @@ async fn full_access_permission_allow_runs_background_destructive_shell_without_
 
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .and(body_string_contains("destructive background/headless"))
+        .and(body_string_contains("call_bg"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
@@ -333,13 +333,24 @@ async fn full_access_permission_allow_runs_background_destructive_shell_without_
     }
     drop(rx);
 
+    let granted = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            let text = crate::test_support::read_shell_sentinel(&victim);
+            if !text.is_empty() && text != "guarded" {
+                break text;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the granted command never wrote its sentinel");
+
     handle.send(Op::Shutdown).await.expect("shutdown engine");
     run_task.await.expect("engine task");
     assert!(saw_tool_result);
     assert!(saw_complete);
     assert_eq!(
-        fs::read_to_string(&victim).expect("read guarded fixture"),
-        "rm -rf /\n",
+        granted, "rm -rf /",
         "the granted command must run to completion"
     );
 }

@@ -1242,6 +1242,7 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
         turns: true,
         turn_operation_idempotency: true,
         turn_operation_lookup: true,
+        automation_mutation_preconditions: true,
         turn_image_inputs: true,
         turn_output_token_limit: true,
         profile_constitution: true,
@@ -5613,6 +5614,14 @@ struct ApprovalsQuery {
 struct ApprovalHistoryRow {
     approval_id: String,
     tool_name: String,
+    /// Redacted host or workspace-relative path the ask was about. Absent on
+    /// records written before targets were kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    /// Redacted one-line description of what was asked, at most 120
+    /// characters. Absent on records written before summaries were kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
     outcome: String,
     /// Who resolved it: `user`, `session_rule`, `posture`, or `host`.
     /// Absent while pending and on records written before deciders were kept.
@@ -5620,6 +5629,18 @@ struct ApprovalHistoryRow {
     decided_by: Option<crate::approval_log::ApprovalDecider>,
     asked_at: chrono::DateTime<Utc>,
     decided_at: Option<chrono::DateTime<Utc>>,
+}
+
+fn approval_row_outcome(
+    outcome: &crate::approval_log::ApprovalOutcome,
+    decided_by: Option<crate::approval_log::ApprovalDecider>,
+) -> &'static str {
+    use crate::approval_log::{ApprovalDecider, ApprovalOutcome};
+    match (outcome, decided_by) {
+        (ApprovalOutcome::ApprovedOnce, Some(ApprovalDecider::SessionRule)) => "always_allow",
+        (ApprovalOutcome::Denied, Some(ApprovalDecider::SessionRule)) => "blocked",
+        _ => approval_outcome_label(outcome),
+    }
 }
 
 fn approval_outcome_label(outcome: &crate::approval_log::ApprovalOutcome) -> &'static str {
@@ -5646,7 +5667,9 @@ fn approval_history_rows(replay: &crate::approval_log::ApprovalReplay) -> Vec<Ap
             ApprovalHistoryRow {
                 approval_id: completed.ask.approval_id().to_string(),
                 tool_name: completed.ask.tool_name().unwrap_or("unknown").to_string(),
-                outcome: approval_outcome_label(&completed.outcome).to_string(),
+                target: completed.ask.target().map(str::to_string),
+                summary: completed.ask.summary().map(str::to_string),
+                outcome: approval_row_outcome(&completed.outcome, completed.decided_by).to_string(),
                 decided_by: completed.decided_by,
                 asked_at,
                 decided_at: Some(completed.decided_at),
@@ -5655,6 +5678,8 @@ fn approval_history_rows(replay: &crate::approval_log::ApprovalReplay) -> Vec<Ap
         .chain(replay.unmatched_asks.iter().map(|ask| ApprovalHistoryRow {
             approval_id: ask.approval_id().to_string(),
             tool_name: ask.tool_name().unwrap_or("unknown").to_string(),
+            target: ask.target().map(str::to_string),
+            summary: ask.summary().map(str::to_string),
             outcome: "pending".to_string(),
             decided_by: None,
             asked_at: ask.created_at(),
@@ -6695,15 +6720,144 @@ async fn list_automations(
     Ok(Json(automations))
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct AutomationPreconditionQuery {
+    #[serde(default)]
+    expected_revision: Option<u64>,
+}
+
+static AUTOMATION_IDEMPOTENCY_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn automation_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(value) = headers.get("idempotency-key") else {
+        return Ok(None);
+    };
+    let key = value
+        .to_str()
+        .map_err(|_| ApiError::bad_request("Idempotency-Key must be visible ASCII"))?
+        .trim();
+    if key.is_empty() || key.len() > 255 || !key.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(ApiError::bad_request(
+            "Idempotency-Key must be 1-255 visible ASCII characters",
+        ));
+    }
+    Ok(Some(key.to_string()))
+}
+
+async fn automation_mutation<T, Fut>(
+    state: &RuntimeApiState,
+    headers: &HeaderMap,
+    operation: &str,
+    request: &impl Serialize,
+    ok_status: StatusCode,
+    map_err: fn(anyhow::Error) -> ApiError,
+    run: Fut,
+) -> Result<Response, ApiError>
+where
+    T: Serialize,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let run = async {
+        match run.await {
+            Ok(value) => Ok(Ok(value)),
+            Err(err) => match err.downcast_ref::<crate::automation_manager::RevisionConflict>() {
+                Some(conflict) => Ok(Err(conflict.current)),
+                None => Err(map_err(err)),
+            },
+        }
+    };
+    let conflict_response = |current: u64| {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": {
+                    "message": format!(
+                        "Automation revision conflict: current revision is {current}"
+                    ),
+                    "status": 409,
+                    "code": "revision_conflict",
+                    "current_revision": current,
+                }
+            })),
+        )
+            .into_response()
+    };
+    let respond = |status: StatusCode, body: serde_json::Value, replayed: bool| {
+        let mut response = (status, Json(body)).into_response();
+        if replayed {
+            response
+                .headers_mut()
+                .insert("idempotency-replayed", HeaderValue::from_static("true"));
+        }
+        response
+    };
+    let Some(key) = automation_idempotency_key(headers)? else {
+        let value = match run.await? {
+            Ok(value) => value,
+            Err(current) => return Ok(conflict_response(current)),
+        };
+        let body = serde_json::to_value(value)
+            .map_err(|e| ApiError::internal(format!("Failed to encode response: {e}")))?;
+        return Ok(respond(ok_status, body, false));
+    };
+    let fingerprint = {
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(operation.as_bytes());
+        hasher.update([0]);
+        hasher.update(serde_json::to_vec(request).unwrap_or_default());
+        hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    let _gate = AUTOMATION_IDEMPOTENCY_GATE.lock().await;
+    let lookup = state
+        .automations
+        .lock()
+        .await
+        .idempotency_lookup(&key, &fingerprint)
+        .map_err(|e| ApiError::internal(format!("Idempotency store unavailable: {e}")))?;
+    match lookup {
+        crate::automation_manager::IdempotencyLookup::Replay { status, body } => {
+            let status = StatusCode::from_u16(status).unwrap_or(ok_status);
+            return Ok(respond(status, body, true));
+        }
+        crate::automation_manager::IdempotencyLookup::KeyReused => {
+            return Err(ApiError::unprocessable(
+                "Idempotency-Key was already used for a different request",
+            )
+            .with_code("idempotency_key_reuse"));
+        }
+        crate::automation_manager::IdempotencyLookup::Miss => {}
+    }
+    let value = match run.await? {
+        Ok(value) => value,
+        Err(current) => return Ok(conflict_response(current)),
+    };
+    let body = serde_json::to_value(value)
+        .map_err(|e| ApiError::internal(format!("Failed to encode response: {e}")))?;
+    state
+        .automations
+        .lock()
+        .await
+        .idempotency_store(&key, &fingerprint, ok_status.as_u16(), body.clone())
+        .map_err(|e| ApiError::internal(format!("Idempotency store unavailable: {e}")))?;
+    Ok(respond(ok_status, body, false))
+}
+
 async fn create_automation(
     State(state): State<RuntimeApiState>,
+    headers: HeaderMap,
     Json(req): Json<CreateAutomationRequest>,
-) -> Result<(StatusCode, Json<AutomationRecord>), ApiError> {
-    let manager = state.automations.lock().await;
-    let automation = manager
-        .create_automation(req)
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    Ok((StatusCode::CREATED, Json(automation)))
+) -> Result<Response, ApiError> {
+    automation_mutation(
+        &state,
+        &headers,
+        "POST /v1/automations",
+        &req,
+        StatusCode::CREATED,
+        |e| ApiError::bad_request(e.to_string()),
+        async { state.automations.lock().await.create_automation(req.clone()) },
+    )
+    .await
 }
 
 async fn get_automation(
@@ -6718,13 +6872,21 @@ async fn get_automation(
 async fn update_automation(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
-    Json(req): Json<UpdateAutomationRequest>,
-) -> Result<Json<AutomationRecord>, ApiError> {
-    let manager = state.automations.lock().await;
-    let automation = manager
-        .update_automation(&id, req)
-        .map_err(map_automation_err)?;
-    Ok(Json(automation))
+    Query(query): Query<AutomationPreconditionQuery>,
+    headers: HeaderMap,
+    Json(mut req): Json<UpdateAutomationRequest>,
+) -> Result<Response, ApiError> {
+    req.expected_revision = req.expected_revision.or(query.expected_revision);
+    automation_mutation(
+        &state,
+        &headers,
+        &format!("PATCH /v1/automations/{id}"),
+        &req,
+        StatusCode::OK,
+        map_automation_err,
+        async { state.automations.lock().await.update_automation(&id, req.clone()) },
+    )
+    .await
 }
 
 async fn delete_automation(
@@ -6739,32 +6901,83 @@ async fn delete_automation(
 async fn run_automation(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
-) -> Result<Json<AutomationRunRecord>, ApiError> {
-    // run_now_shared drops the manager mutex across the task-manager await so
-    // other automation endpoints stay responsive behind a slow enqueue.
-    let run =
-        crate::automation_manager::run_now_shared(&state.automations, &id, &state.task_manager)
-            .await
-            .map_err(map_automation_err)?;
-    Ok(Json(run))
+    Query(query): Query<AutomationPreconditionQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    automation_mutation(
+        &state,
+        &headers,
+        &format!("POST /v1/automations/{id}/run"),
+        &query.expected_revision,
+        StatusCode::OK,
+        map_automation_err,
+        crate::automation_manager::run_now_shared_if(
+            &state.automations,
+            &id,
+            query.expected_revision,
+            &state.task_manager,
+        ),
+    )
+    .await
+}
+
+async fn set_automation_status(
+    state: RuntimeApiState,
+    id: String,
+    query: AutomationPreconditionQuery,
+    headers: HeaderMap,
+    action: &str,
+    status: crate::automation_manager::AutomationStatus,
+) -> Result<Response, ApiError> {
+    let req = UpdateAutomationRequest {
+        status: Some(status),
+        expected_revision: query.expected_revision,
+        ..UpdateAutomationRequest::default()
+    };
+    automation_mutation(
+        &state,
+        &headers,
+        &format!("POST /v1/automations/{id}/{action}"),
+        &query.expected_revision,
+        StatusCode::OK,
+        map_automation_err,
+        async { state.automations.lock().await.update_automation(&id, req) },
+    )
+    .await
 }
 
 async fn pause_automation(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
-) -> Result<Json<AutomationRecord>, ApiError> {
-    let manager = state.automations.lock().await;
-    let automation = manager.pause_automation(&id).map_err(map_automation_err)?;
-    Ok(Json(automation))
+    Query(query): Query<AutomationPreconditionQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    set_automation_status(
+        state,
+        id,
+        query,
+        headers,
+        "pause",
+        crate::automation_manager::AutomationStatus::Paused,
+    )
+    .await
 }
 
 async fn resume_automation(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
-) -> Result<Json<AutomationRecord>, ApiError> {
-    let manager = state.automations.lock().await;
-    let automation = manager.resume_automation(&id).map_err(map_automation_err)?;
-    Ok(Json(automation))
+    Query(query): Query<AutomationPreconditionQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    set_automation_status(
+        state,
+        id,
+        query,
+        headers,
+        "resume",
+        crate::automation_manager::AutomationStatus::Active,
+    )
+    .await
 }
 
 async fn list_automation_runs(
@@ -12491,6 +12704,14 @@ impl ApiError {
     fn gone(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::GONE,
+            message: message.into(),
+            code: None,
+        }
+    }
+
+    fn unprocessable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
             message: message.into(),
             code: None,
         }

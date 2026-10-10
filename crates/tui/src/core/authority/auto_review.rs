@@ -8,7 +8,7 @@
 
 pub use crate::core::authority::RunOrigin;
 
-use crate::tui::approval::{RiskLevel, ToolCategory, classify_risk, get_tool_category_for_call};
+use crate::core::authority::{RiskLevel, ToolCategory, classify_risk, get_tool_category_for_call};
 use codewhale_execpolicy::ApprovalMode;
 use serde_json::{Value, json};
 use std::borrow::Cow;
