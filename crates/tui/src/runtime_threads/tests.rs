@@ -16184,7 +16184,7 @@ async fn runtime_approval_disposition_auto_paths_obey_force_and_posture() -> Res
         if approved && posture == "ask" {
             assert_eq!(decided.payload["grant_id"], grant.unwrap().grant_id);
         } else {
-            assert!(decided.payload.get("grant_id").is_none());
+            assert!(decided.payload.get("grant_id").is_none_or(serde_json::Value::is_null));
         }
         let approval_id = decided.payload["approval_id"]
             .as_str()
