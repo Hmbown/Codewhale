@@ -120,6 +120,7 @@ pub mod underwater;
 pub mod user_input;
 pub mod views;
 pub mod vim_mode;
+pub mod whale_v2;
 pub mod whales;
 pub mod widgets;
 pub mod window_control;
