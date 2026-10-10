@@ -225,8 +225,19 @@ impl Engine {
         event: Event,
         withdraw: Option<&CancellationToken>,
     ) -> Result<ApprovalResult, ToolError> {
-        self.commit_approval_receipt(ApprovalReceipt::asked(tool_id, tool_name))
-            .await?;
+        let ask = match &event {
+            Event::ApprovalRequired {
+                input, description, ..
+            } => ApprovalReceipt::asked_with(
+                tool_id,
+                tool_name,
+                input,
+                description,
+                &self.session.workspace,
+            ),
+            _ => ApprovalReceipt::asked(tool_id, tool_name),
+        };
+        self.commit_approval_receipt(ask).await?;
         if self
             .child_host
             .as_ref()
