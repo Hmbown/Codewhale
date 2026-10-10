@@ -1474,9 +1474,9 @@ dependencies = [
 
 [[package]]
 name = "corcovado"
-version = "0.5.26"
+version = "0.5.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e45f2bbf4ac5607509b654e991e80757ba3681642e81e57c21e137e5e8fa28c4"
+checksum = "aac575a85cf04f046f88f7daf6ef350ebf79545ae54fe9bb081efbb638ed3194"
 dependencies = [
  "libc",
  "miow 0.5.0",
@@ -4679,9 +4679,9 @@ dependencies = [
 
 [[package]]
 name = "rio-grapheme-width"
-version = "0.5.26"
+version = "0.5.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6b193490a94a1273f093c3cc38ac936b56a6d035b106834df3885bd9386403a"
+checksum = "5a901dda1fe16da68fbe8788db5f2b4525f95b43f064618d2bb6c7361c4e9150"
 dependencies = [
  "phf 0.13.1",
  "ucd-trie",
@@ -4689,9 +4689,9 @@ dependencies = [
 
 [[package]]
 name = "rio-graphics"
-version = "0.5.26"
+version = "0.5.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b088ba47933b5e9f0c96596a8ccf91fb689682dcbcee16fd0e08ff5bf42a05f"
+checksum = "40bdcb0a124c88c7e75a4f2b2953b158981bf541613b4b0146e21d07f4a104ac"
 dependencies = [
  "rustc-hash",
  "tracing",
@@ -4700,15 +4700,15 @@ dependencies = [
 
 [[package]]
 name = "rio-unicode"
-version = "0.5.26"
+version = "0.5.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc82053a58d5488dee8f14c7279f8c905d935e58a309aa32f2ec5b311694229d"
+checksum = "48266e8c525eb4fb8d3ad899e1a050404fb782f876cad2df800dd5455126a99b"
 
 [[package]]
 name = "rio-vt"
-version = "0.5.26"
+version = "0.5.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26e0107383748c79f096674a343953ff527d13eacafc581cc123e8888679c3fd"
+checksum = "3f80220ae32041e4cef8719cab57d3579cbe0dc26dd1cb1ca0693f85491e1696"
 dependencies = [
  "base64 0.23.1",
  "bitflags 2.13.1",
@@ -5689,9 +5689,9 @@ dependencies = [
 
 [[package]]
 name = "teletypewriter"
-version = "0.5.26"
+version = "0.5.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27e0d23d9a3f318ac8f04026cdeac320befdb4f265f5a6f7c488f41431360b43"
+checksum = "edbf8e5a8f36cd22c3092b4895a1c5b41b9748e63ef92030b0353b1e05531e46"
 dependencies = [
  "corcovado",
  "dirs 6.0.0",
