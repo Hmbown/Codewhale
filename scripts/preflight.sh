@@ -5,7 +5,8 @@
 #   scripts/preflight.sh            regenerate what can be regenerated, check the rest
 #   scripts/preflight.sh --check    change nothing; fail if anything is stale
 #   scripts/preflight.sh --full     also run the cargo-backed runtime-contract and
-#                                   persistence-backlog ratchets (minutes, offline)
+#                                   persistence-backlog ratchets and the two
+#                                   version-stamped fixture tests (minutes, offline)
 #   scripts/preflight.sh --base REF compare feature receipts against REF
 #                                   (default: merge base with origin/main)
 #
@@ -81,6 +82,10 @@ if [[ "${full}" == "1" ]]; then
   step "persistence-backlog budget" \
     "python3 scripts/check-persistence-backlog-budget.py --update" \
     python3 scripts/check-persistence-backlog-budget.py
+  step "version-stamped fixtures" \
+    "regenerate the stale fixture the failing test names, then commit it" \
+    scripts/dev-cargo.sh nextest run --locked --lib -p codewhale-config -p codewhale-tui \
+    -E 'test(golden_providers_export_matches_registry) | test(status_public_output_and_read_only_state_match_baseline)'
 fi
 
 if [[ -z "${base}" ]]; then

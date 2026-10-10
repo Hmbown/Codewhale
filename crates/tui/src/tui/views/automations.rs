@@ -881,6 +881,7 @@ mod tests {
             updated_at: at,
             next_run_at: Some(at),
             last_run_at: None,
+            revision: 0,
         }
     }
 
