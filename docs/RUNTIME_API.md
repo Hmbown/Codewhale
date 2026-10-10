@@ -1694,6 +1694,28 @@ Create and update requests accept an optional `model`. When present, each
 scheduled or manually triggered run uses that model; omitting it keeps the
 runtime's default task model.
 
+**Automation mutation preconditions.** `GET /v1/runtime/info` advertises
+`capabilities.automation_mutation_preconditions: true`; require it before
+relying on the behavior below (older Engines ignore both inputs).
+
+- Every `AutomationRecord` carries an integer `revision`: `1` on create, `+1`
+  on each `PATCH`, `pause` and `resume`; legacy records read as `0`. Scheduler
+  bookkeeping (`next_run_at`, `last_run_at`) does not change it.
+- `expected_revision` is an optional precondition on `PATCH`, `run`, `pause`
+  and `resume`: a JSON body field on `PATCH`, or the `?expected_revision=N`
+  query parameter on any of the four. On mismatch nothing is written and the
+  response is `409` with
+  `{"error":{"code":"revision_conflict","current_revision":N,...}}`. Omitting
+  it behaves as before.
+- `Idempotency-Key` (1-255 visible ASCII characters) is optional on `POST
+  /v1/automations`, `PATCH`, `run`, `pause` and `resume`. The first successful
+  response (2xx) is persisted in `idempotency.json` beside the automation
+  store, bounded to 1024 entries and a 24 hour TTL. A retry with the same key
+  and identical request returns the stored status and body with
+  `Idempotency-Replayed: true` and performs no second create or run. The same
+  key with a different request is `422` `idempotency_key_reuse`. Failed
+  attempts are not stored, so they can be retried. `DELETE` is not covered.
+
 **Operate** (always-on named operation; same `OperateRecord` as CWC
 `20de981` / PR #284)
 

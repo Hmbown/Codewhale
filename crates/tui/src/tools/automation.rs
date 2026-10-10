@@ -474,6 +474,7 @@ impl AutomationTool {
             auto_approve,
             delivery_mode: optional_delivery_mode(input)?,
             status,
+            expected_revision: None,
         };
         let automation = manager
             .update_automation(id, req)
