@@ -8706,13 +8706,24 @@ async fn list_goals(
             .map_err(|_| ApiError::bad_request(format!("unknown goal status '{raw}'")))?,
         ),
     };
+    let status_key = query.status.as_deref().unwrap_or("-");
     let after = match query.cursor.as_deref() {
         None => None,
         Some(raw) => {
-            let (updated_at, thread_id) = raw
-                .split_once(':')
-                .and_then(|(at, id)| Some((at.parse::<i64>().ok()?, id.to_string())))
-                .ok_or_else(|| ApiError::bad_request("invalid cursor"))?;
+            let mut parts = raw.splitn(3, ':');
+            let (cursor_status, updated_at, thread_id) = match (
+                parts.next(),
+                parts.next().and_then(|at| at.parse::<i64>().ok()),
+                parts.next(),
+            ) {
+                (Some(cursor_status), Some(at), Some(id)) => (cursor_status, at, id.to_string()),
+                _ => return Err(ApiError::bad_request("invalid cursor")),
+            };
+            if cursor_status != status_key {
+                return Err(ApiError::bad_request(
+                    "cursor does not match the status filter",
+                ));
+            }
             Some((updated_at, thread_id))
         }
     };
@@ -8733,11 +8744,21 @@ async fn list_goals(
                 || (goal.updated_at == updated_at && goal.thread_id > thread_id)
         });
     }
-    let next_cursor = (goals.len() > limit).then(|| {
-        let last = &goals[limit - 1];
-        format!("{}:{}", last.updated_at, last.thread_id)
+    let mut page = Vec::with_capacity(limit.min(goals.len()) + 1);
+    for goal in goals {
+        if state.runtime_threads.thread_exists(&goal.thread_id).await {
+            page.push(goal);
+            if page.len() > limit {
+                break;
+            }
+        }
+    }
+    let next_cursor = (page.len() > limit).then(|| {
+        let last = &page[limit - 1];
+        format!("{status_key}:{}:{}", last.updated_at, last.thread_id)
     });
-    goals.truncate(limit);
+    page.truncate(limit);
+    let goals = page;
     Ok(Json(GoalsPage { goals, next_cursor }))
 }
 

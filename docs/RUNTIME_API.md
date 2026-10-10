@@ -1063,7 +1063,7 @@ and live state comes only from a resumed thread's SSE stream.
   `{"goals": [ThreadGoal...], "next_cursor": "<opaque>"}`; `next_cursor` is
   absent on the last page. `limit` is 1-200 (default 50); `status` is one of
   `active`, `paused`, `blocked`, `usage_limited`, `budget_limited`, `complete`;
-  a bad `status` or `cursor` is `400`. Same auth as every other `/v1` read.
+  goals whose thread no longer exists are omitted; a bad `status` or `cursor`, or a cursor issued under a different `status`, is `400`. Same auth as every other `/v1` read.
   Goal creation, completion and removal stay on `/v1/threads/{id}/goal`.
 - `GET /v1/threads/{id}/notices`
 - `DELETE /v1/threads/{id}/notices/{notice_id}`
