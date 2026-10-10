@@ -1135,6 +1135,7 @@ pub(crate) async fn handle_mcp_ui_action(
                 // the reload-started line.
                 app.mcp_reload_required = false;
                 app.mcp_reload_in_flight = true;
+                app.mcp_initializing = true;
                 if is_reload {
                     add_mcp_message(
                         app,

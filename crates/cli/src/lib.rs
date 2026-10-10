@@ -2618,6 +2618,9 @@ fn run() -> Result<()> {
             )
         }
         Some(Commands::Config(args)) => {
+            if let Some(profile) = cli.profile.as_deref() {
+                require_config_profile(store.path(), profile)?;
+            }
             let resolved_runtime =
                 resolve_runtime_for_diagnostic_dispatch(&store, &runtime_overrides);
             let session = start_cli_telemetry(
@@ -5231,6 +5234,28 @@ fn run_auth_migrate(store: &mut ConfigStore, secrets: &Secrets, dry_run: bool) -
         eprintln!("warning: {w}");
     }
     Ok(())
+}
+
+fn require_config_profile(path: &Path, profile: &str) -> Result<()> {
+    let table = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Table>(&text).ok());
+    let mut available = table
+        .as_ref()
+        .and_then(|table| table.get("profiles"))
+        .and_then(toml::Value::as_table)
+        .map(|profiles| profiles.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if available.iter().any(|name| name == profile) {
+        return Ok(());
+    }
+    available.sort();
+    let available = if available.is_empty() {
+        "none".to_string()
+    } else {
+        available.join(", ")
+    };
+    bail!("Profile not found (name not shown). Available profiles: {available}")
 }
 
 fn run_config_command(

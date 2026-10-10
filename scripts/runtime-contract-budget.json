@@ -90,9 +90,9 @@
     "modes": {
       "act": {
         "active": {
-          "bytes": 37873,
+          "bytes": 37703,
           "identity_sha256": "e2d6dfb7168d48ee8d2a415feac7ff5b8864e18528c233a697055370144eb138",
-          "tokens_est": 9469,
+          "tokens_est": 9426,
           "tool_names": [
             "agent",
             "bash",
@@ -112,9 +112,9 @@
           "tools": 14
         },
         "full": {
-          "bytes": 85363,
-          "identity_sha256": "928e6417732837d26f1f26fe41ea6a11f5b8e3bfc4eeb3dd97a309379cffeff9",
-          "tokens_est": 21341,
+          "bytes": 84384,
+          "identity_sha256": "2a2ee97e7c482c625bc50c77db7f0e08d6bc67e2b4e73e7351385418700252bb",
+          "tokens_est": 21096,
           "tool_names": [
             "Git",
             "Run",
@@ -151,7 +151,6 @@
             "session_get",
             "session_search",
             "speech",
-            "task_shell_start",
             "task_shell_wait",
             "tasks",
             "terminal/cancel",
@@ -169,14 +168,14 @@
             "workflow",
             "write"
           ],
-          "tools": 52
+          "tools": 51
         }
       },
       "operate": {
         "active": {
-          "bytes": 37873,
+          "bytes": 37703,
           "identity_sha256": "e2d6dfb7168d48ee8d2a415feac7ff5b8864e18528c233a697055370144eb138",
-          "tokens_est": 9469,
+          "tokens_est": 9426,
           "tool_names": [
             "agent",
             "bash",
@@ -196,9 +195,9 @@
           "tools": 14
         },
         "full": {
-          "bytes": 85363,
-          "identity_sha256": "928e6417732837d26f1f26fe41ea6a11f5b8e3bfc4eeb3dd97a309379cffeff9",
-          "tokens_est": 21341,
+          "bytes": 84384,
+          "identity_sha256": "2a2ee97e7c482c625bc50c77db7f0e08d6bc67e2b4e73e7351385418700252bb",
+          "tokens_est": 21096,
           "tool_names": [
             "Git",
             "Run",
@@ -235,7 +234,6 @@
             "session_get",
             "session_search",
             "speech",
-            "task_shell_start",
             "task_shell_wait",
             "tasks",
             "terminal/cancel",
@@ -253,14 +251,14 @@
             "workflow",
             "write"
           ],
-          "tools": 52
+          "tools": 51
         }
       },
       "plan": {
         "active": {
-          "bytes": 36343,
+          "bytes": 36173,
           "identity_sha256": "6c432c75bf776d95b367b17308b171c3eaba8e70aa0c2f76bac453b3c3368a21",
-          "tokens_est": 9086,
+          "tokens_est": 9044,
           "tool_names": [
             "agent",
             "bash",
@@ -279,9 +277,9 @@
           "tools": 13
         },
         "full": {
-          "bytes": 55333,
+          "bytes": 55163,
           "identity_sha256": "ac8af1f4988199825be7b00b054c258724a44074b1d4e6de6c92ade7c1cffe63",
-          "tokens_est": 13834,
+          "tokens_est": 13791,
           "tool_names": [
             "Git",
             "Web",
