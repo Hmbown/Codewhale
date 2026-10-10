@@ -33,6 +33,9 @@ tower-http.workspace = true
 tracing.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 uuid.workspace = true
+# The store-derived control endpoint hashes the runtime store root
+# (`daemon_socket::store_selected_socket_path`).
+sha2.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true
@@ -40,5 +43,4 @@ tempfile.workspace = true
 tower = "0.5"
 
 [target.'cfg(windows)'.dependencies]
-sha2.workspace = true
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_Pipes"] }

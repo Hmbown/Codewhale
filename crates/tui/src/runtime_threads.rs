@@ -4860,6 +4860,23 @@ fn runtime_dir_override() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The canonicalized runtime-dir override, when one is set.
+///
+/// The control plane derives its endpoint from the same selection the store
+/// uses (`daemon_socket::store_selected_socket_path`), so a non-default store
+/// never shares the default owner's socket. Canonicalized through
+/// [`checked_runtime_store_root`] so an aliased, relative or `..`-bearing
+/// override cannot fork a second owner silently, and the same path the store
+/// is compared against later. An unresolvable override is an error, not a
+/// silent `None`: falling back would hand the caller the default endpoint for
+/// a store that is not the default one.
+#[cfg(unix)]
+pub(crate) fn canonical_runtime_dir_override() -> Result<Option<PathBuf>> {
+    runtime_dir_override()
+        .map(checked_runtime_store_root)
+        .transpose()
+}
+
 fn default_runtime_store_root(task_data_dir: &Path, session_id: Option<&str>) -> PathBuf {
     match session_id
         .map(str::trim)
@@ -19650,7 +19667,7 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-fn checked_runtime_store_root(root: PathBuf) -> Result<PathBuf> {
+pub(crate) fn checked_runtime_store_root(root: PathBuf) -> Result<PathBuf> {
     if root.as_os_str().is_empty() {
         bail!("Runtime store root cannot be empty");
     }

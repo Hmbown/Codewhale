@@ -162,6 +162,7 @@ mod voice;
 mod work_graph;
 mod worker_profile;
 mod working_set;
+mod workspace_lease;
 mod workspace_trust;
 
 use crate::config::{
