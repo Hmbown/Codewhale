@@ -52,15 +52,11 @@ pub(super) enum ApprovalDecision {
     },
     /// The interactive card expired unanswered (#6101): the configured
     /// bound denied the call, not the operator.
-    TimedOut {
-        id: String,
-    },
+    TimedOut { id: String },
     /// The request could not be put in front of a person — it belonged to a
     /// turn that had already ended or been cancelled locally, or to another
     /// conversation. Recorded as `unavailable`, never as the person's denial.
-    Unavailable {
-        id: String,
-    },
+    Unavailable { id: String },
     /// Retry a tool with an elevated sandbox policy.
     RetryWithPolicy {
         id: String,

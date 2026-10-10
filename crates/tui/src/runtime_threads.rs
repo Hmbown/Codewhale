@@ -17648,19 +17648,19 @@ impl RuntimeThreadManager {
                         }
                     };
                     let grant_class = grant_tool_class(&tool_name);
-                    let grant_verdict = self.grants.evaluate(
-                        &crate::core::authority::grants::GrantQuery {
-                            thread_id: &thread_id,
-                            workspace_id: &grant_workspace_id,
-                            origin: crate::core::authority::grants::GrantOrigin::Interactive,
-                            posture: grant_posture,
-                            tool_class: &grant_class,
-                            exact_digest: &approval_key,
-                            grouping_key: &approval_grouping_key,
-                            argv: &[],
-                            net_host: None,
-                        },
-                    );
+                    let grant_verdict =
+                        self.grants
+                            .evaluate(&crate::core::authority::grants::GrantQuery {
+                                thread_id: &thread_id,
+                                workspace_id: &grant_workspace_id,
+                                origin: crate::core::authority::grants::GrantOrigin::Interactive,
+                                posture: grant_posture,
+                                tool_class: &grant_class,
+                                exact_digest: &approval_key,
+                                grouping_key: &approval_grouping_key,
+                                argv: &[],
+                                net_host: None,
+                            });
                     let (grant, deny_grant) = match grant_verdict {
                         crate::core::authority::grants::GrantVerdict::Allow(grant) => {
                             (Some(grant), None)
