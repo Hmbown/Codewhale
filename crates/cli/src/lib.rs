@@ -217,7 +217,7 @@ enum Commands {
     #[command(
         visible_alias = "receipt",
         override_usage = "codewhale receipts [ID|--last] [--format <md|json>]",
-        after_help = "Options:\n      --last             Show the most recent session\n      --format <FORMAT>  Output format: md or json\n\nID is a saved session id or prefix; `codewhale sessions` lists them."
+        after_help = "Receipt options:\n      --last             Show the most recent session\n      --format <FORMAT>  Output format: md or json\n\nID is a saved session id or prefix; `codewhale sessions` lists them."
     )]
     Receipts(TuiPassthroughArgs),
     /// Resume a saved session.
