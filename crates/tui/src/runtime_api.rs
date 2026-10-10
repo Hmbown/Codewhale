@@ -5624,6 +5624,10 @@ struct ApprovalHistoryRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
     outcome: String,
+    /// `allow` or `deny` when a standing session rule or grant answered the
+    /// ask rather than a person; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    standing_rule: Option<&'static str>,
     /// Who resolved it: `user`, `session_rule`, `posture`, or `host`.
     /// Absent while pending and on records written before deciders were kept.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5632,15 +5636,15 @@ struct ApprovalHistoryRow {
     decided_at: Option<chrono::DateTime<Utc>>,
 }
 
-fn approval_row_outcome(
+fn approval_row_standing_rule(
     outcome: &crate::approval_log::ApprovalOutcome,
     decided_by: Option<crate::approval_log::ApprovalDecider>,
-) -> &'static str {
+) -> Option<&'static str> {
     use crate::approval_log::{ApprovalDecider, ApprovalOutcome};
     match (outcome, decided_by) {
-        (ApprovalOutcome::ApprovedOnce, Some(ApprovalDecider::SessionRule)) => "always_allow",
-        (ApprovalOutcome::Denied, Some(ApprovalDecider::SessionRule)) => "blocked",
-        _ => approval_outcome_label(outcome),
+        (ApprovalOutcome::ApprovedOnce, Some(ApprovalDecider::SessionRule)) => Some("allow"),
+        (ApprovalOutcome::Denied, Some(ApprovalDecider::SessionRule)) => Some("deny"),
+        _ => None,
     }
 }
 
@@ -5670,7 +5674,8 @@ fn approval_history_rows(replay: &crate::approval_log::ApprovalReplay) -> Vec<Ap
                 tool_name: completed.ask.tool_name().unwrap_or("unknown").to_string(),
                 target: completed.ask.target().map(str::to_string),
                 summary: completed.ask.summary().map(str::to_string),
-                outcome: approval_row_outcome(&completed.outcome, completed.decided_by).to_string(),
+                outcome: approval_outcome_label(&completed.outcome).to_string(),
+                standing_rule: approval_row_standing_rule(&completed.outcome, completed.decided_by),
                 decided_by: completed.decided_by,
                 asked_at,
                 decided_at: Some(completed.decided_at),
@@ -5682,6 +5687,7 @@ fn approval_history_rows(replay: &crate::approval_log::ApprovalReplay) -> Vec<Ap
             target: ask.target().map(str::to_string),
             summary: ask.summary().map(str::to_string),
             outcome: "pending".to_string(),
+            standing_rule: None,
             decided_by: None,
             asked_at: ask.created_at(),
             decided_at: None,

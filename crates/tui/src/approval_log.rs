@@ -160,51 +160,113 @@ fn cap_ask_text(text: &str) -> Option<String> {
     Some(format!("{head}…"))
 }
 
-fn relativize(text: &str, workspace: &Path) -> String {
+fn safe_path(token: &str, workspace: &Path) -> String {
     let root = workspace.to_string_lossy();
     let root = root.trim_end_matches('/');
-    if root.is_empty() {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find(root) {
-        let after = &rest[at + root.len()..];
-        if after.is_empty() || after.starts_with('/') {
-            out.push_str(&rest[..at]);
-            out.push('.');
-        } else {
-            out.push_str(&rest[..at + root.len()]);
+    if !root.is_empty()
+        && let Some(rest) = token.strip_prefix(root)
+    {
+        if rest.is_empty() {
+            return ".".to_string();
         }
-        rest = after;
+        if rest.starts_with('/') {
+            return format!(".{rest}");
+        }
     }
-    out.push_str(rest);
-    out
+    if token.starts_with('/') || token.starts_with('~') {
+        let base = token.rsplit('/').find(|part| !part.is_empty()).unwrap_or("");
+        return format!(".../{base}");
+    }
+    token.to_string()
 }
 
-fn mask_env_assignments(text: &str) -> String {
-    text.split(' ')
-        .map(|word| match word.split_once('=') {
-            Some((key, value))
-                if !value.is_empty()
-                    && key
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                    && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
-            {
-                format!("{key}=[redacted]")
+fn split_shell_words(text: &str) -> Vec<&str> {
+    let mut words = Vec::new();
+    let mut start = None;
+    let mut quote: Option<char> = None;
+    for (at, c) in text.char_indices() {
+        match (quote, c) {
+            (Some(q), _) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'' | '`') => {
+                quote = Some(c);
+                start.get_or_insert(at);
             }
-            _ => word.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+            (None, c) if c.is_whitespace() => {
+                if let Some(s) = start.take() {
+                    words.push(&text[s..at]);
+                }
+            }
+            _ => {
+                start.get_or_insert(at);
+            }
+        }
+    }
+    if let Some(s) = start {
+        words.push(&text[s..]);
+    }
+    words
 }
 
-fn redact_ask_text(text: &str, workspace: &Path) -> Option<String> {
-    let masked = mask_env_assignments(text);
-    let (redacted, _) = crate::session_peek::redact(&masked);
-    cap_ask_text(&relativize(&redacted, workspace))
+fn plain_word(word: &str) -> bool {
+    const SENSITIVE: [&str; 11] = [
+        "pass", "token", "secret", "key", "auth", "cred", "user", "cookie", "bearer", "header",
+        "private",
+    ];
+    if word.is_empty() || word.chars().count() > 64 {
+        return false;
+    }
+    if !word
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "_./~+,%-".contains(c))
+    {
+        return false;
+    }
+    if let Some(flag) = word.strip_prefix("--") {
+        let lower = flag.to_ascii_lowercase();
+        return !flag.is_empty() && !SENSITIVE.iter().any(|s| lower.contains(s));
+    }
+    if let Some(flag) = word.strip_prefix('-') {
+        return word.len() > 1 && flag.len() == 1 && "alrRfnvih".contains(flag);
+    }
+    true
+}
+
+fn redact_ask_text(text: &str, workspace: &Path, command: bool) -> Option<String> {
+    let words = split_shell_words(text);
+    let redacted = if command {
+        let program = words.first().copied().filter(|w| plain_word(w));
+        match program {
+            None => "[command redacted]".to_string(),
+            Some(program) => {
+                let name = safe_path(program, workspace);
+                let name = name.rsplit('/').next().unwrap_or(&name).to_string();
+                let rest = &words[1..];
+                if rest.iter().all(|w| plain_word(w)) {
+                    let mut out = vec![name];
+                    out.extend(rest.iter().map(|w| safe_path(w, workspace)));
+                    out.join(" ")
+                } else {
+                    format!("{name} [args redacted]")
+                }
+            }
+        }
+    } else {
+        words
+            .iter()
+            .map(|w| {
+                if plain_word(w) || w.chars().all(|c| c.is_alphanumeric() || ".,:;()".contains(c))
+                {
+                    safe_path(w, workspace)
+                } else {
+                    "[redacted]".to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let (redacted, _) = crate::session_peek::redact(&redacted);
+    cap_ask_text(&redacted)
 }
 
 fn ask_target(input: &serde_json::Value, workspace: &Path) -> Option<String> {
@@ -218,19 +280,25 @@ fn ask_target(input: &serde_json::Value, workspace: &Path) -> Option<String> {
     }
     for key in ["path", "file_path", "filepath", "filename"] {
         if let Some(raw) = input.get(key).and_then(|v| v.as_str()) {
-            return redact_ask_text(raw, workspace);
+            let raw = raw.trim();
+            if raw.is_empty() || raw.contains(char::is_whitespace) {
+                return redact_ask_text(raw, workspace, false);
+            }
+            return cap_ask_text(&safe_path(raw, workspace));
         }
     }
     None
 }
 
 fn ask_summary(input: &serde_json::Value, description: &str, workspace: &Path) -> Option<String> {
-    let source = input
+    match input
         .get("command")
         .and_then(|v| v.as_str())
         .filter(|c| !c.trim().is_empty())
-        .unwrap_or(description);
-    redact_ask_text(source, workspace)
+    {
+        Some(command) => redact_ask_text(command, workspace, true),
+        None => redact_ask_text(description, workspace, false),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

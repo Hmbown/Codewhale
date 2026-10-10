@@ -1340,14 +1340,16 @@ Each history row carries `approval_id`, `tool_name`, `outcome`, `asked_at` and
 `decided_at` (null while pending), plus optional `decided_by` (`user`,
 `session_rule`, `posture`, `host`), `target` and `summary`. `outcome` is one of
 `allowed_once`, `denied`, `timeout`, `cancelled`, `unavailable`,
-`retry_with_policy`, `pending`, or the standing-rule outcomes `always_allow` and
-`blocked`: an approval or denial answered by a remembered session rule rather
-than a person (`decided_by: session_rule`). `target` is the host of a URL or a
-workspace-relative path; `summary` is a one-line description of what was asked
-(the shell command when there is one). Both are redacted when the ask is
-recorded: `KEY=VALUE` words become `KEY=[redacted]`, credentials, tokens and URL
-userinfo are masked, the workspace root becomes `.`, whitespace is collapsed and
-text is capped at 120 characters. Rows recorded before these fields existed
+`retry_with_policy`, or `pending`. `standing_rule` (`allow` or `deny`) is present
+only when a remembered session rule or grant answered rather than a person
+(`decided_by: session_rule`); `outcome` is unchanged. `target` is the host of a
+URL or a workspace-relative path (absolute paths outside the workspace are
+reduced to `.../<basename>`); `summary` is a one-line description of what was
+asked. Both are redacted conservatively when the ask is recorded: a shell
+command keeps only the program name and plain arguments, and any quoted,
+`KEY=VALUE`, credential-like or unrecognised argument replaces all arguments
+with `[args redacted]`. Whitespace is collapsed and text is capped at 120
+characters. Rows recorded before these fields existed
 omit `target` and `summary`.
 
 `approval_id` is minted by the Runtime, not by the model or the provider. It is
