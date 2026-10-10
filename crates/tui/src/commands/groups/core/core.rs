@@ -150,9 +150,16 @@ fn user_command_help(
 /// Clear conversation history
 pub fn clear(app: &mut App) -> CommandResult {
     if app.session_transition_blocked() {
-        return CommandResult::error(
-            tr(app.ui_locale, MessageId::ClearConversationBusy).to_string(),
-        );
+        // The same gate the lifecycle commands consult, so the refusal owes
+        // the same explanation. The sentence stays localized; a blocker row
+        // is data (id, status, elapsed, summary) and is not translated
+        // anywhere else either.
+        let mut message = tr(app.ui_locale, MessageId::ClearConversationBusy).to_string();
+        for blocker in app.session_transition_blockers() {
+            message.push_str("\n  • ");
+            message.push_str(&blocker);
+        }
+        return CommandResult::error(message);
     }
     let new_id = uuid::Uuid::new_v4().to_string();
     let queue_transition = match crate::tui::ui::prepare_offline_queue_transition(app, &new_id) {
