@@ -2556,6 +2556,7 @@ mod tests {
             title: "refactor the parser".to_string(),
             updated_at: chrono::Utc::now(),
             message_count: 12,
+            interrupted: false,
         }];
         app.launch.row_hitboxes = vec![(
             crate::tui::app::LaunchRowId::Recent("sess-1".to_string()),

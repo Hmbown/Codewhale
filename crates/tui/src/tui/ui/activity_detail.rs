@@ -275,7 +275,18 @@ const RAW_DETAIL_PAGER_INTRO: &str =
     "Raw detail for the selected item — press Ctrl+Alt+O for the whole-turn overview.";
 
 pub(super) fn open_tool_details_pager(app: &mut App) -> bool {
-    let target_cell = detail_target_cell_index(app);
+    let target_cell = if app
+        .viewport
+        .transcript_selection
+        .ordered_endpoints()
+        .is_some()
+    {
+        detail_target_cell_index(app)
+    } else {
+        crate::tui::shell_job_routing::newest_running_shell_cell(app)
+            .filter(|&idx| crate::tui::shell_job_routing::shell_job_for_cell(app, idx).is_some())
+            .or_else(|| detail_target_cell_index(app))
+    };
 
     let Some(cell_index) = target_cell else {
         app.status_message = Some(NO_RAW_DETAIL_HINT.to_string());
@@ -389,6 +400,16 @@ fn canonical_owned_file(
 }
 
 pub(crate) fn open_details_pager_for_cell(app: &mut App, cell_index: usize) -> bool {
+    if app.cell_at_virtual_index(cell_index).is_some_and(|cell| {
+        matches!(
+            cell,
+            HistoryCell::Tool(ToolCell::Exec(exec)) if exec.status == ToolStatus::Running
+        )
+    }) && let Some(detail) = crate::tui::shell_job_routing::shell_job_for_cell(app, cell_index)
+    {
+        crate::tui::shell_job_routing::open_shell_job_pager(app, &detail);
+        return true;
+    }
     if let Some(detail) = app.tool_detail_record_for_cell(cell_index) {
         let input = serde_json::to_string_pretty(&detail.input)
             .unwrap_or_else(|_| detail.input.to_string());

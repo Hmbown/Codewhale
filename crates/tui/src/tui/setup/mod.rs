@@ -644,16 +644,17 @@ impl SetupRuntimePreset {
 
     pub fn permission_posture(self) -> &'static str {
         match self {
-            Self::AskFirst | Self::NormalAgent => "ask",
-            Self::HighTrustLocal => "full-access",
+            Self::AskFirst | Self::NormalAgent | Self::HighTrustLocal => "ask",
         }
+    }
+
+    pub fn full_access_requested(self) -> bool {
+        matches!(self, Self::HighTrustLocal)
     }
 
     pub fn approval_policy(self) -> Option<&'static str> {
         match self {
             Self::AskFirst | Self::NormalAgent => Some("on-request"),
-            // Full Access lives in TUI settings; it is intentionally not a
-            // top-level approval_policy value.
             Self::HighTrustLocal => None,
         }
     }
@@ -676,7 +677,7 @@ impl SetupRuntimePreset {
     pub fn result_summary(self) -> String {
         let approval = self
             .approval_policy()
-            .unwrap_or("unset (Full Access saved in TUI settings)");
+            .unwrap_or("unset (Full Access is confirmed per session)");
         format!(
             "preset={}, default_mode={}, permission_posture={}, approval_policy={}, allow_shell={}, sandbox_mode={}, network=unchanged, trust=unchanged",
             self.id(),
@@ -4229,7 +4230,7 @@ fn runtime_preset_preview_text(
 
 fn runtime_preset_diff_rows(preset: SetupRuntimePreset, facts: &SetupRuntimeFacts) -> Vec<String> {
     let approval_target = preset.approval_policy().map_or_else(
-        || "removed; Full Access comes from settings.permission_posture".to_string(),
+        || "removed; Full Access is confirmed per session".to_string(),
         ToString::to_string,
     );
     let mut rows = vec![

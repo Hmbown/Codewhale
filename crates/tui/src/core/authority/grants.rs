@@ -243,6 +243,9 @@ impl Grant {
         if self.limits.expires_at.is_some_and(|at| at <= now) {
             return Some(GrantState::Expired);
         }
+        if self.effect == GrantEffect::Deny {
+            return None;
+        }
         if let Some(ttl) = self.limits.idle_ttl_secs {
             let base = self.limits.last_used_at.unwrap_or(self.created.at);
             let ttl = Duration::seconds(i64::try_from(ttl).unwrap_or(i64::MAX / 2));
@@ -315,6 +318,8 @@ pub enum GrantError {
     TooBroad,
     #[error("grant store is degraded: {0}")]
     Degraded(String),
+    #[error("a grant needs a non-empty thread or workspace id")]
+    InvalidScope,
     #[error("grant is exhausted, expired or no longer active")]
     NotUsable,
     #[error("grant evidence could not be written: {0}")]
@@ -366,9 +371,34 @@ struct Inner {
     dir: Option<PathBuf>,
     grants: Vec<Grant>,
     degraded: Option<String>,
+    stamp: Option<(std::time::SystemTime, u64)>,
 }
 
 impl Inner {
+    fn file_stamp(&self) -> Option<(std::time::SystemTime, u64)> {
+        let meta = fs::metadata(self.dir.as_ref()?.join(GRANTS_FILE)).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    }
+
+    fn refresh(&mut self) {
+        let Some(dir) = &self.dir else {
+            return;
+        };
+        let stamp = self.file_stamp();
+        if stamp.is_none() || stamp == self.stamp {
+            return;
+        }
+        let Ok(bytes) = fs::read(dir.join(GRANTS_FILE)) else {
+            return;
+        };
+        if let Ok(file) = serde_json::from_slice::<GrantFile>(&bytes)
+            && file.schema_v <= GRANT_SCHEMA_VERSION
+        {
+            self.grants = file.grants;
+            self.stamp = stamp;
+        }
+    }
+
     fn persist(&self, grants: &[Grant], events: &[GrantEvent]) -> std::io::Result<()> {
         let Some(dir) = &self.dir else {
             return Ok(());
@@ -397,6 +427,7 @@ impl Inner {
     fn commit(&mut self, grants: Vec<Grant>, events: Vec<GrantEvent>) -> std::io::Result<()> {
         self.persist(&grants, &events)?;
         self.grants = grants;
+        self.stamp = self.file_stamp();
         Ok(())
     }
 
@@ -405,9 +436,11 @@ impl Inner {
             tracing::warn!(target: "approval", %error, "grant revocation evidence could not be written");
         }
         self.grants = grants;
+        self.stamp = self.file_stamp();
     }
 
     fn sweep(&mut self, now: DateTime<Utc>) {
+        self.refresh();
         let mut grants = self.grants.clone();
         let mut events = Vec::new();
         for grant in &mut grants {
@@ -439,6 +472,7 @@ impl Inner {
         reason: &str,
         tighten: bool,
     ) -> Vec<Grant> {
+        self.refresh();
         let mut grants = self.grants.clone();
         let mut events = Vec::new();
         let mut changed = Vec::new();
@@ -487,30 +521,31 @@ pub struct GrantStore {
 
 impl GrantStore {
     /// Open the file-backed store under `dir`. An unreadable or corrupt store
-    /// is moved aside and treated as holding no grants: the store never
-    /// allows from a file it cannot read.
+    /// is left untouched on disk and the store runs degraded (no grants, no
+    /// writes, see [`Self::degraded_reason`]): it never allows from a file it
+    /// cannot read, and it never overwrites standing denies it could not parse.
     #[must_use]
     pub fn open(dir: &Path) -> Self {
         let mut inner = Inner {
             dir: Some(dir.to_path_buf()),
             grants: Vec::new(),
             degraded: None,
+            stamp: None,
         };
         let path = dir.join(GRANTS_FILE);
         match fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<GrantFile>(&bytes) {
-                Ok(file) if file.schema_v <= GRANT_SCHEMA_VERSION => inner.grants = file.grants,
+                Ok(file) if file.schema_v <= GRANT_SCHEMA_VERSION => {
+                    inner.grants = file.grants;
+                    inner.stamp = inner.file_stamp();
+                }
                 Ok(file) => {
                     inner.degraded = Some(format!("grant store schema {} is newer", file.schema_v));
                     inner.dir = None;
                 }
                 Err(error) => {
-                    let aside = dir.join(format!(
-                        "{GRANTS_FILE}.corrupt-{}",
-                        Utc::now().timestamp_millis()
-                    ));
-                    let _ = fs::rename(&path, aside);
                     inner.degraded = Some(format!("grant store was unreadable: {error}"));
+                    inner.dir = None;
                 }
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -523,7 +558,10 @@ impl GrantStore {
             tracing::warn!(target: "approval", %reason, "standing grants are unavailable; every call asks");
         }
         inner.transition(
-            |grant| matches!(grant.scope, GrantScope::Thread { .. }),
+            |grant| {
+                grant.effect == GrantEffect::Allow
+                    && matches!(grant.scope, GrantScope::Thread { .. })
+            },
             GrantState::Active,
             GrantState::Suspended,
             "suspended",
@@ -536,11 +574,23 @@ impl GrantStore {
         }
     }
 
+    #[must_use]
+    pub fn degraded_reason(&self) -> Option<String> {
+        self.inner.lock().degraded.clone()
+    }
+
     /// Create a grant. Allow grants cannot cover a whole tool class, and an
     /// identical live grant is returned instead of duplicated.
     pub fn create(&self, new: NewGrant) -> Result<Grant, GrantError> {
         if new.effect == GrantEffect::Allow && !new.matcher.narrows_beyond_class() {
             return Err(GrantError::TooBroad);
+        }
+        let empty_id = match &new.scope {
+            GrantScope::Thread { thread_id } => thread_id.is_empty(),
+            GrantScope::Workspace { workspace_id } => workspace_id.is_empty(),
+        };
+        if empty_id {
+            return Err(GrantError::InvalidScope);
         }
         let mut inner = self.inner.lock();
         if let Some(reason) = &inner.degraded
@@ -552,7 +602,7 @@ impl GrantStore {
         inner.sweep(now);
         let matcher_digest = new.matcher.digest();
         if let Some(existing) = inner.grants.iter().find(|grant| {
-            grant.state == GrantState::Active
+            matches!(grant.state, GrantState::Active | GrantState::Suspended)
                 && grant.effect == new.effect
                 && grant.scope == new.scope
                 && grant.matcher_digest == matcher_digest
@@ -560,7 +610,10 @@ impl GrantStore {
             return Ok(existing.clone());
         }
         let mut limits = new.limits;
-        if limits.idle_ttl_secs.is_none() && matches!(new.scope, GrantScope::Workspace { .. }) {
+        if limits.idle_ttl_secs.is_none()
+            && new.effect == GrantEffect::Allow
+            && matches!(new.scope, GrantScope::Workspace { .. })
+        {
             limits.idle_ttl_secs = Some(DEFAULT_WORKSPACE_IDLE_TTL_SECS);
         }
         let grant = Grant {
@@ -611,7 +664,9 @@ impl GrantStore {
             grant.state == GrantState::Active
                 && match &grant.scope {
                     GrantScope::Thread { thread_id } => thread_id == query.thread_id,
-                    GrantScope::Workspace { workspace_id } => workspace_id == query.workspace_id,
+                    GrantScope::Workspace { workspace_id } => {
+                        !workspace_id.is_empty() && workspace_id == query.workspace_id
+                    }
                 }
                 && grant.matcher.matches(query)
         };

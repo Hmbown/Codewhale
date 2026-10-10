@@ -9154,6 +9154,7 @@ async fn patch_thread_accepts_extended_field_set() -> Result<()> {
             "auto_approve": true,
             "model": "deepseek-v4-pro",
             "mode": "yolo",
+            "full_access_confirmation": "session",
             "title": "Whalescale UI test thread",
             "system_prompt": "You are a useful assistant."
         }))

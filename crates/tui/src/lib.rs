@@ -27,7 +27,6 @@ mod auto_reasoning;
 mod automation_manager;
 mod child_env;
 mod client;
-pub mod cloud_dispatch;
 mod codex_model_cache;
 mod commands;
 mod compaction;
@@ -45,7 +44,6 @@ mod credentials;
 /// Guarded installation I/O reusing Engine's confined file primitives.
 pub mod delivery_files;
 mod dependencies;
-pub mod dispatch_runner;
 mod doctor;
 mod doctor_fix;
 mod dsh_credentials;
@@ -143,10 +141,10 @@ use codewhale_release::tls;
 // re-exports; the split deletes it by rewriting these paths to
 // `codewhale_runtime::` (docs/design/TUI_DECONSTRUCTION.md).
 use codewhale_runtime::{
-    computer_meter, context_budget, continual_harness, fast_hash, features, goal_loop, hashing,
-    host_terminal, lane_control, llm_response_cache, logging, media_originals, model_context,
-    native_memory, prompt_zones, regex_cache, resource_telemetry, retry_status, runtime_policy,
-    safe_label, session_tree, skill_state, sleep_guard, startup_trace, tool_history_repair,
+    context_budget, continual_harness, fast_hash, features, goal_loop, hashing, host_terminal,
+    lane_control, llm_response_cache, logging, media_originals, model_context, native_memory,
+    prompt_zones, regex_cache, resource_telemetry, retry_status, runtime_policy, safe_label,
+    session_tree, skill_state, sleep_guard, startup_trace, tool_history_repair,
     workspace_discovery,
 };
 mod todo_snapshot;
@@ -12024,6 +12022,7 @@ async fn run_mcp_command(
                 disabled: false,
                 enabled: true,
                 required: false,
+                lazy: false,
                 enabled_tools: Vec::new(),
                 disabled_tools: Vec::new(),
                 headers: std::collections::HashMap::new(),
@@ -12175,6 +12174,7 @@ async fn run_mcp_command(
                         disabled: false,
                         enabled: true,
                         required: false,
+                        lazy: false,
                         enabled_tools: Vec::new(),
                         disabled_tools: Vec::new(),
                         headers: std::collections::HashMap::new(),
@@ -13513,23 +13513,6 @@ async fn run_interactive_prepared(
             && let Ok(manager) = session_manager::SessionManager::default_location()
         {
             let _ = manager.cleanup_old_sessions_keeping(janitor_resume_id.as_deref());
-        }
-
-        // Cloud-dispatch orphan reconciliation: a previous TUI could quit
-        // (or crash) with a detached cloud-agent runner in flight, leaving
-        // an active job record — and possibly a billing sandbox — behind.
-        // Stale active jobs are failed and torn down, then any
-        // dispatch-labeled sandbox whose job no longer needs it is deleted
-        // by label. Best effort: one bounded listing call when credentials
-        // exist, fail-closed quiet otherwise, never fatal.
-        if let Ok(store) = crate::cloud_dispatch::CloudJobStore::from_env() {
-            let receipt = crate::dispatch_runner::startup_reconcile(
-                &store,
-                &crate::cloud_dispatch::LiveDaytonaLauncher,
-            );
-            if !receipt.is_empty() {
-                logging::info(receipt);
-            }
         }
     });
 
@@ -18906,6 +18889,7 @@ mod doctor_mcp_tests {
             disabled: false,
             enabled: true,
             required: false,
+            lazy: false,
             enabled_tools: Vec::new(),
             disabled_tools: Vec::new(),
             headers: std::collections::HashMap::new(),

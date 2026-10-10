@@ -50,6 +50,7 @@ pub mod footer_hints;
 pub mod footer_ui;
 pub mod format_helpers;
 pub mod frame_rate_limiter;
+pub mod full_access_confirm;
 pub mod gate_receipts;
 pub mod git_mention;
 pub mod glyphs;

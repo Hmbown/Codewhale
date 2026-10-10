@@ -8111,11 +8111,9 @@ impl Engine {
             }
         };
 
-        // Boot is lazy (#6033): a configured server nobody asked for is not
-        // spawned at session start. The eager set is `required` servers plus
-        // whatever the session's explicit tool selections cover; everything
-        // else connects on demand — a selected turn, a `/mcp` connect, or a
-        // lazy tool-name resolution.
+        // Boot connects every configured server in the background except
+        // those marked `lazy = true`, which connect on demand — a selected
+        // turn, a `/mcp` connect, or a lazy tool-name resolution.
         let requested = self.explicit_mcp_tool_names(self.config.allowed_tools.as_deref());
         let (pending, auth_errors, timeouts, network_policy, catalog_generation, backend) = {
             let mut pool = pool.lock().await;

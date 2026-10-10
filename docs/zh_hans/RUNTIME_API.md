@@ -1038,6 +1038,19 @@ fork 还可能包含 `backtrack_depth_from_tail` 与 `dropped_turn_id`，而
 引擎与会话历史被保留，下一个回合会装上新的
 路由。
 
+任何会为尚未处于 Full Access 的线程开启 Full Access 的 `PATCH`（无论通过
+`permission_posture`、`mode` 还是 `auto_approve`）都必须带上
+`full_access_confirmation`（`"session"` 或 `"repo"`）。缺少时请求以 `400`
+失败，消息以 `full_access_confirmation_required` 开头，且什么都不会改变；
+其他取值同样返回 `400`。`"session"` 仅对该线程保持 Full Access。`"repo"`
+还会把该线程的工作区记入已保存的 `full_access_repos` 列表；该写入发生在
+更新线程之前，因此保存失败会拒绝请求并保持线程不变。把线程移出 Full Access
+的 `PATCH` 会像 TUI 一样忘记该工作区的 `full_access_repos` 条目。有效权限发生
+变化时，会在线程最新回合追加一个已完成的 `status` 条目，并发布
+`thread.permissions_changed` 事件（`from`、`to`、`scope`、`source`）。这对此前
+单独发送 `permission_posture: "full-access"` 或旧版 `yolo` 模式的客户端是破坏性
+变更：它们现在必须加上该字段。
+
 **回合**（线程内的）
 - `POST /v1/threads/{id}/turns`
 - `POST /v1/threads/{id}/turns/{turn_id}/steer` - 向进行中的回合注入引导。响应是一份描述实际发生了什么的回执，而不是描述尝试过什么的回执；参见 [引导送达](#引导送达)。

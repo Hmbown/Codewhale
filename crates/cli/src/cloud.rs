@@ -357,7 +357,7 @@ enum CloudAgentsCommand {
         confirm_eu_compute: bool,
         #[arg(
             long,
-            help = "Exact whole seconds printed by work-quote; legacy trial default is 300"
+            help = "Exact whole seconds printed by work-quote; default is what your current offer allows"
         )]
         seconds: Option<u64>,
         #[arg(long, help = "Exact failed workspace ID used for the recovery quote")]
@@ -2575,7 +2575,7 @@ fn run_agents<T: CloudTransport, W: Write>(
             validate_operation_key(&message_id)?;
             validate_operation_key(&operation_key)?;
             let selected = prepare_work_agent(client, agent.as_deref())?;
-            let interactive = io::stdin().is_terminal();
+            let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
             work::dispatch(
                 client,
                 out,
@@ -3606,14 +3606,77 @@ impl CloudHttpError {
 
 impl std::fmt::Display for CloudHttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.code {
-            Some(code) => write!(
+        match self.code.as_deref().and_then(neutral_error_text) {
+            Some(text) => write!(
                 f,
-                "Codewhale account request failed (HTTP {}, code {code})",
+                "Codewhale account request failed (HTTP {}): {text}",
                 self.status
             ),
-            None => write!(f, "Codewhale account request failed (HTTP {})", self.status),
+            None => match self.code.as_deref().filter(|code| !is_vendor_code(code)) {
+                Some(code) => write!(
+                    f,
+                    "Codewhale account request failed (HTTP {}, code {code})",
+                    self.status
+                ),
+                None => write!(f, "Codewhale account request failed (HTTP {})", self.status),
+            },
         }
+    }
+}
+
+pub(crate) fn vendor_safe_prose(text: String) -> String {
+    if is_vendor_code(&text) {
+        "The cloud service reported an unrecognised condition".to_string()
+    } else {
+        text
+    }
+}
+
+fn is_vendor_code(code: &str) -> bool {
+    code.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| {
+            matches!(
+                token.to_ascii_lowercase().as_str(),
+                "boat" | "daytona" | "sprite" | "sprites" | "agentbay" | "alibaba"
+            )
+        })
+}
+
+fn neutral_error_text(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "boat_task_replay_expired" | "work_task_replay_expired" => {
+            "The earlier request can no longer be replayed and needs operator reconciliation"
+        }
+        "boat_task_create_in_progress" | "work_task_create_in_progress" => {
+            "The cloud computer is still being created"
+        }
+        "boat_task_cleanup_pending" | "work_task_cleanup_pending" => {
+            "The cloud computer is still being cleaned up"
+        }
+        "boat_task_receipt_invalid" | "work_task_receipt_invalid" => {
+            "The cloud computer's receipt could not be verified"
+        }
+        "boat_task_authority_changed" | "work_task_authority_changed" => {
+            "Your account authority changed while the cloud computer was starting"
+        }
+        "boat_task_stop_unconfirmed" | "work_task_stop_unconfirmed" => {
+            "The cloud computer stopped but its state is unconfirmed"
+        }
+        "boat_task_usage_pending" | "work_task_usage_pending" => {
+            "Usage for the cloud computer is still being finalized"
+        }
+        "boat_task_outcome_unknown" | "work_task_outcome_unknown" => {
+            "The cloud computer outcome is unknown"
+        }
+        _ => return None,
+    })
+}
+
+pub(crate) fn display_error_code(code: &str) -> String {
+    match neutral_error_text(code) {
+        Some(text) => text.to_string(),
+        None if is_vendor_code(code) => "unrecognised cloud error".to_string(),
+        None => code.to_string(),
     }
 }
 

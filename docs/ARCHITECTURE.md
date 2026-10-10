@@ -270,7 +270,7 @@ drives turns through Chat Completions.
   - `policy.rs` - Sandbox policy configuration
   - `opensandbox.rs` - Alibaba OpenSandbox HTTP backend adapter
   - `seatbelt.rs` - macOS Seatbelt profile generation
-  - `bwrap.rs` - opt-in Linux bubblewrap command wrapper
+  - `bwrap.rs` - Linux bubblewrap command wrapper
   - `seccomp.rs` - dormant Linux seccomp implementation; not wired into commands
   - `process_hardening.rs` - Linux kernel-level hardening for the TUI process
     itself (defense-in-depth; not a child-command sandbox)
@@ -317,7 +317,7 @@ drives turns through Chat Completions.
 2. Tool registry looks up handler
 3. Pre-execution hooks run
 4. Approval requested when the effective permission posture and policy require it
-5. Tool executed (possibly wrapped by Seatbelt on macOS or opt-in bubblewrap on Linux)
+5. Tool executed (possibly wrapped by Seatbelt on macOS or bubblewrap on Linux)
 6. Post-execution hooks run
 7. Result metadata is retained on runtime item records
 8. **LSP post-edit hook**: after a `File` write, edit, or patch action (including a replay-only legacy alias), the engine runs `run_post_edit_lsp_hook()` when LSP is enabled to collect diagnostics
@@ -401,7 +401,7 @@ command = "echo 'Running tool: $TOOL_NAME'"
 3. **Extensibility**: MCP, skills, and hooks allow customization without code changes
 4. **Cross-platform**: Core works on Linux/macOS/Windows. Sandbox guarantees
    are platform-specific: macOS uses Seatbelt when available; Linux uses an
-   installed bubblewrap executable only when explicitly enabled; Windows has
+   installed bubblewrap executable by default when a probe shows it works; Windows has
    no advertised OS command sandbox. Seccomp and the Windows helper contract
    are not wired into command execution.
 5. **Minimal dependencies**: Careful dependency selection for build speed

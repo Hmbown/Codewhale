@@ -1504,6 +1504,13 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "false",
         None,
     ),
+    def("full_access_repos", SettingKind::String, "", None),
+    def(
+        "full_access_migration_shown",
+        SettingKind::Bool(ON_OFF),
+        "false",
+        None,
+    ),
     // Round 3 work-bar placement migration ran once (`top` → `bottom`).
     def(
         "work_surface_bottom_migrated",

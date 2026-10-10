@@ -1196,6 +1196,21 @@ new provider's default model; an `auto` thread stays `auto`. The loaded
 engine and conversation history are kept, and the next turn installs the new
 route.
 
+`full_access_confirmation` (`"session"` or `"repo"`) is required on any
+`PATCH` that turns Full Access on for a thread that is not already in it,
+whether through `permission_posture`, `mode`, or `auto_approve`. Without it the
+request fails with `400` and a message starting `full_access_confirmation_required`,
+and nothing changes; any other value is also a `400`. `"session"` keeps Full
+Access for this thread only. `"repo"` additionally records the thread's
+workspace in the saved `full_access_repos` list, written before the thread is
+updated so a failed save refuses the request and leaves the thread unchanged.
+A `PATCH` that moves a thread out of Full Access forgets that workspace's
+`full_access_repos` entry, as the TUI does. A change of effective permission
+adds a completed `status` item to the thread's latest turn and publishes a
+`thread.permissions_changed` event (`from`, `to`, `scope`, `source`). This is a
+breaking change for clients that previously sent `permission_posture:
+"full-access"` or a legacy `yolo` mode alone: they must now add the field.
+
 **Turns** (within a thread)
 - `POST /v1/threads/{id}/turns`
 - `POST /v1/threads/{id}/turns/{turn_id}/steer` - inject guidance into the running turn. The response is a receipt for what actually happened, not for what was attempted; see [Steer delivery](#steer-delivery).

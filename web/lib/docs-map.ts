@@ -265,10 +265,10 @@ export const DOC_TOPICS: DocTopic[] = [
     slug: "computers",
     label: { en: "Send a task to the cloud", zh: "把任务发送到云端" },
     description: {
-      en: "Preview: propose, confirm, and track a cloud agent that opens a pull request on GitHub, CNB, or Gitee.",
-      zh: "预览版：提议、确认并跟踪一个在 GitHub、CNB 或 Gitee 上提交拉取请求的云端 Agent。",
+      en: "Preview: quote and run a cloud agent through your account.",
+      zh: "预览版：通过你的账户为云端 Agent 报价并运行。",
     },
-    repoSource: ["docs/DAYTONA_CLOUD_DISPATCH.md", "docs/CODEWHALE_AGENT.md"],
+    repoSource: ["docs/GUIDE.md", "docs/CODEWHALE_AGENT.md"],
     hasPage: true,
     category: "extending",
   },

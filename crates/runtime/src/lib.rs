@@ -13,7 +13,6 @@
 
 pub use codewhale_command_contract::elapsed;
 
-pub mod computer_meter;
 pub mod context_budget;
 pub mod continual_harness;
 pub mod fast_hash;

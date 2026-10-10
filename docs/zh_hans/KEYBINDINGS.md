@@ -20,14 +20,14 @@
 | `Ctrl-B` | 结束当前 shell 等待，使回合继续；前台命令转入 `/jobs`，后台任务继续运行。可用 `/jobs` 或 `action: "wait"` 的 `Bash` 查看输出 |
 | `Ctrl-D` | 退出（仅当输入框为空时） |
 | `Tab` | 当输入框为空时，循环切换 TUI 模式：Plan → Work → Operate → Plan |
-| `Shift+Tab` | 循环切换权限级别：Ask → Auto-Review → Full Access（完全访问）。无论输入框内容如何、回合是否在运行都即时生效（仅在打开设置以外的模态框时被抑制） |
+| `Shift+Tab` | 循环切换权限级别：Ask → Auto-Review → Full Access（完全访问）。进入 Full Access 前会先确认（`Enter` 仅本会话，`R` 对本仓库保持，`Esc` 取消）。无论输入框内容如何、回合是否在运行都即时生效（仅在打开设置以外的模态框时被抑制） |
 | `Ctrl-T` | 循环切换当前模型的思考强度。走与 `/model` 和 `/effort` 相同的阶梯（模型目录，或已文档化的路由方言）。始终思考的模型省略 `off`；Grok 4.6 包含 `xhigh`。 |
 | `Ctrl-Shift-T` | 切换实时对话记录浮层（粘性尾部自动滚动） |
 | `Ctrl-R` | 打开恢复会话选择器 |
 | `Ctrl-L` | 压缩对话上下文（状态行显示进度；压缩已在运行时不执行任何操作） |
 | `Ctrl-O` | 打开所选或当前回合的思考详情，与输入框内容无关 |
 | `Ctrl-Alt-O` | 打开整个回合的 Turn Inspector，与输入框内容无关 |
-| `Alt-V` / `Option-V`（macOS） | 为所选、可见或最近的工具/智能体卡片打开详情分页器；发出传统 Option-V 字符的终端也会被处理 |
+| `Alt-V` / `Option-V`（macOS） | 为所选的工具/智能体卡片打开详情分页器；未选择时，打开最新正在运行的 shell 的实时检查器，否则打开可见或最近的卡片；发出传统 Option-V 字符的终端也会被处理 |
 | `Ctrl-Shift-E` / `Cmd-Shift-E` | 在任务面板（workbar）中切换文件树 |
 | `Ctrl-]` 或 `Ctrl-Tab` | 循环切换 work dock：TODO → Agents → Jobs → Background。`Ctrl-]` 是可移植的组合键——`Ctrl-Tab` 只有在 kitty 键盘协议下才能送达 |
 | `Ctrl-Shift-Tab` | 反向循环切换 work dock |
@@ -36,7 +36,7 @@
 | `Alt-!` / `Alt-@` / `Alt-#` / `Alt-$` | 选择任务面板（workbar）的面板：Tasks / Agents / Context / Files |
 | `Ctrl-Alt-0` | 关闭任务面板（workbar）/ 恢复到底部位置 |
 | `Alt-L` | 为最后一条消息打开分页器（输入框为空） |
-| `Alt-P` / `Alt-A` / `Alt-Y` | 跳到 Plan / Work，或请求 Full Access（`Alt-Y` 是旧的权限通道——Work + Full Access——不是独立模式；它遵循锁定的审批策略） |
+| `Alt-P` / `Alt-A` / `Alt-Y` | 跳到 Plan / Work，或请求 Full Access（与 `Shift+Tab` 一样会先确认；`Alt-Y` 是旧的权限通道——Work + Full Access——不是独立模式；它遵循锁定的审批策略） |
 | `Ctrl-X`（Activity 任务面板） | 取消所有正在运行的后台 shell 任务 |
 | `Esc` | 关闭最上层模态框 · 取消斜杠菜单 · 关闭 toast。当压缩正在为一个进行中的回合服务时，`Esc` 会停止该回合（压缩随之中断） |
 
@@ -265,3 +265,12 @@ Hotbar 的触发键刻意只限 `Alt-1` 到 `Alt-8`。在 macOS 键盘上，这�
 - **输入框为空时，裸 Up/Down 方向键滚动对话记录（v0.8.13）。** 以前 `should_scroll_with_arrows` 开关被硬编码为 false，意味着即使输入框为空，裸方向键也总是在输入框历史中导航。虚拟终端（Ghostty、Codex、Kitty 协议）中的用户尤其受影响，因为他们无法使用 Cmd+Up / Alt+Up 快捷键。
 - **可配置键位（#436）和 `tui.toml`（#437）仍然延期。** `TuiPrefs` 结构体和加载器存在于 `settings.rs` 中，但未在启动时接线。允许 `~/.codewhale/tui.toml` 覆盖单个条目的命名绑定注册表仍然待办。
 - **未发现其他损坏的绑定。** 上面列出的每个其他组合都解析为 `crates/tui/src/tui/ui.rs`（按键事件分发）或 `crates/tui/src/tui/app.rs`（模式 + 状态转换）中的实时处理器。
+
+## 实时终端 dock
+
+在 `/workbar terminal` 中，点击 dock 或按 `Alt+W` 使其获得焦点。输入、
+Enter、Tab 和 Ctrl+C 会送达所选 shell。Esc 返回输入框。
+`Alt+Down` / `Alt+Up` 切换会话；`Ctrl+N` 启动新的 shell。
+鼠标滚轮和 PageUp/PageDown 滚动输出。
+
+权限边界、粘贴行为和支持的平台请参阅[终端 dock 指南](../GUIDE.md#live-terminal-dock)。

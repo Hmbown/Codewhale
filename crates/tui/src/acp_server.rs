@@ -493,6 +493,7 @@ impl AcpServer {
                 &resumed.thread_id,
                 UpdateThreadRequest {
                     permission_posture: Some(self.permission_value().to_string()),
+                    full_access_confirmation: Some("session".to_string()),
                     allow_shell: Some(self.shell_allowed()),
                     ..Default::default()
                 },

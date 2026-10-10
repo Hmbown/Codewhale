@@ -10693,6 +10693,7 @@ async fn active_turn_permission_posture_switches_use_the_engine_live_authority()
                 &thread.id,
                 UpdateThreadRequest {
                     permission_posture: Some(requested.to_string()),
+                    full_access_confirmation: Some("session".to_string()),
                     ..Default::default()
                 },
             )
@@ -16184,7 +16185,12 @@ async fn runtime_approval_disposition_auto_paths_obey_force_and_posture() -> Res
         if approved && posture == "ask" {
             assert_eq!(decided.payload["grant_id"], grant.unwrap().grant_id);
         } else {
-            assert!(decided.payload.get("grant_id").is_none_or(serde_json::Value::is_null));
+            assert!(
+                decided
+                    .payload
+                    .get("grant_id")
+                    .is_none_or(serde_json::Value::is_null)
+            );
         }
         let approval_id = decided.payload["approval_id"]
             .as_str()

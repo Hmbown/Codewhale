@@ -233,6 +233,7 @@ changelog or release notes, and this contributor record.
 
 **Merged or adapted contributions**
 
+- **[xyzs996 / Mark Yan](https://github.com/xyzs996)** — DeepSeek V4 billing treats whole Beijing weekends as off-peak, and the scorecard window comment now matches ([#5545](https://github.com/codewhale-hq/Codewhale/pull/5545))
 - **[Sun Zhenyuan / bistack](https://github.com/bistack)** — extracted tool-call
   planning, execution, and result processing from the turn loop while preserving
   the existing sandbox-policy, hook, budget, and batch-execution behavior
@@ -341,6 +342,8 @@ changelog or release notes, and this contributor record.
 
 **Merged or adapted contributions**
 
+- **[Lstarsky0](https://github.com/Lstarsky0)** — compact rows no longer reserve a hidden session-metrics strip ([#5486](https://github.com/codewhale-hq/Codewhale/pull/5486)); docs shell and shared component pick-text onto the typed dictionary spine ([#5488](https://github.com/codewhale-hq/Codewhale/pull/5488), [#5490](https://github.com/codewhale-hq/Codewhale/pull/5490))
+- **[Sh1Zuku / SparkofSpike](https://github.com/SparkofSpike)** — topbar session title ([#5481](https://github.com/codewhale-hq/Codewhale/pull/5481))
 - **[h3c-hexin](https://github.com/h3c-hexin)** — a concrete route/offering
   output limit now outranks the conservative 8,192-token compatibility guess
   for an uncatalogued model; routes that publish no limit stay fail-closed
@@ -375,6 +378,7 @@ changelog or release notes, and this contributor record.
 
 **Merged or adapted contributions**
 
+- **[xiaoray-blip / Arlo](https://github.com/xiaoray-blip)** — MCP list responses omit `nextCursor` when there are no further pages ([#5336](https://github.com/codewhale-hq/Codewhale/pull/5336), reported in [#5335](https://github.com/codewhale-hq/Codewhale/issues/5335))
 - **[EvanProgramming](https://github.com/EvanProgramming)** — webhook hook
   sink no longer panics when its HTTP client fails to build (#5381); session-index
   JSONL writes are serialized so concurrent stores cannot drop an append

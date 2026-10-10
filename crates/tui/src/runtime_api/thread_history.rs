@@ -1912,8 +1912,16 @@ fn decode_history_overrides(
     let mut prompt_parts = Vec::new();
     for (key, value) in fields {
         match key.as_str() {
-            "model" | "model_provider" | "model_provider_id" | "mode" | "permission_posture"
-            | "allow_shell" | "trust_mode" | "auto_approve" | "system_prompt" => {
+            "model"
+            | "model_provider"
+            | "model_provider_id"
+            | "mode"
+            | "permission_posture"
+            | "full_access_confirmation"
+            | "allow_shell"
+            | "trust_mode"
+            | "auto_approve"
+            | "system_prompt" => {
                 ensure!(
                     wire.insert(key.clone(), value.clone()).is_none(),
                     "conflicting history configuration fields"
@@ -1963,6 +1971,7 @@ fn decode_history_overrides(
                                 | "model_provider_id"
                                 | "mode"
                                 | "permission_posture"
+                                | "full_access_confirmation"
                                 | "allow_shell"
                                 | "trust_mode"
                                 | "auto_approve"

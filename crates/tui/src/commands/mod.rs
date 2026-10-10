@@ -1224,7 +1224,6 @@ mod tests {
     fn flagship_orchestration_and_workspace_commands_are_visible_at_the_palette_root() {
         for name in [
             "auto",
-            "dispatch",
             "goal",
             "hooks",
             "tokens",
@@ -2093,7 +2092,6 @@ mod tests {
             // FEAT-018 utility group.
             "attach",
             "automation",
-            "dispatch",
             "jobs",
             "mcp",
             "network",

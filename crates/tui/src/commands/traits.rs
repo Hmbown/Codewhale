@@ -65,8 +65,8 @@ pub(crate) const COMPATIBILITY_DISCOVERY_COMMANDS: &[&str] = &["subagents"];
 /// control-plane actions through that registry, so it is a substrate rather
 /// than a place to browse. The entry here only stops the product from
 /// *teaching* a route it is not standing behind yet. Founder, 2026-09-03:
-/// "remove /lane", "hide dispatch for now".
-pub(crate) const UNLISTED_COMMANDS: &[&str] = &["lane", "dispatch"];
+/// "remove /lane".
+pub(crate) const UNLISTED_COMMANDS: &[&str] = &["lane"];
 
 /// Small, task-oriented starting set for a bare `/` in the composer.
 ///

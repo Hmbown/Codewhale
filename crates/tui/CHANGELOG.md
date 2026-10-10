@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- A first launch with no key or route now opens the composer. Codewhale asks
+  for a provider when you send your first message, keeps the message in the
+  box, and offers a local model only when a local Ollama server answers. The provider list
+  now shows what you type to filter it during first-run setup.
+- Removed the own-sandbox cloud dispatch (`--own-sandbox`, `/dispatch`,
+  `agent runtime:"cloud"`, the `cloud-agent` alias, and the `--confirm`,
+  `--remote`, `--branch`, `--cwd`, `--status` and `--list` options).
+  `codewhale dispatch "<task>"` now runs only through the signed-in account,
+  with its quote and EU-compute consent.
+- `codewhale dispatch` uses the account's neutral wording for cloud errors,
+  runs for the quoted seconds unless `--seconds` is given, and asks for consent
+  only when both stdin and stdout are terminals. It refuses a message that was
+  not read as new Work, and prints the Message ID.
+- MCP servers you configure now connect when a session starts; set
+  `lazy = true` on a server to connect it on demand instead. Servers that come
+  from plugins stay on demand. Finishing an OAuth login reconnects just that
+  server, and `/mcp reload` redials every server that is not `lazy` and reports
+  how many are not connected out of the configured total.
+- Running shell commands open an inspector with their output and status, and
+  `Alt+V` opens the newest running shell (#6931).
+- `/resume`, `/load` and other session changes that cannot run yet now list
+  what is still busy and how to stop it.
+- Sessions that ended without a clean exit show `interrupted` with their age
+  in the session list.
+- `codewhale logout` also deletes a stored legacy sandbox token.
+- `codewhale lane list` prints an empty list instead of failing when no lane
+  has been started, `codewhale completion` no longer errors when its output
+  pipe closes early, and `session-diagnostics`, `receipts` and `features` help
+  and errors say what to pass and where to find saved sessions.
+- A missing `--config` file, a missing `-C` workspace directory and an unknown
+  `--profile` now fail at startup with a clear message.
+- `codewhale web` works when `$HOME` sits under a root-owned symlink.
+- Typing `/exi` and pressing Enter now completes the command instead of running
+  a different destructive command (`/exit`, `/clear`, `/new`, `/logout`,
+  `/restore`).
+- The Shift+Tab permission hint stays in the footer while in Auto-Review and
+  Full Access.
+- An idle pet view no longer builds animation frames while nobody is
+  looking at it (#6728).
+- README: `codewhale exec --auto` is shown for headless runs that edit files
+  or run commands.
+- `bash` now moves a foreground command to the background after 30 s and
+  reports the elapsed time and how long ago it last printed output.
+  `task_shell_start` is removed; use `bash` with `background=true`.
+- Full Access now asks before turning on (Shift+Tab, Alt+Y, `/config
+  approval_mode full-access`, the High-trust setup preset) and lasts one
+  session. `R` in the popup keeps it on for this repo (`full_access_repos` in
+  `settings.toml`); `--yolo` and `CODEWHALE_YOLO` skip the question. A saved
+  `permission_posture = "full-access"` stays on for that session with a
+  one-time notice; later sessions start in Ask.
+  The footer chip reads `Full Access · session` or `Full Access · this repo`,
+  and every change of effective permission writes a `Permissions changed to …`
+  line (a `status` item and `thread.permissions_changed` event in runtime
+  threads). Runtime clients that `PATCH /v1/threads/{id}` into Full Access
+  must now send `full_access_confirmation` (`session` or `repo`) or get a 400.
+
 - The bundled first-party catalog pins marketplace revision
   `9b5f9d614ef69702be9944a61e89aeb3df14c047`; the 19 catalog entries are
   unchanged, and installed bundles now come from a revision carrying the
@@ -3661,6 +3717,9 @@ item-level change record is retained below the categorized release highlights.
 
 ### Contributors
 
+- **xyzs996 ([@xyzs996](https://github.com/xyzs996))** — DeepSeek V4 whole
+  Beijing weekends are billed as off-peak, and the scorecard window comment now
+  matches (#5545).
 - **Sun Zhenyuan ([@bistack](https://github.com/bistack))** — tool-call stage
   extraction with the existing execution and policy contracts preserved
   (#5523).
@@ -4893,6 +4952,10 @@ locales grow to 18 and 8.
 
 ### Contributors
 
+- Lstarsky0 (@Lstarsky0) — compact rows no longer reserve a hidden
+  session-metrics strip (#5486); docs shell and shared component pick-text
+  moved onto the typed dictionary spine (#5488, #5490).
+- Sh1Zuku (@SparkofSpike) — topbar session title (#5481).
 - hexin (@h3c-hexin) — a concrete route/offering output limit outranks the
   8,192-token compatibility guess for an uncatalogued model (#5461, closes
   #5460); web tool results use the noisy soft limit (#5474); owned direct
@@ -5259,6 +5322,8 @@ a published OpenAI-compatible host ship here (#5350).
 
 ### Contributors
 
+- Arlo (@xiaoray-blip) — MCP list responses omit `nextCursor` when there
+  are no further pages (#5336, reported in #5335).
 - EvanProgramming (@EvanProgramming) — webhook client panic fallback
   (#5381); session-index JSONL mutex (#5382).
 - Lstarsky0 (@Lstarsky0) — session peek hides internal runtime events

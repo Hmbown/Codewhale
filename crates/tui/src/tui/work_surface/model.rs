@@ -2698,30 +2698,24 @@ fn shells_section_heading(shells: &[WorkRow]) -> WorkRow {
 }
 
 fn shell_inspector_body(app: &App, entry: &TaskPanelEntry, command: &str, status: &str) -> String {
-    let mut body = format!(
-        "Job: {}\nStatus: {status}\nCommand: {command}\n\nCancel: /jobs cancel {}\n",
-        entry.id, entry.id
-    );
     let session = app.current_session_id.as_deref().unwrap_or("");
     if let Some(manager) = app.runtime_services.shell_manager.as_ref()
         && let Ok(mut manager) = manager.try_lock()
         && let Ok(detail) = manager.inspect_job_for_session(session, &entry.id)
     {
-        if !detail.stdout.is_empty() {
-            body.push_str("\nSTDOUT:\n");
-            body.push_str(&detail.stdout);
-        }
-        if !detail.stderr.is_empty() {
-            body.push_str("\nSTDERR:\n");
-            body.push_str(&detail.stderr);
-        }
-        if detail.stdout.is_empty() && detail.stderr.is_empty() {
-            body.push_str("\n(no output yet — reopen this row to watch the shell)");
-        }
-    } else {
-        body.push_str("\nOpen this row to watch live output.");
+        let live = detail.snapshot.status == crate::tools::shell::ShellStatus::Running
+            && !detail.snapshot.stale;
+        let body = crate::tui::shell_job_routing::format_shell_job_detail(&detail);
+        return if live {
+            format!("Cancel: /jobs cancel {}\n\n{body}", entry.id)
+        } else {
+            body
+        };
     }
-    body
+    format!(
+        "Job: {}\nStatus: {status}\nCommand: {command}\n\nCancel: /jobs cancel {}\n\nOpen this row to watch live output.",
+        entry.id, entry.id
+    )
 }
 
 fn graph_node_row(snapshot: &WorkGraphSnapshot, node: &WorkNode) -> WorkRow {

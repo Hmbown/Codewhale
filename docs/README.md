@@ -28,7 +28,6 @@ is the source. Translations live beside their English page (`*.id.md`) or in
 - [Skills](SKILLS.md) and [evaluating skill changes](SKILL_EVALUATION.md)
 - [User memory](MEMORY.md)
 - [`read_media`](READ_MEDIA.md) and [`/preview-request`](PREVIEW_REQUEST.md)
-- [Cloud-agent dispatch](DAYTONA_CLOUD_DISPATCH.md)
 
 ## Extending Codewhale
 

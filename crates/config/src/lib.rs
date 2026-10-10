@@ -6328,6 +6328,16 @@ pub fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
     default_config_path()
 }
 
+pub fn require_explicit_config_exists(explicit: Option<PathBuf>) -> Result<()> {
+    if let Some(path) = explicit {
+        let path = normalize_config_file_path(path)?;
+        if !checked_path_exists(&path)? {
+            bail!("config file does not exist: {}", quote_os_path(&path));
+        }
+    }
+    Ok(())
+}
+
 /// Whether `path` names a workspace-scoped config document —
 /// `<repo>/.codewhale/config.toml` (or the legacy `.deepseek` layout) inside a
 /// checkout — rather than a user-global config file.

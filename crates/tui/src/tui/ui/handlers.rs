@@ -646,6 +646,10 @@ pub(crate) fn poll_mcp_login(app: &mut App) {
         McpLoginProgress::Finished(outcome) => {
             app.mcp_login = None;
             match outcome {
+                Ok(()) if crate::mcp::mcp_name_is_command_safe(&server) => {
+                    app.mcp_login_reconnect = Some(server);
+                    return;
+                }
                 Ok(()) => (
                     app.tr(MessageId::McpLoginStored)
                         .replace("{server}", &server)
@@ -732,7 +736,7 @@ fn refresh_open_extensions(app: &mut App) {
 /// on the UI loop. While a turn runs, the op waits in the engine mailbox and
 /// runs as soon as the turn ends — the person asked once, so they are not
 /// told to ask again.
-fn start_mcp_retry(app: &mut App, engine_handle: &EngineHandle, name: String) {
+pub(crate) fn start_mcp_retry(app: &mut App, engine_handle: &EngineHandle, name: String) {
     use crate::tui::app::PendingMcpRetry;
 
     let already = app
@@ -1230,14 +1234,7 @@ pub(crate) fn handle_shell_job_action(app: &mut App, action: crate::tui::app::Sh
     match action {
         crate::tui::app::ShellJobAction::List => {
             let jobs = manager.list_jobs_for_session(&active_session_id);
-            let mut text = format_shell_job_list(&jobs);
-            if let Ok(cloud) =
-                crate::cloud_dispatch::CloudJobStore::from_env().and_then(|store| store.list())
-                && !cloud.is_empty()
-            {
-                text.push_str("\n\n");
-                text.push_str(&crate::cloud_dispatch::format_job_list(&cloud));
-            }
+            let text = format_shell_job_list(&jobs);
             add_shell_job_message(app, text);
         }
         crate::tui::app::ShellJobAction::Show { id } => {
@@ -3197,6 +3194,20 @@ pub(crate) async fn handle_view_events(
                     .await?
                 {
                     return Ok(true);
+                }
+                app.needs_redraw = true;
+            }
+            ViewEvent::FullAccessConfirmed { scope, origin } => {
+                if app.apply_confirmed_full_access(scope, origin) {
+                    if matches!(
+                        origin,
+                        crate::tui::full_access_confirm::FullAccessOrigin::RootCycle
+                            | crate::tui::full_access_confirm::FullAccessOrigin::RootConfig
+                    ) {
+                        config.approval_policy = None;
+                    }
+                    sync_mode_update(app, engine_handle).await;
+                    refresh_config_view_if_open(app, "permission_posture");
                 }
                 app.needs_redraw = true;
             }

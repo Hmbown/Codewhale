@@ -126,7 +126,7 @@ fn lowercase_bash_description_matches_the_timeout_it_actually_applies() {
     };
 
     // `bash {command}` with no `timeout` translates to a legacy input carrying
-    // no `timeout_ms`. The contract delegate waits the 120 s default in the
+    // no `timeout_ms`. The contract delegate waits the 30 s default in the
     // foreground, then moves a still-running process to the background.
     let translated =
         contract_bash_legacy_input(&json!({"command": "sleep 600"})).expect("translated input");
@@ -1807,7 +1807,7 @@ async fn exec_shell_multiline_block_explains_allow_shell_boundary() {
         result.content
     );
     assert!(
-        result.content.contains("task_shell_start"),
+        result.content.contains("background=true"),
         "{}",
         result.content
     );
@@ -5113,7 +5113,7 @@ fn timeout_ms_description_covers_every_action_default() {
         .as_str()
         .expect("timeout_ms description");
 
-    for expected in ["120000", "600000", "30000", "1000"] {
+    for expected in ["600000", "30000", "1000"] {
         assert!(
             description.contains(expected),
             "missing {expected}: {description}"

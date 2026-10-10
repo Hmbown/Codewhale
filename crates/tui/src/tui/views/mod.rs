@@ -86,6 +86,7 @@ pub enum ModalKind {
     /// "Resume this session?" over the launch card. Resuming replaces the
     /// whole session context, so it asks first.
     LaunchResumeConfirm,
+    FullAccessConfirm,
     /// Router setup (`/router`, `/model router`): presets for `[auto.router]`.
     RouterSetup,
 }
@@ -1150,6 +1151,10 @@ pub enum ViewEvent {
     /// the named session through the same path the card's own Enter uses.
     LaunchResumeConfirmed {
         session_id: String,
+    },
+    FullAccessConfirmed {
+        scope: crate::tui::full_access_confirm::FullAccessScope,
+        origin: crate::tui::full_access_confirm::FullAccessOrigin,
     },
     /// A slash command an Extensions row activated in place: the panel stays
     /// open, the host runs the command through the normal command path, then

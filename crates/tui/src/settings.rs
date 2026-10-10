@@ -417,13 +417,17 @@ pub struct Settings {
     /// Default reasoning effort selected from the TUI model picker.
     /// `None` falls back to `config.toml` and then the runtime default.
     pub reasoning_effort: Option<String>,
-    /// TUI-only Shift+Tab posture: ask, auto-review, or full-access.
+    /// TUI-only Shift+Tab posture: ask or auto-review.
     /// An explicit/managed `config.toml` approval policy always takes
     /// precedence, so this preference cannot loosen project requirements.
     /// This is **tool-approval posture**, not filesystem scope — see
     /// [`Self::sandbox_mode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_posture: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub full_access_repos: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub full_access_migration_shown: bool,
     /// Filesystem sandbox scope, independent of approval posture:
     /// `read-only | workspace-write | danger-full-access | external-sandbox`.
     /// Surfaced in Settings and the shell so "Full Access" (approval) is
@@ -598,6 +602,8 @@ impl Default for Settings {
             default_model: None,
             reasoning_effort: None,
             permission_posture: None,
+            full_access_repos: Vec::new(),
+            full_access_migration_shown: false,
             sandbox_mode: None,
             provider_models: None,
             enabled_models: None,
@@ -1937,6 +1943,38 @@ impl Settings {
             }
         }
         lines.join("\n")
+    }
+
+    #[must_use]
+    pub fn full_access_repo_kept(&self, workspace: &std::path::Path) -> bool {
+        Self::full_access_repo_key(workspace)
+            .is_some_and(|key| self.full_access_repos.iter().any(|kept| kept == &key))
+    }
+
+    #[must_use]
+    pub fn full_access_repo_key(workspace: &std::path::Path) -> Option<String> {
+        codewhale_execpolicy::normalize_workspace_scope(&workspace.to_string_lossy())
+    }
+
+    pub fn set_full_access_repo(
+        &mut self,
+        workspace: &std::path::Path,
+        kept: bool,
+    ) -> Result<bool> {
+        let key = Self::full_access_repo_key(workspace).ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot keep Full Access for '{}': not an absolute, non-root workspace path",
+                workspace.display()
+            )
+        })?;
+        let before = self.full_access_repos.clone();
+        self.full_access_repos.retain(|existing| existing != &key);
+        if kept {
+            self.full_access_repos.push(key);
+        }
+        self.full_access_repos.sort();
+        self.full_access_repos.dedup();
+        Ok(self.full_access_repos != before)
     }
 
     /// Toggle one exact provider/model pin without touching credentials or

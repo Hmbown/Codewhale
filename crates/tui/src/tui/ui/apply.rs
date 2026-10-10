@@ -3481,11 +3481,14 @@ pub(crate) fn apply_setup_runtime_preset(
     let trust_mode = match preset {
         crate::tui::setup::SetupRuntimePreset::AskFirst => false,
         crate::tui::setup::SetupRuntimePreset::NormalAgent => app.agent_trust_baseline(),
-        crate::tui::setup::SetupRuntimePreset::HighTrustLocal => true,
+        crate::tui::setup::SetupRuntimePreset::HighTrustLocal => false,
     };
     app.set_agent_runtime_baseline(preset.allow_shell(), trust_mode, approval_mode);
     let mode = AppMode::from_setting(preset.default_mode());
     app.set_mode(mode);
+    if preset.full_access_requested() {
+        app.request_full_access(crate::tui::full_access_confirm::FullAccessOrigin::Setup);
+    }
     app.needs_redraw = true;
 
     Ok(format!("Applied {}.", preset.result_summary()))

@@ -28,6 +28,14 @@ Press `Tab` to complete composer menus or cycle through the visible modes
 when the composer is empty: **Plan → Work → Operate → Plan**. `Tab` never sends
 or queues composer text; use `Enter` to send or queue it.
 Press `Shift+Tab` to cycle permission posture (Ask → Auto-Review → Full Access).
+Entering Full Access (`Shift+Tab`, `Alt+Y`, `/config approval_mode full-access`)
+asks first: `Enter` turns it on for this session, `R` keeps it on for this repo
+(`full_access_repos` in `settings.toml`), `Esc` cancels. Full Access is never
+saved as the startup posture; `--yolo` and `CODEWHALE_YOLO` skip the question.
+Every change of effective permission writes a `Permissions changed to …` line
+in the transcript, and the footer chip reads `Full Access · session` or
+`Full Access · this repo`. A runtime `PATCH /v1/threads/{id}` that turns on
+Full Access must send `full_access_confirmation` (`session` or `repo`).
 Press `Ctrl+T` to cycle reasoning effort.
 Run `/mode` to open the mode picker, or switch directly with `/mode work`,
 `/mode plan`, or `/mode operate`.

@@ -489,8 +489,8 @@ fn run_world(
         {
             audio = None;
         }
-        let active =
-            now.duration_since(last_view) <= LEASE || producer.is_some() || audio.is_some();
+        let viewed = now.duration_since(last_view) <= LEASE;
+        let active = viewed || producer.is_some() || audio.is_some();
         if !active || !was_active {
             last = now;
         }
@@ -560,99 +560,106 @@ fn run_world(
             } else {
                 last + Duration::from_secs_f64(count as f64 / 30.0)
             };
-            let text: String = context.with(|ctx| ctx.eval("pet.presentation()"))?;
-            let mut frame: Value = serde_json::from_str(&text)?;
-            frame["version"] = json!(1);
-            frame["identity"] = json!(saved.identity);
-            frame["epoch"] = json!(epoch);
-            frame["tick"] =
-                json!((frame["timeMs"].as_f64().unwrap_or(0.0) * 30.0 / 1000.0).round() as u64);
-            frame["cursor"] = json!(saved.cursor);
-            frame["source"] = json!(saved.source);
-            frame["sourceRevision"] = json!(saved.source_revision);
-            bind_activity(&mut frame, &saved.source, saved.cursor);
-            // Presentation material keeps missing coverage legible. The core
-            // pigment, score, particle digest and recording are unchanged.
-            for key in ["", "still"] {
-                let pose = if key.is_empty() {
-                    &mut frame
-                } else {
-                    &mut frame[key]
-                };
-                let hollow =
-                    producer.is_none() || pose["style"]["hollow"].as_bool().unwrap_or(true);
-                if hollow {
-                    pose["style"]["hollow"] = json!(true);
-                    pose["style"]["r"] = json!(153);
-                    pose["style"]["g"] = json!(176);
-                    pose["style"]["b"] = json!(184);
-                    pose["style"]["alpha"] =
-                        json!(0.68 * pose["state"]["lit"].as_f64().unwrap_or(1.0).max(0.25));
-                }
-            }
-            for key in ["", "still"] {
-                let pose = if key.is_empty() {
-                    &mut frame
-                } else {
-                    &mut frame[key]
-                };
-                if !saved.appearance.event_colors {
-                    for (key, value) in ["r", "g", "b"].into_iter().zip(saved.appearance.particle) {
-                        pose["style"][key] = json!(value);
+            if viewed {
+                let text: String = context.with(|ctx| ctx.eval("pet.presentation()"))?;
+                let mut frame: Value = serde_json::from_str(&text)?;
+                frame["version"] = json!(1);
+                frame["identity"] = json!(saved.identity);
+                frame["epoch"] = json!(epoch);
+                frame["tick"] =
+                    json!((frame["timeMs"].as_f64().unwrap_or(0.0) * 30.0 / 1000.0).round() as u64);
+                frame["cursor"] = json!(saved.cursor);
+                frame["source"] = json!(saved.source);
+                frame["sourceRevision"] = json!(saved.source_revision);
+                bind_activity(&mut frame, &saved.source, saved.cursor);
+                // Presentation material keeps missing coverage legible. The core
+                // pigment, score, particle digest and recording are unchanged.
+                for key in ["", "still"] {
+                    let pose = if key.is_empty() {
+                        &mut frame
+                    } else {
+                        &mut frame[key]
+                    };
+                    let hollow =
+                        producer.is_none() || pose["style"]["hollow"].as_bool().unwrap_or(true);
+                    if hollow {
+                        pose["style"]["hollow"] = json!(true);
+                        pose["style"]["r"] = json!(153);
+                        pose["style"]["g"] = json!(176);
+                        pose["style"]["b"] = json!(184);
+                        pose["style"]["alpha"] =
+                            json!(0.68 * pose["state"]["lit"].as_f64().unwrap_or(1.0).max(0.25));
                     }
                 }
-                let hollow = pose["style"]["hollow"].as_bool().unwrap_or(true);
-                let lit = pose["state"]["lit"]
-                    .as_f64()
-                    .unwrap_or(1.0)
-                    .clamp(0.18, 1.0);
-                let light = saved
-                    .appearance
-                    .background
-                    .iter()
-                    .map(|v| f64::from(*v))
-                    .sum::<f64>()
-                    > 510.0;
-                if let Some(materials) = pose["materials"].as_array_mut() {
-                    for material in materials {
-                        if let Some(channels) = material.as_array_mut().filter(|c| c.len() == 4) {
-                            for k in 0..3 {
-                                let value = if hollow {
-                                    [153., 176., 184.][k]
-                                } else if !saved.appearance.event_colors {
-                                    f64::from(saved.appearance.particle[k])
-                                } else {
-                                    channels[k].as_f64().unwrap_or(160.0)
-                                };
-                                channels[k] = json!(if light { value * 0.48 } else { value });
-                            }
-                            let alpha = channels[3].as_f64().unwrap_or(0.5);
-                            channels[3] =
-                                json!((alpha * saved.appearance.brightness * lit).clamp(0.0, 1.0));
+                for key in ["", "still"] {
+                    let pose = if key.is_empty() {
+                        &mut frame
+                    } else {
+                        &mut frame[key]
+                    };
+                    if !saved.appearance.event_colors {
+                        for (key, value) in
+                            ["r", "g", "b"].into_iter().zip(saved.appearance.particle)
+                        {
+                            pose["style"][key] = json!(value);
                         }
                     }
+                    let hollow = pose["style"]["hollow"].as_bool().unwrap_or(true);
+                    let lit = pose["state"]["lit"]
+                        .as_f64()
+                        .unwrap_or(1.0)
+                        .clamp(0.18, 1.0);
+                    let light = saved
+                        .appearance
+                        .background
+                        .iter()
+                        .map(|v| f64::from(*v))
+                        .sum::<f64>()
+                        > 510.0;
+                    if let Some(materials) = pose["materials"].as_array_mut() {
+                        for material in materials {
+                            if let Some(channels) = material.as_array_mut().filter(|c| c.len() == 4)
+                            {
+                                for k in 0..3 {
+                                    let value = if hollow {
+                                        [153., 176., 184.][k]
+                                    } else if !saved.appearance.event_colors {
+                                        f64::from(saved.appearance.particle[k])
+                                    } else {
+                                        channels[k].as_f64().unwrap_or(160.0)
+                                    };
+                                    channels[k] = json!(if light { value * 0.48 } else { value });
+                                }
+                                let alpha = channels[3].as_f64().unwrap_or(0.5);
+                                channels[3] = json!(
+                                    (alpha * saved.appearance.brightness * lit).clamp(0.0, 1.0)
+                                );
+                            }
+                        }
+                    }
+                    pose["style"]["alpha"] = json!(
+                        (pose["style"]["alpha"].as_f64().unwrap_or(0.5)
+                            * saved.appearance.brightness)
+                            .clamp(0.0, 1.0)
+                    );
                 }
-                pose["style"]["alpha"] = json!(
-                    (pose["style"]["alpha"].as_f64().unwrap_or(0.5) * saved.appearance.brightness)
-                        .clamp(0.0, 1.0)
-                );
-            }
-            frame["appearance"] = json!(saved.appearance);
-            frame["producerConnected"] = json!(producer.is_some());
-            frame["storageAvailable"] = json!(!storage_error);
-            frame["audioOwner"] = json!(audio.as_ref().map(|(id, _)| id));
-            frame["audioUnavailable"] = json!(audio_error);
-            measurements.push_back(started.elapsed().as_secs_f64() * 1000.0);
-            if measurements.len() > 300 {
-                measurements.pop_front();
-            }
-            frame["performance"] = json!({"worldHz":30,"frames":ticks,"uptimeSeconds":origin.elapsed().as_secs_f64(),"workMs":measurements.back()});
-            let mut output = frames
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Frame lock failed"))?;
-            output.push_back(frame);
-            if output.len() > 16 {
-                output.pop_front();
+                frame["appearance"] = json!(saved.appearance);
+                frame["producerConnected"] = json!(producer.is_some());
+                frame["storageAvailable"] = json!(!storage_error);
+                frame["audioOwner"] = json!(audio.as_ref().map(|(id, _)| id));
+                frame["audioUnavailable"] = json!(audio_error);
+                measurements.push_back(started.elapsed().as_secs_f64() * 1000.0);
+                if measurements.len() > 300 {
+                    measurements.pop_front();
+                }
+                frame["performance"] = json!({"worldHz":30,"frames":ticks,"uptimeSeconds":origin.elapsed().as_secs_f64(),"workMs":measurements.back()});
+                let mut output = frames
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Frame lock failed"))?;
+                output.push_back(frame);
+                if output.len() > 16 {
+                    output.pop_front();
+                }
             }
         }
         if (active || was_active || storage_error) && last_save.elapsed() >= Duration::from_secs(1)

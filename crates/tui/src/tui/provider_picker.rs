@@ -197,6 +197,7 @@ pub struct ProviderPickerView {
     /// the advanced management hotkeys from the decision surface. They remain
     /// available from `/provider` after onboarding.
     onboarding_mode: bool,
+    local_runtime_detected: bool,
     query: String,
     /// Explicit search keeps provider names from invoking legacy letter actions.
     search_mode: bool,
@@ -1920,6 +1921,7 @@ impl ProviderPickerView {
             view,
             setup_mode: false,
             onboarding_mode: false,
+            local_runtime_detected: true,
             query: String::new(),
             search_mode: false,
             api_key_input: String::new(),
@@ -1968,6 +1970,29 @@ impl ProviderPickerView {
     pub(crate) fn with_locale(mut self, locale: Locale) -> Self {
         self.locale = locale;
         self
+    }
+
+    #[must_use]
+    pub(crate) fn with_local_runtime_detected(mut self, detected: bool) -> Self {
+        self.local_runtime_detected = detected;
+        if !self.rows.is_empty() && !self.row_visible(self.selected_idx) {
+            self.selected_idx = (0..self.rows.len())
+                .find(|idx| self.row_visible(*idx))
+                .unwrap_or(0);
+        }
+        self
+    }
+
+    fn hides_undetected_local(&self, idx: usize) -> bool {
+        self.onboarding_mode
+            && !self.local_runtime_detected
+            && !self.rows[idx].is_configured
+            && self.rows[idx]
+                .provider
+                .provider()
+                .credential_help()
+                .acquisition
+                == CredentialAcquisition::LocalOptional
     }
 
     fn tr(&self, id: MessageId) -> Cow<'static, str> {
@@ -2130,6 +2155,9 @@ impl ProviderPickerView {
     }
 
     fn row_visible(&self, idx: usize) -> bool {
+        if self.hides_undetected_local(idx) {
+            return false;
+        }
         let query = self.query.trim();
         if !query.is_empty() {
             return self.rows[idx].matches_query(query);
@@ -2844,14 +2872,23 @@ impl ProviderPickerView {
         } else {
             self.tr(MessageId::PickerActionSetKey)
         };
-        let title = if !self.onboarding_mode && (self.search_mode || !self.query.is_empty()) {
+        let title = if self.onboarding_mode {
+            if self.search_mode || !self.query.is_empty() {
+                format!(
+                    " {} · {}: {} ",
+                    self.tr(MessageId::OnboardProviderTitle),
+                    self.tr(MessageId::SessionsActionSearch),
+                    self.query
+                )
+            } else {
+                format!(" {} ", self.tr(MessageId::OnboardProviderTitle))
+            }
+        } else if self.search_mode || !self.query.is_empty() {
             format!(
                 "{}: {}",
                 self.tr(MessageId::SessionsActionSearch),
                 self.query
             )
-        } else if self.onboarding_mode {
-            format!(" {} ", self.tr(MessageId::OnboardProviderTitle))
         } else {
             match (self.setup_mode, self.view) {
                 (true, ProviderListView::Configured) => {
@@ -4708,7 +4745,8 @@ impl ModalView for ProviderPickerView {
                 KeyCode::Char(c)
                     if key.modifiers.is_empty()
                         && self.query.is_empty()
-                        && c.eq_ignore_ascii_case(&'l') =>
+                        && c.eq_ignore_ascii_case(&'l')
+                        && (!self.onboarding_mode || self.local_runtime_detected) =>
                 {
                     self.show_local_routes();
                     ViewAction::None
@@ -8368,7 +8406,7 @@ mod tests {
             "provider = \"openai\"\ndefault_text_model = \"gpui-fixture\"\n\
              [providers.openai]\nbase_url = \"https://fixture.invalid/v1\"\nauth_mode = \"api_key\"\n",
             |app, config| {
-                assert_eq!(app.onboarding, crate::tui::app::OnboardingState::Provider);
+                assert_eq!(app.onboarding, crate::tui::app::OnboardingState::None);
                 assert!(app.onboarding_recovers_configured_route());
                 let picker = ProviderPickerView::new_for_onboarding(
                     app.api_provider,
@@ -8386,7 +8424,7 @@ mod tests {
     #[test]
     fn first_run_unconfigured_route_keeps_picker_and_local_discovery() {
         with_first_run_config("", |mut app, config| {
-            assert_eq!(app.onboarding, crate::tui::app::OnboardingState::Provider);
+            assert_eq!(app.onboarding, crate::tui::app::OnboardingState::None);
             assert!(!app.onboarding_recovers_configured_route());
             assert!(app.should_adopt_live_local_ollama());
             let picker =

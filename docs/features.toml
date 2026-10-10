@@ -275,6 +275,15 @@ docs = "docs/MODES.md#permission-posture"
 owner = "crates/execpolicy/src/approval_mode.rs"
 
 [[feature]]
+id = "full-access-confirmation"
+name = "Full Access confirmation"
+summary = "Entering Full Access asks first, lasts one session by default, can be kept per repo, and is receipted."
+status = "stable"
+surfaces = { tui = "stable", api = "stable" }
+docs = "docs/MODES.md#permission-posture"
+owner = "crates/tui/src/tui/full_access_confirm.rs"
+
+[[feature]]
 id = "sandbox"
 name = "Command sandbox"
 summary = "Wraps commands in Seatbelt on macOS; bubblewrap on Linux is on by default once installed and verified."
@@ -391,15 +400,6 @@ status = "flagged"
 surfaces = { tui = "stable", api = "stable" }
 docs = "docs/MEMORY.md"
 owner = "crates/memory"
-
-[[feature]]
-id = "cloud-dispatch"
-name = "Cloud dispatch"
-summary = "/dispatch sends a cloud agent to raise a branch and open a PR, after confirmation."
-status = "stable"
-surfaces = { tui = "stable" }
-docs = "docs/DAYTONA_CLOUD_DISPATCH.md"
-owner = "crates/tui/src/cloud_dispatch.rs"
 
 # --- Extending Codewhale ---
 

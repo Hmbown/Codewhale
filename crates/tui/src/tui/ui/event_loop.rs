@@ -1212,16 +1212,6 @@ pub async fn run_tui(
         persist_offline_queue_state(&app);
     }
 
-    // A launch without a usable key opens the picker immediately (#6566).
-    // A configured user's picker focuses the saved route so recovery cannot
-    // silently replace it; an unconfigured user sees the provider list rather
-    // than the built-in default's missing key.
-    if app.onboarding == OnboardingState::Provider && app.onboarding_missing_key_recovery {
-        let recover_configured_route = app.onboarding_recovers_configured_route();
-        open_onboarding_provider_picker(&mut app, config, &engine_handle, recover_configured_route)
-            .await;
-    }
-
     // #4605: create the dispatch completion channel before any submit path so
     // initial input and queued follow-ups can dispatch without blocking the
     // startup sequence.
@@ -1641,8 +1631,24 @@ async fn submit_decided_composer_input(
     let slash_menu_open = !slash_menu_entries.is_empty();
     let selecting_inline_skill = slash_menu_open
         && partial_inline_skill_mention_at_cursor(&app.input, app.cursor_position).is_some();
+    let typed_before_selection = app.input.trim().to_string();
     if slash_menu_open && apply_slash_menu_selection(app, &slash_menu_entries, false) {
         app.close_slash_menu();
+        let resolved = app
+            .input
+            .trim()
+            .trim_start_matches('/')
+            .to_ascii_lowercase();
+        if !selecting_inline_skill
+            && !typed_before_selection.eq_ignore_ascii_case(app.input.trim())
+            && matches!(
+                resolved.as_str(),
+                "exit" | "quit" | "clear" | "new" | "logout" | "restore"
+            )
+        {
+            app.cursor_position = app.input.chars().count();
+            return Ok(false);
+        }
         if selecting_inline_skill {
             return Ok(false);
         }
@@ -2019,6 +2025,17 @@ pub(crate) async fn run_event_loop(
             super::feedback_host::dispatch_ready(app, config, &engine_handle).await?;
         }
 
+        if app.onboarding == OnboardingState::Provider && app.view_stack.top_kind().is_none() {
+            let recover_configured_route = app.onboarding_recovers_configured_route();
+            open_onboarding_provider_picker(
+                app,
+                &*config,
+                &engine_handle,
+                recover_configured_route,
+            )
+            .await;
+        }
+
         // Drain the version-check handle once; re-assign None so we
         // don't poll it again.
         let mut done = false;
@@ -2051,6 +2068,7 @@ pub(crate) async fn run_event_loop(
             local_done = handle.is_finished();
         }
         if local_done && let Ok(Some(catalog)) = local_ollama_probe.take().unwrap().await {
+            app.local_runtime_detected = true;
             adopt_live_local_ollama_catalog(app, &mut engine_handle, config, catalog).await;
         }
 
@@ -2281,6 +2299,9 @@ pub(crate) async fn run_event_loop(
 
         // Discovery and callback delivery never park terminal input.
         poll_mcp_login(app);
+        if let Some(server) = app.mcp_login_reconnect.take() {
+            start_mcp_retry(app, &engine_handle, server);
+        }
         poll_mcp_retries(app);
 
         // #1830/#2317: service any already-arrived terminal keys before a

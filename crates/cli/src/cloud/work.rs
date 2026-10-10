@@ -695,7 +695,7 @@ fn write_work_result<W: Write>(
                     text_at(attempt, &["status"]).unwrap_or_else(|| "unknown".to_string())
                 );
                 if let Some(code) = text_at(attempt, &["errorCode"]) {
-                    line.push_str(&format!(" (error {code})"));
+                    line.push_str(&format!(" (error: {})", display_error_code(&code)));
                 }
                 writeln!(out, "{line}")?;
             }
@@ -1142,7 +1142,7 @@ pub(super) fn quote<T: CloudTransport, W: Write>(
         writeln!(out, "{title}")?;
     }
     if let Some(copy) = str_at(&quote, &["confirmCopy", "body"])
-        .map(|body| printable_max(body, 800))
+        .map(|body| vendor_safe_prose(printable_max(body, 800)))
         .filter(|body| !body.is_empty())
     {
         writeln!(out, "{copy}")?;
@@ -1205,6 +1205,15 @@ pub(super) fn dispatch<T: CloudTransport, W: Write>(
         out.write_all(&recorded)?;
         bail!("This message did not create exactly one new Work, so nothing was quoted or started");
     };
+    let recorded_text = String::from_utf8_lossy(&recorded);
+    if !recorded_text
+        .lines()
+        .any(|line| matches!(line.trim(), "Intent: actionable" | "Intent: queued"))
+    {
+        out.write_all(&recorded)?;
+        bail!("This message was not read as new Work, so nothing was quoted or started");
+    }
+    writeln!(out, "Message ID: {}", options.message_id)?;
     writeln!(out, "Work ID: {id}")?;
     let quoted = quote(
         client,

@@ -2685,29 +2685,26 @@ fn fully_configured_returning_user_skips_onboarding() {
 }
 
 #[test]
-fn returning_user_missing_api_key_goes_to_canonical_provider_setup() {
+fn returning_user_missing_api_key_starts_at_composer() {
     assert_eq!(
         initial_onboarding_state(false, true, false, true, false),
-        OnboardingState::Provider
+        OnboardingState::None
     );
-    // workspace trust doesn't affect the api-key gate
     assert_eq!(
         initial_onboarding_state(false, true, false, true, true),
-        OnboardingState::Provider
+        OnboardingState::None
     );
 }
 
 #[test]
-fn first_run_user_without_a_key_starts_on_connect_a_model() {
-    // #6566: a new user with no key used to land on a composer that could
-    // not answer. The one launch screen is the provider picker.
+fn first_run_user_without_a_key_starts_at_composer() {
     assert_eq!(
         initial_onboarding_state(false, false, true, true, true),
-        OnboardingState::Provider
+        OnboardingState::None
     );
     assert_eq!(
         initial_onboarding_state(false, false, false, true, true),
-        OnboardingState::Provider
+        OnboardingState::None
     );
 }
 
@@ -2816,8 +2813,9 @@ fn first_run_app_without_a_key_opens_provider_setup() {
     .collect();
 
     let app = App::new(test_options(false), &Config::default());
-    // #6566: the first screen connects a model; Esc returns to the composer.
-    assert_eq!(app.onboarding, OnboardingState::Provider);
+    // CW-7167: a keyless launch opens the composer; the provider is asked for
+    // on the first send.
+    assert_eq!(app.onboarding, OnboardingState::None);
     assert!(app.onboarding_needs_api_key);
     assert!(app.onboarding_missing_key_recovery);
     // A new user has no saved route, so the picker opens on the provider
@@ -3942,7 +3940,19 @@ fn cycle_approval_scenario() {
         assert!(app.cycle_approval_posture());
         assert_eq!(app.approval_mode, ApprovalMode::Auto);
 
-        assert!(app.cycle_approval_posture());
+        assert!(!app.cycle_approval_posture());
+        assert_eq!(
+            app.view_stack.top_kind(),
+            Some(crate::tui::views::ModalKind::FullAccessConfirm)
+        );
+        assert_eq!(app.approval_mode, ApprovalMode::Auto);
+        let persisted =
+            std::fs::read_to_string(tmp.path().join("settings.toml")).expect("settings");
+        assert!(!persisted.contains("full-access"));
+        assert!(app.apply_confirmed_full_access(
+            crate::tui::full_access_confirm::FullAccessScope::Session,
+            crate::tui::full_access_confirm::FullAccessOrigin::Cycle,
+        ));
         assert_eq!(app.approval_mode, ApprovalMode::Bypass);
 
         assert!(app.cycle_approval_posture());
@@ -3970,7 +3980,7 @@ fn cycle_approval_scenario() {
             .count();
         assert_eq!(notices, 1, "first cycle posts the rebinding notice");
 
-        assert!(app.cycle_approval_posture());
+        let _ = app.cycle_approval_posture();
         let notices = app
             .status_toasts
             .iter()
@@ -4002,9 +4012,13 @@ fn plan_permission_cycle_moves_the_baseline_and_leaves_plan_read_only() {
     app.set_mode(AppMode::Plan);
 
     assert!(
-        app.cycle_approval_posture(),
-        "Shift+Tab must still change permissions while in Plan"
+        !app.cycle_approval_posture(),
+        "Shift+Tab into Full Access asks first, even while in Plan"
     );
+    assert!(app.apply_confirmed_full_access(
+        crate::tui::full_access_confirm::FullAccessScope::Session,
+        crate::tui::full_access_confirm::FullAccessOrigin::Cycle,
+    ));
     assert_eq!(
         app.mode_prefs.agent_approval_mode,
         ApprovalMode::Bypass,
@@ -4021,16 +4035,9 @@ fn plan_permission_cycle_moves_the_baseline_and_leaves_plan_read_only() {
         "changing permissions must not move the mode"
     );
     assert!(
-        app.status_toasts
-            .iter()
-            .any(|toast| toast.text.contains("applies in Act and Operate")),
-        "the receipt must say when the new posture starts applying"
-    );
-
-    let persisted = std::fs::read_to_string(tmp.path().join("settings.toml")).expect("settings");
-    assert!(
-        persisted.contains("permission_posture = \"full-access\""),
-        "the posture is durable, not dropped because Plan was active: {persisted}"
+        std::fs::read_to_string(tmp.path().join("settings.toml"))
+            .map_or(true, |persisted| !persisted.contains("full-access")),
+        "Full Access is per-session and is never written to settings"
     );
 
     app.set_mode(AppMode::Operate);
@@ -4067,10 +4074,10 @@ fn busy_permission_cycle_changes_neither_runtime_nor_persistence() {
 #[test]
 fn permission_postures_persist_across_restart() {
     let _env_lock = lock_test_env();
-    for (cycles, expected) in [
-        (1, ApprovalMode::Auto),
-        (2, ApprovalMode::Bypass),
-        (3, ApprovalMode::Suggest),
+    for (cycles, expected, restarted_expected) in [
+        (1, ApprovalMode::Auto, ApprovalMode::Auto),
+        (2, ApprovalMode::Bypass, ApprovalMode::Auto),
+        (3, ApprovalMode::Suggest, ApprovalMode::Suggest),
     ] {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("config.toml");
@@ -4079,16 +4086,27 @@ fn permission_postures_persist_across_restart() {
         options.start_in_agent_mode = true;
         options.config_path = Some(path.clone());
         let mut app = App::new(options.clone(), &Config::default());
-        for _ in 0..cycles {
-            assert!(app.cycle_approval_posture());
+        for cycle in 1..=cycles {
+            if cycle == 2 {
+                assert!(!app.cycle_approval_posture());
+                assert!(app.apply_confirmed_full_access(
+                    crate::tui::full_access_confirm::FullAccessScope::Session,
+                    crate::tui::full_access_confirm::FullAccessOrigin::Cycle,
+                ));
+            } else {
+                assert!(app.cycle_approval_posture());
+            }
         }
         assert_eq!(app.approval_mode, expected);
         assert_eq!(app.trust_mode, expected == ApprovalMode::Bypass);
 
         let restarted = App::new(options, &Config::default());
-        assert_eq!(restarted.approval_mode, expected);
-        assert_eq!(restarted.mode_prefs.agent_approval_mode, expected);
-        assert_eq!(restarted.trust_mode, expected == ApprovalMode::Bypass);
+        assert_eq!(restarted.approval_mode, restarted_expected);
+        assert_eq!(restarted.mode_prefs.agent_approval_mode, restarted_expected);
+        assert_eq!(
+            restarted.trust_mode,
+            restarted_expected == ApprovalMode::Bypass
+        );
         drop(config_env);
     }
 }
@@ -4158,11 +4176,24 @@ fn legacy_yolo_migrates_root_policy_to_agent_full_access() {
     let saved_settings = std::fs::read_to_string(&settings_path).expect("saved settings");
     assert!(saved_settings.contains("default_mode = \"agent\""));
     assert!(saved_settings.contains("permission_posture = \"full-access\""));
+    assert!(!saved_settings.contains("full_access_migration_shown"));
+    assert_eq!(
+        app.view_stack.top_kind(),
+        Some(crate::tui::views::ModalKind::FullAccessConfirm)
+    );
+    let mut app = app;
+    assert!(!app.apply_confirmed_full_access(
+        crate::tui::full_access_confirm::FullAccessScope::Session,
+        crate::tui::full_access_confirm::FullAccessOrigin::Migration,
+    ));
+    let saved_settings = std::fs::read_to_string(&settings_path).expect("saved settings");
+    assert!(saved_settings.contains("permission_posture = \"ask\""));
+    assert!(saved_settings.contains("full_access_migration_shown = true"));
 
     let restarted_config = Config::load(Some(config_path), None).expect("reload config");
     let restarted = App::new(options, &restarted_config);
     assert_eq!(restarted.mode, AppMode::Agent);
-    assert_eq!(restarted.approval_mode, ApprovalMode::Bypass);
+    assert_eq!(restarted.approval_mode, ApprovalMode::Suggest);
     assert!(!restarted.approval_policy_locked());
 }
 
@@ -6731,7 +6762,14 @@ fn explicit_mode_selection_and_hotbar_share_the_persistence_owner() {
 
     // The legacy YOLO entry point installs Act, so that is what must persist —
     // "yolo" is a permission alias, never a startup mode.
-    assert_eq!(app.select_yolo_compat(), SettingSelection::Changed);
+    assert_eq!(
+        app.select_yolo_compat(),
+        SettingSelection::NeedsConfirmation
+    );
+    assert!(app.apply_confirmed_full_access(
+        crate::tui::full_access_confirm::FullAccessScope::Session,
+        crate::tui::full_access_confirm::FullAccessOrigin::Yolo,
+    ));
     assert_eq!(Settings::load().expect("reload").default_mode, "agent");
 }
 
@@ -7086,13 +7124,20 @@ async fn mode_and_permission_posture_writes_do_not_clobber_each_other() {
             "mode selection must change mode"
         );
         assert!(
-            app.cycle_approval_posture(),
+            app.cycle_approval_posture()
+                || app.apply_confirmed_full_access(
+                    crate::tui::full_access_confirm::FullAccessScope::Session,
+                    crate::tui::full_access_confirm::FullAccessOrigin::Cycle,
+                ),
             "the posture write must succeed, or the assertion below is vacuous"
         );
     }
     app.startup_defaults.flush();
 
-    let expected_posture = App::approval_posture_setting(app.mode_prefs.agent_approval_mode);
+    let expected_posture = match app.mode_prefs.agent_approval_mode {
+        ApprovalMode::Bypass => "auto-review",
+        mode => App::approval_posture_setting(mode),
+    };
     let saved = Settings::load_persisted().expect("reload settings");
     assert_eq!(
         saved.default_mode, "operate",
@@ -7190,7 +7235,13 @@ async fn rapid_mixed_writes_settle_on_the_last_value_for_every_field() {
         );
         app.apply_reasoning_effort_cycle();
         // Synchronous direct writers.
-        assert!(app.cycle_approval_posture());
+        assert!(
+            app.cycle_approval_posture()
+                || app.apply_confirmed_full_access(
+                    crate::tui::full_access_confirm::FullAccessScope::Session,
+                    crate::tui::full_access_confirm::FullAccessOrigin::Cycle,
+                )
+        );
         Settings::transact(|settings| settings.set("max_history", &(200 + index).to_string()))
             .expect("the direct write must land");
     }
@@ -7207,7 +7258,10 @@ async fn rapid_mixed_writes_settle_on_the_last_value_for_every_field() {
         &app.active_route_base_url,
         &app.model,
     );
-    let expected_posture = App::approval_posture_setting(app.mode_prefs.agent_approval_mode);
+    let expected_posture = match app.mode_prefs.agent_approval_mode {
+        ApprovalMode::Bypass => "auto-review",
+        mode => App::approval_posture_setting(mode),
+    };
     let saved = Settings::load_persisted().expect("reload settings");
     assert_eq!(saved.default_mode, app.mode.as_setting());
     assert_eq!(saved.reasoning_effort.as_deref(), Some(expected_effort));
@@ -7683,11 +7737,11 @@ fn launch_onboarding_scenario() {
     }
     // from launch_onboarding_opens_picker_for_generic_missing_key
     {
-        // A generic missing key (not the xAI-OAuth re-auth case) still reopens the
-        // provider picker for recovery.
+        // A generic missing key (not the xAI-OAuth re-auth case) starts at the
+        // composer with missing-key recovery armed for the first send.
         let (onboarding, recovery) =
             launch_onboarding_decision(false, true, false, true, false, false);
-        assert_eq!(onboarding, OnboardingState::Provider);
+        assert_eq!(onboarding, OnboardingState::None);
         assert!(recovery);
     }
     // from launch_onboarding_clean_when_onboarded_with_key
@@ -7705,10 +7759,8 @@ fn launch_onboarding_scenario() {
         assert_eq!(onboarding, OnboardingState::None);
         assert!(!recovery);
 
-        // #6566: a first run with no key opens the picker directly, with the
-        // same Esc-to-composer exit as missing-key recovery.
         let (keyless, recovery) = launch_onboarding_decision(false, false, true, true, true, false);
-        assert_eq!(keyless, OnboardingState::Provider);
+        assert_eq!(keyless, OnboardingState::None);
         assert!(recovery);
 
         // A first run with a key starts at the composer.

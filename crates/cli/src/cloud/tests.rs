@@ -4004,7 +4004,7 @@ fn work_result_summarises_evidence_pr_route_and_boat_usage() {
         "Provider VM: stopped",
         "Provider cleanup: confirmed",
         "Attempts: 2",
-        "#1 launch failed (error boat_task_stop_unconfirmed)",
+        "#1 launch failed (error: The cloud computer stopped but its state is unconfirmed)",
         "#2 recovery settled",
         "Evidence through event 57",
     ] {
@@ -4937,7 +4937,7 @@ fn account_errors_stay_typed_so_callers_can_tell_refusals_from_unknown_outcomes(
     ));
     assert_eq!(
         refusal.to_string(),
-        "Codewhale account request failed (HTTP 422, code boat_work_trial_seconds_invalid)"
+        "Codewhale account request failed (HTTP 422)"
     );
     assert!(!outcome_unknown(&refusal));
     for status in [500, 502, 503, 504, 408] {

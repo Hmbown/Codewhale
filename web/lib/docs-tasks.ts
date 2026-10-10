@@ -199,12 +199,12 @@ export const DOC_TASKS: DocTask[] = [
     id: "cloud-computer",
     label: { en: "Send a task to the cloud", zh: "把任务发送到云端" },
     description: {
-      en: "Preview: propose and confirm a cloud agent that opens a pull request.",
-      zh: "预览版：提议并确认一个会提交拉取请求的云端 Agent。",
+      en: "Preview: quote and run a cloud agent through your account.",
+      zh: "预览版：通过你的账户为云端 Agent 报价并运行。",
     },
     href: "/docs/computers",
     topicId: "computers",
-    keywords: { en: "dispatch cloud agent daytona remote github cnb gitee", zh: "云端 派发 远程" },
+    keywords: { en: "dispatch cloud agent quote account", zh: "云端 派发 远程" },
   },
   {
     id: "troubleshoot",

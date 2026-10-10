@@ -1139,7 +1139,11 @@ pub(crate) fn tideline_footer_from_app(app: &mut App, width: u16) -> TidelineFoo
         permission_chip,
         permission_key: live_chord(ShellBindingId::PermissionCycle)
             .filter(|_| {
-                !crate::tui::footer_hints::retired(
+                matches!(
+                    app.approval_mode,
+                    codewhale_execpolicy::ApprovalMode::Auto
+                        | codewhale_execpolicy::ApprovalMode::Bypass
+                ) || !crate::tui::footer_hints::retired(
                     &app.footer_hint_uses,
                     crate::tui::footer_hints::PERMISSION_CYCLE,
                 )

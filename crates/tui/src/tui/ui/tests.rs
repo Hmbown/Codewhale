@@ -3318,14 +3318,7 @@ fn mcp_login_progress_preserves_cancel_until_finish_and_ignores_cancelled_mailbo
     *progress.lock().unwrap() = Some(McpLoginProgress::Finished(Ok(())));
     poll_mcp_login(&mut app);
     assert!(app.mcp_login.is_none());
-    assert!(
-        app.status_toasts
-            .back()
-            .unwrap()
-            .text
-            .as_str()
-            .contains("Stored OAuth credentials")
-    );
+    assert_eq!(app.mcp_login_reconnect.as_deref(), Some("fixture"));
     assert!(token.is_cancelled());
     let completed = app.status_toasts.back().unwrap().text.clone();
     *progress.lock().unwrap() = Some(McpLoginProgress::Finished(Err("late failure".into())));
@@ -9012,17 +9005,25 @@ fn setup_high_trust_persists_full_access_without_legacy_yolo_mode() {
 
     let settings = Settings::load().expect("load saved settings");
     assert_eq!(settings.default_mode, "agent");
-    assert_eq!(settings.permission_posture.as_deref(), Some("full-access"));
+    assert_eq!(settings.permission_posture.as_deref(), Some("ask"));
     assert_eq!(config.approval_policy, None);
     assert_eq!(app.mode, AppMode::Agent);
-    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
+    assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+    assert_eq!(
+        app.view_stack.top_kind(),
+        Some(crate::tui::views::ModalKind::FullAccessConfirm)
+    );
     assert!(app.allow_shell);
-    assert!(app.trust_mode);
+    assert!(!app.trust_mode);
     assert_eq!(
         app.configured_sandbox_mode.as_deref(),
         Some("danger-full-access")
     );
 
+    assert!(app.apply_confirmed_full_access(
+        crate::tui::full_access_confirm::FullAccessScope::Session,
+        crate::tui::full_access_confirm::FullAccessOrigin::Setup,
+    ));
     app.set_mode(AppMode::Plan);
     assert!(!app.allow_shell);
     assert_eq!(app.approval_mode, ApprovalMode::Suggest);
@@ -10544,8 +10545,14 @@ async fn mode_change_update_notifies_engine() {
     let mut engine = crate::core::engine::mock_engine_handle();
 
     assert!(
-        apply_yolo_compat_update(&mut app, &engine.handle, &crate::config::Config::default()).await
+        !apply_yolo_compat_update(&mut app, &engine.handle, &crate::config::Config::default())
+            .await
     );
+    assert!(app.apply_confirmed_full_access(
+        crate::tui::full_access_confirm::FullAccessScope::Session,
+        crate::tui::full_access_confirm::FullAccessOrigin::Yolo,
+    ));
+    crate::tui::ui::sync_mode_update(&app, &engine.handle).await;
 
     match engine.rx_op.recv().await.expect("change mode op") {
         crate::core::ops::Op::ChangeMode {
@@ -11267,8 +11274,7 @@ async fn first_run_switch_to_keyed_route_clears_launch_missing_key_state() {
     assert_eq!(app.api_provider, ProviderKind::Deepseek);
     assert!(app.onboarding_needs_api_key);
     assert!(app.onboarding_missing_key_recovery);
-    assert_eq!(app.onboarding, OnboardingState::Provider);
-    app.onboarding = OnboardingState::None;
+    assert_eq!(app.onboarding, OnboardingState::None);
 
     let mut engine = mock_engine_handle();
     assert!(

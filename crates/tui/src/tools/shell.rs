@@ -48,7 +48,9 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 mod guidance;
 mod output;
 
-use super::shell_output::{summarize_output, truncate_with_meta};
+use super::shell_output::{
+    kill_outcome_note, output_phase_hint, summarize_output, truncate_with_meta,
+};
 use crate::child_env;
 use crate::sandbox::{
     CommandSpec,
@@ -3189,6 +3191,11 @@ impl ShellManager {
         Ok(())
     }
 
+    pub fn last_output_age_ms(&self, task_id: &str) -> Option<u64> {
+        let shell = self.processes.get(task_id)?;
+        Some(u64::try_from(shell.last_output_at.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+
     /// Kill a running background process
     pub fn kill(&mut self, task_id: &str) -> Result<ShellResult> {
         let shell = self
@@ -5254,7 +5261,7 @@ const FOREGROUND_POLL_MAX_MS: u64 = 100;
 /// no `timeout_ms`. Matches the value the tool's own input schema advertises;
 /// before this existed the omitted case fell through to
 /// `BASH_MAX_TIMEOUT_MS`.
-const CONTRACT_BASH_FOREGROUND_DEFAULT_TIMEOUT_MS: u64 = 120_000;
+const CONTRACT_BASH_FOREGROUND_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
 /// Resolve the lifetime for one `bash` run.
 ///
@@ -5262,7 +5269,7 @@ const CONTRACT_BASH_FOREGROUND_DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// `BASH_MAX_TIMEOUT_MS` (~24.8 days), so a command that blocked on an
 /// interactive prompt or a hung network call pinned the turn indefinitely —
 /// the tool row just counted seconds while the model waited. The tool's own
-/// schema already promises `action=run 120000`, so an omitted timeout takes
+/// schema already promises `action=run 30000`, so an omitted timeout takes
 /// that default as the foreground wait. Past it the command moves to the
 /// background (it is never killed for running long) and the model gets its
 /// output so far and task id.
@@ -5283,6 +5290,27 @@ fn contract_bash_timeout_ms(
     requested_ms
 }
 
+fn promotion_notice(
+    context: &ToolContext,
+    task_id: &str,
+    elapsed_seconds: u64,
+    output: &str,
+) -> String {
+    let last_output = context
+        .shell_manager
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .last_output_age_ms(task_id)
+        .map_or_else(
+            || "last output age unknown".to_string(),
+            |ms| format!("last output {}s ago", ms / 1_000),
+        );
+    format!(
+        "Still running after {elapsed_seconds}s ({last_output}; {}); moved to the background as {task_id} (not killed).",
+        output_phase_hint(output)
+    )
+}
+
 fn contract_bash_error_status(result: &ShellResult, timeout_ms: Option<u64>) -> String {
     match result.status {
         ShellStatus::TimedOut => {
@@ -5294,7 +5322,10 @@ fn contract_bash_error_status(result: &ShellResult, timeout_ms: Option<u64>) -> 
             };
             format!("Command timed out after {seconds} seconds")
         }
-        ShellStatus::Killed => "Command aborted".to_string(),
+        ShellStatus::Killed => format!(
+            "Command aborted. {}",
+            kill_outcome_note(&format!("{}{}", result.stdout, result.stderr))
+        ),
         ShellStatus::Failed | ShellStatus::Completed | ShellStatus::Running => format!(
             "Command exited with code {}",
             result.exit_code.unwrap_or(-1)
@@ -5334,9 +5365,9 @@ fn finish_contract_bash_result(
         } else {
             tail_lines(output.trim(), 20)
         };
+        let notice = promotion_notice(context, task_id, result.duration_ms / 1_000, &output);
         return Ok(ToolResult::success(format!(
-            "Still running after {}s; moved to the background as {task_id} (not killed).\n\nOutput so far:\n{so_far}\n\nCompletion will appear as a runtime event. To see more output or block until it finishes, call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id}\". To stop it, send the same call with cancel=true. It also stops when the session ends.",
-            result.duration_ms / 1_000
+            "{notice}\n\nOutput so far:\n{so_far}\n\nCompletion will appear as a runtime event. To see more output or block until it finishes, call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id}\". To stop it, send the same call with cancel=true. It also stops when the session ends."
         )).with_metadata(metadata));
     }
     if result.status != ShellStatus::Completed {
@@ -5381,7 +5412,7 @@ impl ToolSpec for LowercaseBashTool {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": guidance::runtime_command_guidance() },
-                "timeout": { "type": "number", "description": "Optional seconds to wait in the foreground (default 120 seconds). A command still running then is not killed: it moves to the background and you get its output so far and a task_id. Find task_shell_wait with tool_search to read more or wait for it." },
+                "timeout": { "type": "number", "description": "Optional seconds to wait in the foreground (default 30 seconds). A command still running then is not killed: it moves to the background by itself and you get its output so far, how long ago it last printed, its build phase, and a task_id. Find task_shell_wait with tool_search to read more or wait for it." },
                 "read_only": { "type": "boolean", "description": "Set true to run analysis code (including Python/SQLite) with mandatory native filesystem read-only isolation and no network. Available during peer writes. Refused when native enforcement is unavailable; no background, stdin, external backend, or sandbox escalation." },
                 "sandbox_permissions": {
                     "type": "string",
@@ -5585,7 +5616,7 @@ impl ToolSpec for BashTool {
                 "read_only": { "type": "boolean", "description": "Set true to require native filesystem read-only and no-network execution. Only foreground run with command, cwd and timeout_ms; unavailable enforcement fails closed." },
                 "timeout_ms": {
                     "type": "integer",
-                    "description": "How long to wait, in milliseconds. action=run: how long the turn waits in the foreground (default 120000, max 600000); a command still running then is NOT killed — it moves to the background and you get its output so far and task_id. action=wait 30000, action=interact 1000. For action=wait, `timeout_secs` (seconds) and `timeout` (milliseconds) are accepted aliases."
+                    "description": "How long to wait, in milliseconds. action=run: how long the turn waits in the foreground (default 30000, max 600000); a command still running then is NOT killed — it moves to the background by itself and you get its output so far, how long ago it last printed, its build phase, and task_id. action=wait 30000, action=interact 1000. For action=wait, `timeout_secs` (seconds) and `timeout` (milliseconds) are accepted aliases."
                 },
                 "background": {
                     "type": "boolean",
@@ -5842,7 +5873,14 @@ impl ToolSpec for BashTool {
                 })
                 .transpose()?
         } else {
-            Some(optional_u64(&input, "timeout_ms", 120_000)?.min(600_000))
+            let detached = optional_bool(&input, "background", false)?
+                || optional_bool(&input, "interactive", false)?;
+            let default_ms = if detached {
+                120_000
+            } else {
+                CONTRACT_BASH_FOREGROUND_DEFAULT_TIMEOUT_MS
+            };
+            Some(optional_u64(&input, "timeout_ms", default_ms)?.min(600_000))
         };
         let background = optional_bool(&input, "background", false)?;
         let interactive = optional_bool(&input, "interactive", false)?;
@@ -6442,8 +6480,14 @@ impl ToolSpec for BashTool {
                                 tail_lines(err, 20)
                             ),
                         };
+                        let notice = promotion_notice(
+                            context,
+                            &task_id_str,
+                            seconds,
+                            &format!("{}{}", result.stdout, result.stderr),
+                        );
                         format!(
-                            "Still running after {seconds}s; moved to the background as {task_id_str} (not killed).\n\nOutput so far:\n{so_far}\n\n{completion_contract} Keep working if you can. To decide: call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id_str}\" for more output or completion, or with cancel=true to stop it. It also stops when the session ends."
+                            "{notice}\n\nOutput so far:\n{so_far}\n\n{completion_contract} Keep working if you can. To decide: call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id_str}\" for more output or completion, or with cancel=true to stop it. It also stops when the session ends."
                         )
                     } else {
                         format!(
@@ -6452,8 +6496,10 @@ impl ToolSpec for BashTool {
                     }
                 } else if result.status == ShellStatus::Killed && was_cancelled {
                     format!(
-                        "Command canceled; process killed.\n\nSTDOUT:\n{}\n\nSTDERR:\n{}",
-                        result.stdout, result.stderr
+                        "Command canceled; process killed. {}\n\nSTDOUT:\n{}\n\nSTDERR:\n{}",
+                        kill_outcome_note(&format!("{}{}", result.stdout, result.stderr)),
+                        result.stdout,
+                        result.stderr
                     )
                 } else if result.status == ShellStatus::TimedOut {
                     format!(
@@ -6988,7 +7034,10 @@ impl BashTool {
             .clone()
             .unwrap_or_else(|| task_id.to_string());
         Ok(ToolResult {
-            content: format!("Canceled background command: {task_id}"),
+            content: format!(
+                "Canceled background command: {task_id}. {}",
+                kill_outcome_note(&format!("{}{}", result.stdout, result.stderr))
+            ),
             success: true,
             metadata: Some(json!({
                 "status": format!("{:?}", result.status),

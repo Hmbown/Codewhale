@@ -2,8 +2,10 @@
 
 use crate::tools::shell::{ShellJobDetail, ShellJobSnapshot, ShellResult, ShellStatus};
 use crate::tui::app::App;
-use crate::tui::history::HistoryCell;
+use crate::tui::history::{HistoryCell, ToolCell, ToolStatus};
 use crate::tui::pager::PagerView;
+use crate::tui::views::{CommandPaletteAction, ViewEvent};
+use codewhale_localization::MessageId;
 
 fn status_label(status: &ShellStatus, stale: bool) -> &'static str {
     if stale {
@@ -85,34 +87,108 @@ pub(super) fn format_shell_poll(result: &ShellResult) -> String {
     lines.join("\n")
 }
 
-pub(super) fn open_shell_job_pager(app: &mut App, detail: &ShellJobDetail) {
+const MAX_INSPECTOR_STREAM_BYTES: usize = 256 * 1024;
+
+fn bounded_tail(text: &str) -> String {
+    if text.len() <= MAX_INSPECTOR_STREAM_BYTES {
+        return text.to_string();
+    }
+    let mut start = text.len() - MAX_INSPECTOR_STREAM_BYTES;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("... ({start} earlier bytes omitted)\n{}", &text[start..])
+}
+
+pub(crate) fn shell_job_for_cell(app: &App, cell_index: usize) -> Option<ShellJobDetail> {
+    let HistoryCell::Tool(ToolCell::Exec(exec)) = app.cell_at_virtual_index(cell_index)? else {
+        return None;
+    };
+    let session = app.current_session_id.as_deref()?;
+    let mut manager = app
+        .runtime_services
+        .shell_manager
+        .as_ref()?
+        .try_lock()
+        .ok()?;
+    let job_id = match exec.shell_task_id.clone() {
+        Some(id) => id,
+        None => {
+            let tool_id = app
+                .tool_cells
+                .iter()
+                .find(|(_, index)| **index == cell_index)
+                .map(|(tool_id, _)| tool_id.clone())?;
+            manager
+                .list_jobs_for_session(session)
+                .into_iter()
+                .find(|job| job.origin_tool_call_id.as_deref() == Some(tool_id.as_str()))?
+                .id
+        }
+    };
+    manager.inspect_job_for_session(session, &job_id).ok()
+}
+
+pub(crate) fn newest_running_shell_cell(app: &App) -> Option<usize> {
+    (0..app.virtual_cell_count()).rev().find(|&index| {
+        matches!(
+            app.cell_at_virtual_index(index),
+            Some(HistoryCell::Tool(ToolCell::Exec(exec))) if exec.status == ToolStatus::Running
+        )
+    })
+}
+
+pub(crate) fn open_shell_job_pager(app: &mut App, detail: &ShellJobDetail) {
     let width = app
         .viewport
         .last_transcript_area
         .map(|area| area.width)
         .unwrap_or(100)
         .saturating_sub(4);
-    app.view_stack.push(PagerView::from_text(
+    let live = detail.snapshot.status == ShellStatus::Running && !detail.snapshot.stale;
+    let body = format_shell_job_detail(detail);
+    let mut pager = PagerView::from_text(
         format!("Bash Job {}", detail.snapshot.id),
-        &format_shell_job_detail(detail),
+        &body,
         width.max(60),
-    ));
+    )
+    .with_copy_text(body);
+    if live {
+        pager = pager.with_destructive_action(
+            's',
+            app.tr(MessageId::SidebarStopControl),
+            app.tr(MessageId::WorkSurfaceStopConfirmHint),
+            ViewEvent::CommandPaletteSelected {
+                action: CommandPaletteAction::ExecuteCommand {
+                    command: format!("/jobs cancel {}", detail.snapshot.id),
+                },
+            },
+        );
+    }
+    app.view_stack.push(pager);
 }
 
-fn format_shell_job_detail(detail: &ShellJobDetail) -> String {
+pub(crate) fn format_shell_job_detail(detail: &ShellJobDetail) -> String {
     let job = &detail.snapshot;
     let mut lines = vec![
         format!("Job: {}", job.id),
         format!("Status: {}", status_label(&job.status, job.stale)),
         format!("Command: {}", job.command),
         format!("Cwd: {}", crate::utils::display_path(&job.cwd)),
-        format!(
-            "Elapsed: {}",
-            codewhale_command_contract::elapsed::format_elapsed_ms(job.elapsed_ms)
-        ),
-        format!("Exit Code: {:?}", job.exit_code),
-        format!("Stdin Available: {}", job.stdin_available),
     ];
+    if let Some(owner) = job
+        .owner_agent_name
+        .as_ref()
+        .or(job.owner_agent_id.as_ref())
+    {
+        lines.push(format!("Owner: {owner}"));
+    }
+    lines.push(format!(
+        "Elapsed: {}",
+        codewhale_command_contract::elapsed::format_elapsed_ms(job.elapsed_ms)
+    ));
+    lines.push(format!("Exit Code: {:?}", job.exit_code));
+    lines.push(format!("Stdin Available: {}", job.stdin_available));
     if let Some(task_id) = job.linked_task_id.as_ref() {
         lines.push(format!("Linked Task: {task_id}"));
     }
@@ -120,22 +196,32 @@ fn format_shell_job_detail(detail: &ShellJobDetail) -> String {
         lines.push(
             "Completion state: stale after restart; the process is no longer running.".to_string(),
         );
+    } else if job.status == ShellStatus::Running {
+        lines.push("Completion State: still running in this TUI process.".to_string());
     } else {
-        lines.push("Completion State: live in this TUI process.".to_string());
+        lines.push("Completion State: finished.".to_string());
     }
     lines.push(String::new());
+    if detail.stdout.is_empty()
+        && detail.stderr.is_empty()
+        && job.status == ShellStatus::Running
+        && !job.stale
+    {
+        lines.push("(no output yet)".to_string());
+        return lines.join("\n");
+    }
     lines.push(format!("STDOUT ({} bytes):", job.stdout_len));
     lines.push(if detail.stdout.is_empty() {
         "(empty)".to_string()
     } else {
-        detail.stdout.clone()
+        bounded_tail(&detail.stdout)
     });
     lines.push(String::new());
     lines.push(format!("STDERR ({} bytes):", job.stderr_len));
     lines.push(if detail.stderr.is_empty() {
         "(empty)".to_string()
     } else {
-        detail.stderr.clone()
+        bounded_tail(&detail.stderr)
     });
     lines.join("\n")
 }

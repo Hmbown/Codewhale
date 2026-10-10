@@ -96,7 +96,6 @@ use coord::{
 
 pub mod advisor;
 pub(crate) mod budget_handback;
-mod cloud_proposal;
 pub mod coord;
 mod delivery;
 pub(crate) mod engine;
@@ -11260,16 +11259,6 @@ impl ToolSpec for AgentTool {
                     "type": "string",
                     "description": "The focused task to give the worker. A read-only role needs no write scope; a write-capable role defaults to the parent workspace unless narrowed with write_roots."
                 },
-                "runtime": {
-                    "type": "string",
-                    "enum": ["local", "cloud"],
-                    "description": "cloud only proposes a cloud PR job; nothing runs until the person types /dispatch confirm <id>. Never confirm it yourself."
-                },
-                "remote": {
-                    "type": "string",
-                    "enum": ["github", "cnb", "gitee"],
-                    "description": "cloud: PR forge."
-                },
                 "detached": {
                     "type": "boolean",
                     "description": "Default children continue after ordinary parent turn completion and remain explicitly cancellable. true additionally opts this subtree out of parent-turn cancellation; its own budgets still apply."
@@ -11454,11 +11443,6 @@ impl ToolSpec for AgentTool {
                 | AgentToolAction::Peek
                 | AgentToolAction::Wait,
             ) => ApprovalRequirement::Auto,
-            // A cloud proposal spawns and spends nothing; the person's
-            // `/dispatch confirm` is its gate.
-            Ok(AgentToolAction::Start) if cloud_proposal::is_cloud_start(input) => {
-                ApprovalRequirement::Auto
-            }
             Ok(AgentToolAction::Start) if start_requests_read_only_role(input) => {
                 ApprovalRequirement::Auto
             }
@@ -11512,14 +11496,18 @@ impl ToolSpec for AgentTool {
         let action = parse_agent_tool_action(&input)?;
         match action {
             AgentToolAction::Start => {
-                if cloud_proposal::parse_start_runtime(&input)?
-                    == cloud_proposal::StartRuntime::Cloud
-                {
-                    return cloud_proposal::propose_cloud_run(
-                        &input,
-                        &context.workspace,
-                        self.runtime.spawn_depth,
-                    );
+                let remote_set = !matches!(input.get("remote"), None | Some(Value::Null));
+                let runtime_is_local = match input.get("runtime") {
+                    None | Some(Value::Null) => true,
+                    Some(Value::String(value)) => {
+                        matches!(value.trim().to_ascii_lowercase().as_str(), "" | "local")
+                    }
+                    Some(_) => false,
+                };
+                if remote_set || !runtime_is_local {
+                    return Err(ToolError::invalid_input(
+                        "Cloud agent runs are no longer started from the agent tool; omit runtime and remote to run a local child.",
+                    ));
                 }
             }
             AgentToolAction::Roster => {
@@ -18413,8 +18401,7 @@ fn reject_subagent_terminal_takeover(name: &str, input: &Value) -> Result<()> {
         return Err(anyhow!(
             "Sub-agents run in the background and cannot use Bash with interactive=true \
              because that would take over the parent TUI terminal. Use Bash without \
-             interactive, or with background=true / tty=true, or task_shell_start \
-             instead."
+             interactive, or with background=true / tty=true instead."
         ));
     }
     Ok(())

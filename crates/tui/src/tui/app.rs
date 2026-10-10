@@ -294,22 +294,13 @@ fn initial_onboarding_state(
     needs_api_key: bool,
     needs_workspace_trust: bool,
 ) -> OnboardingState {
-    if skip_onboarding || (was_onboarded && !needs_api_key && !needs_workspace_trust) {
+    if skip_onboarding || needs_api_key {
         return OnboardingState::None;
     }
 
-    if needs_api_key {
-        // Nothing can answer until a model is connected, so the first screen
-        // is the one that connects it (#6566). A returning user keeps the
-        // configured route focused; a new user sees the provider list. It is
-        // one screen, not the old five-gate wizard, and Esc leaves it for the
-        // composer.
-        OnboardingState::Provider
-    } else if was_onboarded && needs_workspace_trust {
+    if was_onboarded && needs_workspace_trust {
         OnboardingState::TrustDirectory
     } else {
-        // A new user who already has a key starts at the composer. Language
-        // and trust stay in /setup.
         OnboardingState::None
     }
 }
@@ -347,9 +338,10 @@ fn launch_onboarding_decision(
             needs_workspace_trust,
         )
     };
-    // Both a new user and a returning one reach the picker directly, and Esc
-    // returns to the composer. An explicitly configured route is focused even
-    // on first run (see `onboarding_recovers_configured_route`).
+    // A launch with no usable key opens the composer. The provider picker
+    // opens when the first message is sent (`keep_unsent_message_for_connect`),
+    // and Esc there returns to the composer. An explicitly configured route is
+    // focused even on first run (see `onboarding_recovers_configured_route`).
     let missing_key_recovery = !skip_onboarding && needs_api_key && !xai_oauth_needs_reauth;
     (onboarding, missing_key_recovery)
 }
@@ -636,6 +628,7 @@ pub struct LaunchRecentSession {
     pub title: String,
     pub updated_at: DateTime<Utc>,
     pub message_count: usize,
+    pub interrupted: bool,
 }
 
 /// Identity of one interactive row on the startup card. The card's rows are
@@ -731,8 +724,10 @@ pub(crate) const LAUNCH_CARD_DISSOLVE_MS: u128 = 240;
 /// exist at all so the card never claims "no recent sessions" while
 /// `/resume` has some.
 fn load_launch_recent(workspace: &std::path::Path) -> (Vec<LaunchRecentSession>, usize, bool) {
-    let sessions = crate::session_manager::SessionManager::default_location()
-        .and_then(|manager| manager.list_sessions())
+    let manager = crate::session_manager::SessionManager::default_location().ok();
+    let sessions = manager
+        .as_ref()
+        .and_then(|manager| manager.list_sessions().ok())
         .unwrap_or_default();
     let any_scoped = sessions.iter().any(|session| {
         !session.archived
@@ -746,6 +741,7 @@ fn load_launch_recent(workspace: &std::path::Path) -> (Vec<LaunchRecentSession>,
                 && crate::session_manager::workspace_scope_matches(&session.workspace, workspace)
         })
         .map(|session| LaunchRecentSession {
+            interrupted: false,
             id: session.id,
             title: session.title,
             updated_at: session.updated_at,
@@ -754,6 +750,13 @@ fn load_launch_recent(workspace: &std::path::Path) -> (Vec<LaunchRecentSession>,
         .collect();
     let total = scoped.len();
     scoped.truncate(LAUNCH_RECENT_INLINE_LIMIT);
+    if let Some(manager) = manager.as_ref() {
+        for session in &mut scoped {
+            session.interrupted = manager.session_has_checkpoint(&session.id)
+                && manager.session_from_prior_instance(&session.id)
+                && !manager.is_session_live_anywhere(&session.id);
+        }
+    }
     (scoped, total, any_scoped)
 }
 
@@ -2133,6 +2136,7 @@ pub struct App {
     pub onboarding_had_language_step: bool,
     pub onboarding_had_provider_step: bool,
     pub onboarding_had_trust_step: bool,
+    pub local_runtime_detected: bool,
     /// True when the active credential was discovered only through an
     /// environment variable. Missing-key recovery and route rollback use this
     /// provenance to decide whether a durable provider slot still exists;
@@ -2146,6 +2150,7 @@ pub struct App {
     pub yolo: bool,
     /// One-shot YOLO→Act+Bypass migration notice for this session (#0.8.68 M6).
     yolo_compat_notified: bool,
+    pub(crate) full_access_scope: crate::tui::full_access_confirm::FullAccessScope,
     /// The single serialized owner of `settings.toml` startup-default writes
     /// (mode, thinking, model). Keeping one owner per `App` is what stops two
     /// rapid selections from interleaving their load/modify/save transactions
@@ -2482,6 +2487,9 @@ pub struct App {
     pub(crate) mcp_login: Option<PendingMcpLogin>,
     /// `/mcp retry` requests still waiting on the engine, one per server.
     pub(crate) mcp_retries: Vec<PendingMcpRetry>,
+    /// Server whose OAuth login just stored credentials; the event loop
+    /// retries that one server instead of asking for a full reload.
+    pub(crate) mcp_login_reconnect: Option<String>,
     /// Shared cell for async prompt suggestion delivery from background task.
     pub prompt_suggestion_cell: std::sync::Arc<std::sync::Mutex<Option<(u64, String)>>>,
     /// Tracks whether the initial balance fetch has been attempted for this session.
@@ -3330,6 +3338,8 @@ impl App {
         if previous_mode == mode && !self.yolo {
             return false;
         }
+        let permission_before = self.effective_permission_label();
+        let permission_pair_before = self.permission_pair();
 
         self.mode = mode;
         // Mode chip lives in the header — skip redundant status/toast copy.
@@ -3356,7 +3366,7 @@ impl App {
         self.approval_mode = policy.approval_mode;
         self.yolo = matches!(policy.approval_mode, ApprovalMode::Bypass);
 
-        self.finish_mode_change(previous_mode);
+        self.finish_mode_change(previous_mode, &permission_before, permission_pair_before);
         true
     }
 
@@ -3372,6 +3382,8 @@ impl App {
             return false;
         }
         let previous_mode = self.mode;
+        let permission_before = self.effective_permission_label();
+        let permission_pair_before = self.permission_pair();
         // Same baseline-refresh rule as a mode hop: the elevation must not
         // bleed into the restored Agent surface.
         if previous_mode.uses_agent_baseline() && !self.yolo {
@@ -3392,7 +3404,7 @@ impl App {
         self.approval_mode = ApprovalMode::Bypass;
         self.yolo = true;
         self.notify_yolo_compat_once();
-        self.finish_mode_change(previous_mode);
+        self.finish_mode_change(previous_mode, &permission_before, permission_pair_before);
         true
     }
 
@@ -3413,6 +3425,11 @@ impl App {
             self.needs_redraw = true;
             return SettingSelection::Refused;
         }
+        if !self.yolo
+            && self.request_full_access(crate::tui::full_access_confirm::FullAccessOrigin::Yolo)
+        {
+            return SettingSelection::NeedsConfirmation;
+        }
         let changed = self.set_mode_yolo_compat();
         self.startup_defaults
             .spawn(crate::tui::startup_defaults::StartupDefaults::mode(
@@ -3430,7 +3447,15 @@ impl App {
     /// id, workspace, model, and token total as every other event — it used
     /// to omit `DEEPSEEK_SESSION_ID` entirely, which made mode transitions
     /// uncorrelatable with the session they belonged to.
-    fn finish_mode_change(&mut self, previous_mode: AppMode) {
+    fn finish_mode_change(
+        &mut self,
+        previous_mode: AppMode,
+        permission_before: &str,
+        permission_pair_before: (
+            ApprovalMode,
+            crate::tui::full_access_confirm::FullAccessScope,
+        ),
+    ) {
         let context = self
             .base_hook_context()
             .with_mode(self.mode.label())
@@ -3438,7 +3463,24 @@ impl App {
         if let Err(error) = self.submit_hooks(HookEvent::ModeChange, context) {
             self.surface_observer_hook_submission_failure(error);
         }
+        if self.permission_pair() != permission_pair_before {
+            self.record_permission_change(permission_before, false);
+        }
         self.needs_redraw = true;
+    }
+
+    fn permission_pair(
+        &self,
+    ) -> (
+        ApprovalMode,
+        crate::tui::full_access_confirm::FullAccessScope,
+    ) {
+        let approval = if self.mode == AppMode::Plan {
+            self.mode_prefs.agent_approval_mode
+        } else {
+            self.approval_mode
+        };
+        (approval, self.full_access_scope)
     }
 
     /// Apply a *user-facing* mode selection: change the live session mode and
@@ -3775,6 +3817,10 @@ impl App {
             self.needs_redraw = true;
             return false;
         }
+        if next == ApprovalMode::Bypass {
+            self.request_full_access(crate::tui::full_access_confirm::FullAccessOrigin::Cycle);
+            return false;
+        }
         if let Err(err) = Self::persist_permission_posture(next) {
             self.push_status_toast(
                 format!("Permissions were not changed: could not save TUI posture ({err})"),
@@ -3803,6 +3849,11 @@ impl App {
                 Some(6_000),
             );
             self.needs_redraw = true;
+            return false;
+        }
+
+        if next == ApprovalMode::Bypass {
+            self.request_full_access(crate::tui::full_access_confirm::FullAccessOrigin::RootCycle);
             return false;
         }
 
@@ -3853,7 +3904,9 @@ impl App {
                 }
             };
             let previous = settings.permission_posture.clone();
-            settings.permission_posture = Some(posture);
+            if next != ApprovalMode::Bypass {
+                settings.permission_posture = Some(posture);
+            }
             if let Err(err) = transaction.save(&settings) {
                 return Ok(RootPostureOutcome::Failed(format!(
                     "could not save TUI posture ({err})"
@@ -3926,6 +3979,9 @@ impl App {
     /// queued mode/thinking write — the two used to load the same bytes and the
     /// later save reverted the other's field.
     fn persist_permission_posture(next: ApprovalMode) -> anyhow::Result<()> {
+        if next == ApprovalMode::Bypass {
+            return Ok(());
+        }
         Settings::transact(|settings| {
             settings.permission_posture = Some(Self::approval_posture_setting(next).to_string());
             Ok(())
@@ -3935,21 +3991,6 @@ impl App {
     fn finish_approval_posture_change(&mut self, next: ApprovalMode) {
         self.set_agent_approval_posture(next);
         self.needs_redraw = true;
-        // In Plan the new posture is real but dormant, and the footer chip
-        // alone would imply it is live. Say when it starts applying instead of
-        // refusing the change.
-        if self.mode == AppMode::Plan {
-            self.push_status_toast(
-                format!(
-                    "Permissions set to {}. Plan stays Read Only; this applies in Act and Operate.",
-                    next.permission_chip_label()
-                ),
-                StatusToastLevel::Info,
-                Some(5_000),
-            );
-        }
-        // Footer permission chip is canonical — no status toast for the new
-        // value, only the one-shot rebinding notice.
         self.notify_keybinding_migration_once();
     }
 
@@ -4026,6 +4067,8 @@ impl App {
     /// an independently enabled trust baseline in other posture transitions.
     /// Plan remains read-only.
     pub fn set_agent_approval_posture(&mut self, next: ApprovalMode) {
+        let permission_before = self.effective_permission_label();
+        let forgot_repo = self.leave_full_access_scope(next);
         let trust_mode = if next == ApprovalMode::Bypass {
             true
         } else if self.mode_prefs.agent_approval_mode == ApprovalMode::Bypass {
@@ -4034,6 +4077,146 @@ impl App {
             self.mode_prefs.agent_trust_mode
         };
         self.set_agent_runtime_baseline(self.mode_prefs.agent_allow_shell, trust_mode, next);
+        self.record_permission_change(&permission_before, forgot_repo);
+    }
+
+    #[must_use]
+    pub(crate) fn effective_permission_label(&self) -> String {
+        crate::tui::underwater::permission_label(self).into_owned()
+    }
+
+    fn record_permission_change(&mut self, before: &str, forgot_repo: bool) {
+        let after = self.effective_permission_label();
+        if after == before {
+            return;
+        }
+        let mut content = self
+            .tr(MessageId::PermissionsChangedReceipt)
+            .replace("{label}", &after);
+        if forgot_repo {
+            content.push_str(" · ");
+            content.push_str(&self.tr(MessageId::ReceiptFullAccessForgotten));
+        }
+        self.add_message(HistoryCell::System { content });
+        self.needs_redraw = true;
+    }
+
+    fn leave_full_access_scope(&mut self, next: ApprovalMode) -> bool {
+        use crate::tui::full_access_confirm::FullAccessScope;
+
+        let in_force = self.approval_mode == ApprovalMode::Bypass
+            || self.mode_prefs.agent_approval_mode == ApprovalMode::Bypass;
+        if next == ApprovalMode::Bypass || !in_force {
+            return false;
+        }
+        let was_repo = self.full_access_scope == FullAccessScope::Repo;
+        self.full_access_scope = FullAccessScope::Session;
+        was_repo && self.forget_full_access_repo()
+    }
+
+    fn forget_full_access_repo(&mut self) -> bool {
+        let workspace = self.workspace.clone();
+        match Settings::transact(|settings| settings.set_full_access_repo(&workspace, false)) {
+            Ok(changed) => changed,
+            Err(err) => {
+                self.push_status_toast(
+                    format!("Full Access is still kept for this repo: could not save ({err})"),
+                    StatusToastLevel::Warning,
+                    Some(8_000),
+                );
+                false
+            }
+        }
+    }
+
+    pub(crate) fn request_full_access(
+        &mut self,
+        origin: crate::tui::full_access_confirm::FullAccessOrigin,
+    ) -> bool {
+        if self.approval_mode == ApprovalMode::Bypass
+            || self.mode_prefs.agent_approval_mode == ApprovalMode::Bypass
+        {
+            return false;
+        }
+        if self.view_stack.top_kind() != Some(crate::tui::views::ModalKind::FullAccessConfirm) {
+            self.view_stack
+                .push(crate::tui::full_access_confirm::FullAccessConfirmView::new(
+                    origin,
+                    self.ui_locale,
+                ));
+        }
+        self.needs_redraw = true;
+        true
+    }
+
+    pub(crate) fn apply_confirmed_full_access(
+        &mut self,
+        scope: crate::tui::full_access_confirm::FullAccessScope,
+        origin: crate::tui::full_access_confirm::FullAccessOrigin,
+    ) -> bool {
+        use crate::tui::full_access_confirm::{FullAccessOrigin, FullAccessScope};
+
+        let workspace = self.workspace.clone();
+        let migration = origin == FullAccessOrigin::Migration;
+        if (scope == FullAccessScope::Repo || migration)
+            && let Err(err) = Settings::transact(|settings| {
+                if migration {
+                    settings.permission_posture = Some("ask".to_string());
+                    settings.full_access_migration_shown = true;
+                }
+                if scope == FullAccessScope::Repo {
+                    settings.set_full_access_repo(&workspace, true)?;
+                }
+                Ok(())
+            })
+        {
+            let message = if migration {
+                format!("Full Access stays saved for every project: could not save ({err})")
+            } else {
+                format!("Full Access was not kept for this repo: could not save ({err})")
+            };
+            self.push_status_toast(message, StatusToastLevel::Warning, Some(8_000));
+            return false;
+        }
+        let permission_before = self.effective_permission_label();
+        self.full_access_scope = scope;
+        let moved = match origin {
+            FullAccessOrigin::Migration => {
+                self.record_permission_change(&permission_before, false);
+                false
+            }
+            FullAccessOrigin::Cycle | FullAccessOrigin::Config | FullAccessOrigin::Setup => {
+                self.finish_approval_posture_change(ApprovalMode::Bypass);
+                true
+            }
+            FullAccessOrigin::RootCycle | FullAccessOrigin::RootConfig => {
+                match self.adopt_root_approval_posture(ApprovalMode::Bypass) {
+                    Ok(()) => true,
+                    Err(reason) => {
+                        self.full_access_scope = FullAccessScope::Session;
+                        if scope == FullAccessScope::Repo {
+                            self.forget_full_access_repo();
+                        }
+                        self.push_status_toast(
+                            format!("Permissions were not changed: {reason}"),
+                            StatusToastLevel::Warning,
+                            Some(8_000),
+                        );
+                        false
+                    }
+                }
+            }
+            FullAccessOrigin::Yolo => {
+                let changed = self.set_mode_yolo_compat();
+                self.startup_defaults
+                    .spawn(crate::tui::startup_defaults::StartupDefaults::mode(
+                        self.mode,
+                    ));
+                changed
+            }
+        };
+        self.needs_redraw = true;
+        moved
     }
 
     #[must_use]
@@ -6222,12 +6405,6 @@ impl App {
             StatusToastLevel::Info,
             Some(Self::QUIT_CONFIRMATION_WINDOW.as_millis() as u64),
         );
-        if let Some(warning) = crate::cloud_dispatch::CloudJobStore::from_env()
-            .ok()
-            .and_then(|store| crate::cloud_dispatch::live_job_quit_warning(&store))
-        {
-            self.push_status_toast(warning, StatusToastLevel::Warning, Some(8_000));
-        }
     }
 
     /// Whether the quit timer is currently armed (i.e. a prior Ctrl+C set it

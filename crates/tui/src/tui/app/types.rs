@@ -30,6 +30,7 @@ pub enum SettingSelection {
     PersistedSame,
     /// Refused by the turn lock (#2982). Nothing was written anywhere.
     Refused,
+    NeedsConfirmation,
 }
 
 impl SettingSelection {
@@ -43,7 +44,7 @@ impl SettingSelection {
     #[must_use]
     #[cfg(test)]
     pub fn accepted(self) -> bool {
-        !matches!(self, Self::Refused)
+        matches!(self, Self::Changed | Self::PersistedSame)
     }
 }
 
