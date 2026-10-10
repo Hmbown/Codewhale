@@ -1058,6 +1058,13 @@ and live state comes only from a resumed thread's SSE stream.
 - `GET /v1/threads?limit=50&include_archived=false&archived_only=false`
 - `GET /v1/threads/summary?limit=50&search=<optional>&include_archived=false&archived_only=false&thread_ids=<id>,<id>`
 - `GET /v1/threads/running`
+- `GET /v1/goals?limit=50&cursor=<opaque>&status=<status>` — read-only index of
+  the per-thread goal records across threads, newest update first. Returns
+  `{"goals": [ThreadGoal...], "next_cursor": "<opaque>"}`; `next_cursor` is
+  absent on the last page. `limit` is 1-200 (default 50); `status` is one of
+  `active`, `paused`, `blocked`, `usage_limited`, `budget_limited`, `complete`;
+  a bad `status` or `cursor` is `400`. Same auth as every other `/v1` read.
+  Goal creation, completion and removal stay on `/v1/threads/{id}/goal`.
 - `GET /v1/threads/{id}/notices`
 - `DELETE /v1/threads/{id}/notices/{notice_id}`
 - `POST /v1/threads`
