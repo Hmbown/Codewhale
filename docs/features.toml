@@ -690,7 +690,7 @@ owner = "crates/tui/src/oauth.rs"
 [[feature]]
 id = "plugin-oauth-providers"
 name = "Reviewed plugin OAuth providers"
-summary = "Reviewed plugins appear in /login and /provider; the host owns PKCE, account-scoped model discovery and per-request approval checks."
+summary = "Reviewed plugins appear in /login and /provider; the host owns PKCE, model discovery and per-request approvals."
 status = "experimental"
 surfaces = { tui = "preview", api = "partial", web = "none" }
 since = "unreleased"
@@ -733,7 +733,7 @@ id = "plugin-shell-install"
 name = "Plugin shell installation"
 summary = "codewhale install uses the reviewed bundle installer with local, GitHub and version-pinned npm sources."
 status = "experimental"
-surfaces = { cli = "preview", tui = "preview" }
+surfaces = { tui = "preview" }
 since = "unreleased"
 docs = "docs/PLUGINS.md"
 owner = "crates/tui/src/plugins/mutation.rs"
