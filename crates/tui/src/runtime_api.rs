@@ -6807,7 +6807,11 @@ where
         hasher.update(operation.as_bytes());
         hasher.update([0]);
         hasher.update(serde_json::to_vec(request).unwrap_or_default());
-        hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     };
     let _gate = AUTOMATION_IDEMPOTENCY_GATE.lock().await;
     let lookup = state
@@ -6856,7 +6860,13 @@ async fn create_automation(
         &req,
         StatusCode::CREATED,
         |e| ApiError::bad_request(e.to_string()),
-        async { state.automations.lock().await.create_automation(req.clone()) },
+        async {
+            state
+                .automations
+                .lock()
+                .await
+                .create_automation(req.clone())
+        },
     )
     .await
 }
@@ -6885,7 +6895,13 @@ async fn update_automation(
         &req,
         StatusCode::OK,
         map_automation_err,
-        async { state.automations.lock().await.update_automation(&id, req.clone()) },
+        async {
+            state
+                .automations
+                .lock()
+                .await
+                .update_automation(&id, req.clone())
+        },
     )
     .await
 }

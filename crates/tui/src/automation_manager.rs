@@ -367,7 +367,10 @@ struct IdempotencyEntry {
 #[derive(Debug)]
 pub enum IdempotencyLookup {
     Miss,
-    Replay { status: u16, body: serde_json::Value },
+    Replay {
+        status: u16,
+        body: serde_json::Value,
+    },
     KeyReused,
 }
 
