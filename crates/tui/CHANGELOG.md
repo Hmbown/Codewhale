@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-10-10
+
 - A first launch with no key or route now opens the composer. Codewhale asks
   for a provider when you send your first message, keeps the message in the
   box, and offers a local model only when a local Ollama server answers. The provider list
@@ -67,8 +69,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `9b5f9d614ef69702be9944a61e89aeb3df14c047`; the 19 catalog entries are
   unchanged, and installed bundles now come from a revision carrying the
   reviewed Computer Use and bridge fixes and the MIT license.
-
-## [0.10.2] - 2026-10-08
+- `codewhale app-server` no longer serves `GET /jobs`, which was always empty;
+  background jobs are `GET /v1/jobs` on the Runtime API (#6513).
 
 Codewhale v0.10.2 adds an animated pet view (`/pet on`) and a live Terminal work
 dock, and improves recovery, plugin approval and provider reliability. `/undo`
