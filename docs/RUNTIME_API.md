@@ -1063,7 +1063,7 @@ and live state comes only from a resumed thread's SSE stream.
   `{"goals": [ThreadGoal...], "next_cursor": "<opaque>"}`; `next_cursor` is
   absent on the last page. `limit` is 1-200 (default 50); `status` is one of
   `active`, `paused`, `blocked`, `usage_limited`, `budget_limited`, `complete`;
-  a bad `status` or `cursor` is `400`. Same auth as every other `/v1` read.
+  goals whose thread no longer exists are omitted; a bad `status` or `cursor`, or a cursor issued under a different `status`, is `400`. Same auth as every other `/v1` read.
   Goal creation, completion and removal stay on `/v1/threads/{id}/goal`.
 - `GET /v1/threads/{id}/notices`
 - `DELETE /v1/threads/{id}/notices/{notice_id}`
@@ -1340,14 +1340,16 @@ Each history row carries `approval_id`, `tool_name`, `outcome`, `asked_at` and
 `decided_at` (null while pending), plus optional `decided_by` (`user`,
 `session_rule`, `posture`, `host`), `target` and `summary`. `outcome` is one of
 `allowed_once`, `denied`, `timeout`, `cancelled`, `unavailable`,
-`retry_with_policy`, `pending`, or the standing-rule outcomes `always_allow` and
-`blocked`: an approval or denial answered by a remembered session rule rather
-than a person (`decided_by: session_rule`). `target` is the host of a URL or a
-workspace-relative path; `summary` is a one-line description of what was asked
-(the shell command when there is one). Both are redacted when the ask is
-recorded: `KEY=VALUE` words become `KEY=[redacted]`, credentials, tokens and URL
-userinfo are masked, the workspace root becomes `.`, whitespace is collapsed and
-text is capped at 120 characters. Rows recorded before these fields existed
+`retry_with_policy`, or `pending`. `standing_rule` (`allow` or `deny`) is present
+only when a remembered session rule or grant answered rather than a person
+(`decided_by: session_rule`); `outcome` is unchanged. `target` is the host of a
+URL or a workspace-relative path (absolute paths outside the workspace are
+reduced to `.../<basename>`); `summary` is a one-line description of what was
+asked. Both are redacted conservatively when the ask is recorded: a shell
+command keeps only the program name and plain arguments, and any quoted,
+`KEY=VALUE`, credential-like or unrecognised argument replaces all arguments
+with `[args redacted]`. Whitespace is collapsed and text is capped at 120
+characters. Rows recorded before these fields existed
 omit `target` and `summary`.
 
 `approval_id` is minted by the Runtime, not by the model or the provider. It is
@@ -1721,7 +1723,13 @@ relying on the behavior below (older Engines ignore both inputs).
   and identical request returns the stored status and body with
   `Idempotency-Replayed: true` and performs no second create or run. The same
   key with a different request is `422` `idempotency_key_reuse`. Failed
-  attempts are not stored, so they can be retried. `DELETE` is not covered.
+  attempts are not stored, so they can be retried. Keys are scoped to the
+  route and automation id. If the record cannot be persisted after the
+  mutation committed, the success response is still returned (the failure is
+  logged), so a retry of that request is not deduplicated. An unparseable
+  `idempotency.json` is renamed to `idempotency.corrupt-<timestamp>.json` and
+  that request fails with `500`; later requests start from an empty store.
+  `DELETE` is not covered.
 
 **Operate** (always-on named operation; same `OperateRecord` as CWC
 `20de981` / PR #284)
