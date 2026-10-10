@@ -17072,12 +17072,6 @@ async fn archiving_or_deleting_a_thread_ends_its_session_grants() -> Result<()> 
         )
         .await?;
     assert!(manager.approval_grants_for_thread(&archived.id).is_empty());
-    assert!(
-        manager
-            .session_grant_for(&archived.id, "web:web.run:search_query")
-            .is_none(),
-        "the next matching call on an archived thread prompts again"
-    );
     let events = manager.events_since(&archived.id, None)?;
     assert!(events.iter().any(|event| {
         event.event == "approval.grant_revoked"
@@ -17099,7 +17093,7 @@ async fn archiving_or_deleting_a_thread_ends_its_session_grants() -> Result<()> 
             .is_none(),
         "an archived thread records no new grant"
     );
-    assert!(manager.approval_grants.lock().get(&archived.id).is_none());
+    assert!(manager.approval_grants_for_thread(&archived.id).is_empty());
     // Unarchiving does not bring the grant back.
     manager
         .update_thread(
@@ -17116,7 +17110,7 @@ async fn archiving_or_deleting_a_thread_ends_its_session_grants() -> Result<()> 
 
     // Deleting a thread drops its grants with it.
     manager.discard_empty_thread(&kept.id).await?;
-    assert!(manager.approval_grants.lock().get(&kept.id).is_none());
+    assert!(manager.approval_grants_for_thread(&kept.id).is_empty());
     Ok(())
 }
 

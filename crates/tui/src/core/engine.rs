@@ -9326,8 +9326,8 @@ impl MockEngineHandle {
         Option<crate::approval_log::ApprovalDecider>,
     )> {
         Some(match self.rx_approval.recv().await? {
-            ApprovalDecision::Approved { id, by } => (MockApprovalEvent::Approved { id }, Some(by)),
-            ApprovalDecision::Denied { id, by } => (MockApprovalEvent::Denied { id }, Some(by)),
+            ApprovalDecision::Approved { id, by, .. } => (MockApprovalEvent::Approved { id }, Some(by)),
+            ApprovalDecision::Denied { id, by, .. } => (MockApprovalEvent::Denied { id }, Some(by)),
             ApprovalDecision::TimedOut { id } => (MockApprovalEvent::TimedOut { id }, None),
             ApprovalDecision::Unavailable { id } => (MockApprovalEvent::Unavailable { id }, None),
             ApprovalDecision::RetryWithPolicy { id, policy, by } => {

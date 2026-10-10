@@ -5334,9 +5334,10 @@ pub struct PendingApprovalRequest {
 /// The grant covers later calls of the same tool and argument class (the
 /// approval grouping key) on this thread, for the life of this Runtime
 /// process or until the thread is archived or deleted. It never changes the
-/// thread's permission posture, and it can be revoked. Known limit: grants
-/// are in memory only, so a Runtime restart forgets them and the next
-/// matching call prompts again (fail closed).
+/// thread's permission posture, and it can be revoked. Grants persist in the
+/// Engine grant store; after a Runtime restart they stay suspended until the
+/// thread is resumed by an authenticated client, and the next matching call
+/// prompts again until then (fail closed).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeApprovalGrant {
     /// Runtime-minted `grant_<32 hex>`; the revoke endpoint accepts only this.
@@ -5347,6 +5348,22 @@ pub struct RuntimeApprovalGrant {
     /// The summary of the call the person approved.
     pub summary: String,
     pub granted_at: DateTime<Utc>,
+}
+
+impl RuntimeApprovalGrant {
+    fn from_grant(grant: &crate::core::authority::grants::Grant) -> Self {
+        Self {
+            grant_id: grant.grant_id.clone(),
+            tool_name: grant.display.tool_name.clone(),
+            scope: grant.matcher.grouping_key.clone().unwrap_or_default(),
+            summary: grant.display.redacted_summary.clone(),
+            granted_at: grant.created.at,
+        }
+    }
+}
+
+fn grant_tool_class(tool_name: &str) -> String {
+    format!("{:?}", crate::core::authority::get_tool_category(tool_name)).to_lowercase()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6255,7 +6272,7 @@ pub struct RuntimeThreadManager {
         Arc<parking_lot::Mutex<Option<crate::automation_manager::SharedAutomationManager>>>,
     pending_approvals: Arc<parking_lot::Mutex<HashMap<String, PendingApprovalEntry>>>,
     /// Session approval grants per thread id.
-    approval_grants: Arc<parking_lot::Mutex<HashMap<String, Vec<RuntimeApprovalGrant>>>>,
+    grants: crate::core::authority::grants::GrantStore,
     pending_user_inputs: Arc<parking_lot::Mutex<HashMap<(String, String), PendingUserInputEntry>>>,
     pending_dynamic_tools: Arc<parking_lot::Mutex<HashMap<String, PendingDynamicToolEntry>>>,
     recovery_receipts: Arc<parking_lot::Mutex<HashMap<String, Vec<RecoveredTurnReceipt>>>>,
@@ -7679,6 +7696,7 @@ impl RuntimeThreadManager {
         let store = RuntimeThreadStore::open(manager_cfg.data_dir.clone())?;
         crate::config::initialize_cloud_facts(&config);
         let (event_tx, _event_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let grants = crate::core::authority::grants::GrantStore::open(&manager_cfg.data_dir);
         let manager = Self {
             host_profile,
             config: Arc::new(parking_lot::RwLock::new(config)),
@@ -7701,7 +7719,7 @@ impl RuntimeThreadManager {
             task_execution_lease: Arc::new(parking_lot::Mutex::new(None)),
             automations: Arc::new(parking_lot::Mutex::new(None)),
             pending_approvals: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            approval_grants: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            grants,
             pending_user_inputs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pending_dynamic_tools: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             recovery_receipts: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -8637,20 +8655,11 @@ impl RuntimeThreadManager {
     /// Live session approval grants on `thread_id`, oldest first.
     #[must_use]
     pub fn approval_grants_for_thread(&self, thread_id: &str) -> Vec<RuntimeApprovalGrant> {
-        self.approval_grants
-            .lock()
-            .get(thread_id)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn session_grant_for(&self, thread_id: &str, scope: &str) -> Option<RuntimeApprovalGrant> {
-        self.approval_grants
-            .lock()
-            .get(thread_id)?
+        self.grants
+            .thread_grants(thread_id)
             .iter()
-            .find(|grant| grant.scope == scope)
-            .cloned()
+            .map(RuntimeApprovalGrant::from_grant)
+            .collect()
     }
 
     /// Record "allow for this conversation" as a grant scoped to the tool and
@@ -8669,9 +8678,13 @@ impl RuntimeThreadManager {
         scope: &str,
         summary: &str,
     ) -> Option<RuntimeApprovalGrant> {
+        use crate::core::authority::grants::{
+            GrantAppliesTo, GrantDecider, GrantEffect, GrantLimits, GrantMatcher, GrantScope,
+            GrantSurface, NewGrant,
+        };
         let grant = {
             // Same order as update_thread's archive path (thread_mutation,
-            // then approval_grants), so archive and record cannot interleave.
+            // then the grant store), so archive and record cannot interleave.
             let _thread_mutation = self.store.thread_mutation.lock();
             let live = self
                 .store
@@ -8680,20 +8693,40 @@ impl RuntimeThreadManager {
             if !live {
                 return None;
             }
-            let mut grants = self.approval_grants.lock();
-            let thread_grants = grants.entry(thread_id.to_string()).or_default();
-            if let Some(existing) = thread_grants.iter().find(|grant| grant.scope == scope) {
-                return Some(existing.clone());
+            if let Some(existing) = self
+                .grants
+                .thread_grants(thread_id)
+                .iter()
+                .find(|grant| grant.matcher.grouping_key.as_deref() == Some(scope))
+            {
+                return Some(RuntimeApprovalGrant::from_grant(existing));
             }
-            let grant = RuntimeApprovalGrant {
-                grant_id: format!("grant_{}", Uuid::new_v4().simple()),
+            let created = self.grants.create(NewGrant {
+                effect: GrantEffect::Allow,
+                scope: GrantScope::Thread {
+                    thread_id: thread_id.to_string(),
+                },
+                matcher: GrantMatcher {
+                    tool_class: grant_tool_class(tool_name),
+                    grouping_key: Some(scope.to_string()),
+                    ..GrantMatcher::default()
+                },
                 tool_name: tool_name.to_string(),
-                scope: scope.to_string(),
-                summary: summary.to_string(),
-                granted_at: Utc::now(),
-            };
-            thread_grants.push(grant.clone());
-            grant
+                redacted_summary: summary.to_string(),
+                limits: GrantLimits::default(),
+                applies_to: GrantAppliesTo::default(),
+                principal: "authenticated_client".to_string(),
+                surface: GrantSurface::Runtime,
+                decider: GrantDecider::HumanCard,
+                source_approval_id: None,
+            });
+            match created {
+                Ok(grant) => RuntimeApprovalGrant::from_grant(&grant),
+                Err(error) => {
+                    tracing::warn!(target: "approval", %error, "session grant was not recorded");
+                    return None;
+                }
+            }
         };
         self.emit_event(
             thread_id,
@@ -8707,36 +8740,32 @@ impl RuntimeThreadManager {
         Some(grant)
     }
 
-    /// Remove every session grant on `thread_id` and return them. Archiving or
+    /// End every session grant on `thread_id` and return them. Archiving or
     /// deleting a thread calls this, so a grant never outlives the
     /// conversation it was given in.
     fn take_approval_grants(&self, thread_id: &str) -> Vec<RuntimeApprovalGrant> {
-        self.approval_grants
-            .lock()
-            .remove(thread_id)
-            .unwrap_or_default()
+        self.grants
+            .revoke_thread(thread_id, "runtime", "thread archived or deleted")
+            .iter()
+            .map(RuntimeApprovalGrant::from_grant)
+            .collect()
     }
 
     /// Revoke one session grant. Returns `false` when the thread holds no
     /// grant with that id. The next matching call prompts again.
     pub async fn revoke_approval_grant(&self, thread_id: &str, grant_id: &str) -> Result<bool> {
-        let revoked = {
-            let mut grants = self.approval_grants.lock();
-            let Some(thread_grants) = grants.get_mut(thread_id) else {
-                return Ok(false);
-            };
-            let Some(index) = thread_grants
-                .iter()
-                .position(|grant| grant.grant_id == grant_id)
-            else {
-                return Ok(false);
-            };
-            let revoked = thread_grants.remove(index);
-            if thread_grants.is_empty() {
-                grants.remove(thread_id);
-            }
-            revoked
+        let scope = crate::core::authority::grants::GrantScope::Thread {
+            thread_id: thread_id.to_string(),
         };
+        let Some(revoked) = self.grants.revoke(
+            grant_id,
+            Some(&scope),
+            "authenticated_client",
+            "revoked by an authenticated client",
+        ) else {
+            return Ok(false);
+        };
+        let revoked = RuntimeApprovalGrant::from_grant(&revoked);
         self.emit_event(
             thread_id,
             None,
@@ -11855,6 +11884,7 @@ impl RuntimeThreadManager {
     pub async fn resume_thread(&self, id: &str) -> Result<ThreadRecord> {
         let thread = self.get_thread(id).await?;
         self.ensure_engine_loaded(&thread).await?;
+        self.grants.resume_thread(id);
         Ok(thread)
     }
 
@@ -17596,7 +17626,50 @@ impl RuntimeThreadManager {
                         ApprovalRequestDisposition, TurnAuthority,
                         resolve_approval_request_disposition,
                     };
-                    let grant = self.session_grant_for(&thread_id, &approval_grouping_key);
+                    let grant_workspace_id = match summary_workspace.clone() {
+                        Some(workspace) => tokio::task::spawn_blocking(move || {
+                            crate::core::authority::grants::workspace_id(&workspace)
+                        })
+                        .await
+                        .unwrap_or_default(),
+                        None => String::new(),
+                    };
+                    let grant_posture = if auto_approve {
+                        crate::core::authority::grants::GrantPosture::FullAccess
+                    } else {
+                        match approval_mode {
+                            codewhale_execpolicy::ApprovalMode::Auto => {
+                                crate::core::authority::grants::GrantPosture::AutoReview
+                            }
+                            codewhale_execpolicy::ApprovalMode::Never => {
+                                crate::core::authority::grants::GrantPosture::Never
+                            }
+                            _ => crate::core::authority::grants::GrantPosture::Ask,
+                        }
+                    };
+                    let grant_class = grant_tool_class(&tool_name);
+                    let grant_verdict = self.grants.evaluate(
+                        &crate::core::authority::grants::GrantQuery {
+                            thread_id: &thread_id,
+                            workspace_id: &grant_workspace_id,
+                            origin: crate::core::authority::grants::GrantOrigin::Interactive,
+                            posture: grant_posture,
+                            tool_class: &grant_class,
+                            exact_digest: &approval_key,
+                            grouping_key: &approval_grouping_key,
+                            argv: &[],
+                            net_host: None,
+                        },
+                    );
+                    let (grant, deny_grant) = match grant_verdict {
+                        crate::core::authority::grants::GrantVerdict::Allow(grant) => {
+                            (Some(grant), None)
+                        }
+                        crate::core::authority::grants::GrantVerdict::Deny(grant) => {
+                            (None, Some(grant))
+                        }
+                        crate::core::authority::grants::GrantVerdict::NoMatch => (None, None),
+                    };
                     // This resolver reads the exact live approval posture only;
                     // Core already owns mode and shell admission for this call.
                     let approval_authority = TurnAuthority::from_effective_fields(
@@ -17609,7 +17682,7 @@ impl RuntimeThreadManager {
                     let disposition = resolve_approval_request_disposition(
                         &approval_authority,
                         grant.is_some(),
-                        false, // Runtime has grants, but no session-denial cache.
+                        deny_grant.is_some(),
                         approval_force_prompt,
                         // Rust mints this namespace; tool text cannot claim origin.
                         approval_key.starts_with("extcall:ext:"),
@@ -17690,13 +17763,30 @@ impl RuntimeThreadManager {
                                 "remember": false,
                                 "auto": true,
                                 "posture": posture,
+                                "grant_id": deny_grant.as_ref().map(|grant| grant.grant_id.clone()),
                             }),
                         )
                         .await
                         .ok();
-                        let _ = engine
-                            .deny_tool_call_by(id, crate::approval_log::ApprovalDecider::Posture)
-                            .await;
+                        let _ = match deny_grant {
+                            Some(grant) => {
+                                engine
+                                    .deny_tool_call_by_grant(
+                                        id,
+                                        crate::approval_log::ApprovalDecider::SessionRule,
+                                        grant,
+                                    )
+                                    .await
+                            }
+                            None => {
+                                engine
+                                    .deny_tool_call_by(
+                                        id,
+                                        crate::approval_log::ApprovalDecider::Posture,
+                                    )
+                                    .await
+                            }
+                        };
                         continue;
                     }
 
@@ -17705,6 +17795,7 @@ impl RuntimeThreadManager {
                     // posture (E1). A forced prompt is never pre-answered.
                     if disposition == ApprovalRequestDisposition::AutoApprove
                         && let Some(grant) = grant
+                        && self.grants.record_use(&grant.grant_id).is_ok()
                     {
                         let approval_id = Self::mint_approval_id();
                         self.emit_event(
@@ -17740,9 +17831,10 @@ impl RuntimeThreadManager {
                         .await
                         .ok();
                         let _ = engine
-                            .approve_tool_call_by(
+                            .approve_tool_call_by_grant(
                                 id,
                                 crate::approval_log::ApprovalDecider::SessionRule,
+                                grant,
                             )
                             .await;
                         continue;

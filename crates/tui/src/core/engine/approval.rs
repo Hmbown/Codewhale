@@ -36,16 +36,19 @@ fn wait_announcement(what: &str, tool_id: &str, waited: Duration) -> String {
 }
 
 use super::Engine;
+use crate::core::authority::grants::GrantRef;
 
 #[derive(Debug, Clone)]
 pub(super) enum ApprovalDecision {
     Approved {
         id: String,
         by: ApprovalDecider,
+        grant: Option<GrantRef>,
     },
     Denied {
         id: String,
         by: ApprovalDecider,
+        grant: Option<GrantRef>,
     },
     /// The interactive card expired unanswered (#6101): the configured
     /// bound denied the call, not the operator.
@@ -198,8 +201,22 @@ impl Engine {
         outcome: ApprovalOutcome,
         decided_by: Option<ApprovalDecider>,
     ) -> Result<(), ToolError> {
-        self.commit_approval_receipt(ApprovalReceipt::decided_with(tool_id, outcome, decided_by))
+        self.commit_approval_decision(tool_id, outcome, decided_by, None)
             .await
+    }
+
+    async fn commit_approval_decision(
+        &self,
+        tool_id: &str,
+        outcome: ApprovalOutcome,
+        decided_by: Option<ApprovalDecider>,
+        grant: Option<&GrantRef>,
+    ) -> Result<(), ToolError> {
+        let mut receipt = ApprovalReceipt::decided_with(tool_id, outcome, decided_by);
+        if let Some(grant) = grant {
+            receipt = receipt.with_grant(grant);
+        }
+        self.commit_approval_receipt(receipt).await
     }
 
     pub(super) async fn request_tool_approval(
@@ -374,12 +391,12 @@ impl Engine {
                         continue;
                     }
                     match decision {
-                        ApprovalDecision::Approved { id, by } if id == tool_id => {
-                            self.commit_approval_outcome(tool_id, ApprovalOutcome::ApprovedOnce, Some(by)).await?;
+                        ApprovalDecision::Approved { id, by, grant } if id == tool_id => {
+                            self.commit_approval_decision(tool_id, ApprovalOutcome::ApprovedOnce, Some(by), grant.as_ref()).await?;
                             return Ok(ApprovalResult::Approved(by));
                         }
-                        ApprovalDecision::Denied { id, by } if id == tool_id => {
-                            self.commit_approval_outcome(tool_id, ApprovalOutcome::Denied, Some(by)).await?;
+                        ApprovalDecision::Denied { id, by, grant } if id == tool_id => {
+                            self.commit_approval_decision(tool_id, ApprovalOutcome::Denied, Some(by), grant.as_ref()).await?;
                             return Ok(ApprovalResult::Denied);
                         }
                         ApprovalDecision::TimedOut { id } if id == tool_id => {
