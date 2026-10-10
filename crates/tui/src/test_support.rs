@@ -555,6 +555,24 @@ pub(crate) fn trust_workspace(workspace: &Path) {
     crate::config::save_workspace_trust(workspace).expect("trust test workspace");
 }
 
+pub(crate) fn read_shell_sentinel(path: &Path) -> String {
+    let bytes = std::fs::read(path).unwrap_or_default();
+    let text = if bytes.starts_with(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    text.trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('"', "")
+        .trim()
+        .to_string()
+}
+
 pub(crate) fn test_tui_options(workspace: impl AsRef<Path>) -> crate::tui::app::TuiOptions {
     let workspace = workspace.as_ref().to_path_buf();
     crate::tui::app::TuiOptions {
