@@ -2485,7 +2485,7 @@ mod tests {
         );
         let sentinel = rig.workspace.join("floor-sentinel.txt");
         for _ in 0..180 {
-            if crate::test_support::read_shell_sentinel(&sentinel) != "guarded" {
+            if crate::test_support::read_shell_sentinel(&sentinel) == "rm -rf /" {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
