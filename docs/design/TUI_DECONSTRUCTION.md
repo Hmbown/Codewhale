@@ -341,6 +341,66 @@ is deleted. At `bd2a7b49c` it stands at 11 production references
 `ansi-to-tui` or a terminal component kit; the runtime reaches the terminal
 only through `host_terminal`.
 
+## Operational plan: assignable slices
+
+Measured 2026-10-10 with `python3 scripts/split/partition_report.py` (per-module
+waves, sizes and blockers) and `--scc-edges 60` (the heaviest edges inside the
+cycle). Regenerate before assigning; the numbers below are a snapshot.
+
+- The runtime closure is **one 100-module cycle** (the baseline above counted 85),
+  with `tools` 152k, `core` 50k, `fleet` 39k, `runtime_api` 31k, `client` 26k
+  production lines. It contains `tui`, `commands` and `lib.rs` only through the
+  11 production back-edges the ratchet counts (`runtime_api -> commands` 9,
+  `tools -> commands` 2). Removing those two edge pairs shrinks the cycle to 83
+  modules.
+- 30 modules (about 17k production lines) are **wave 0**: nothing they depend on
+  is still waiting to move. They are claimable as crates now.
+- Moving the cycle as a unit is the rejected pattern (see Rules). The open runtime
+  split issue that moves the whole core into `crates/runtime` in one change
+  (RS-14, #6941) conflicts with the Rules above and is replaced by the slices
+  below unless the founder decides otherwise; it should not start before that
+  decision.
+
+Each slice below was proposed by one analyst and challenged by another that
+re-read the code. "Held" means the challenge confirmed it. The corrections are
+part of the slice.
+
+| Slice | Claim unit (paths) | Size | Status of the analysis | Must happen first | Result |
+| --- | --- | --- | --- | --- | --- |
+| **X1 util-fslock** | `crates/fslock/` (new), `runtime_threads.rs`, `session_manager.rs`, `session_reconcile.rs`, `operate.rs` | S, ~190 lines | **Held.** Five call-site clusters in `runtime_threads.rs` (incl. `has_live_holder`), `session_manager.rs:1954` is production | none | removes the `session_manager <-> runtime_threads` lock edge; first leaf for `session-store` |
+| **X2 command catalog port** | `crates/tui/src/command_catalog.rs` (new leaf), `commands/catalog.rs`, `runtime_api.rs` list handler, `tools/tui_help.rs`, `extension_host/command.rs` | M | **Held with a fix.** The thread-local test guard cannot reach the Runtime API test server thread: install the real catalog process-wide for tests | none | ratchet `prod` 11 -> 0, cycle 100 -> 83, `tui` and `commands` leave it |
+| **X3 tool contract, part 1** | `crates/tools/src/canonical_action.rs`, `crates/tools/src/lib.rs`, `crates/tui/src/tools/mod.rs` | S with a `pub use` shim at `tools/mod.rs`, M without (42 files in other owners' directories) | Direction right; **not rename-only** (visibility widening, split test module) | none | first tool-contract move; unblocks TUI views depending on a crate, not the runtime |
+| **X4 util-schema** | `crates/util-schema/` (new), `tools/schema_sanitize.rs`, `schema_canonicalize.rs` | M | Needs `prepare_tools_for_strict_mode` moved next to its caller first (it is the only use of `codewhale_models::Tool`) | X3 not required | removes `client -> tools` schema refs |
+| **X5 config-types, part 1** | `crates/config-types/` (new), `features.rs`, `route_receipt.rs`, `plugins/types.rs` | S-M, ~400 lines | **Corrected:** move `impl Display for PluginId` with `PluginId` (orphan rule); leave out `CustomLspDef` (already in `crates/config`); the `lsp` and `plugins` edges stay | none | removes the type-only up-edges from `config`/`settings` |
+| **X6 runtime-wire, part 1** | `crates/runtime-wire/` (new), `core/events.rs`, `core/ops.rs`, `rlm/bridge.rs` | S, ~300 lines | **Corrected:** `ModelToolCall` stays in `core` (moving it makes a Cargo cycle `models -> config -> execpolicy`); widen `is_bidi_format_control` and `NESTED_RLM_STATUS_PREFIX` | none | first DTOs a TUI sandbox can depend on without `core` |
+| **X7 tool rules into execpolicy** | `crates/execpolicy/src/tool_rules.rs`, `core/engine/tool_catalog.rs` | S | Part of the fleet plan; `tool_denied`, `tool_matches_any_rule`, `requires_raw_shell`, `policy_tool_aliases` | none | cuts `tools -> core` and `config -> core` rule references |
+| **X8 agent-contract** | `crates/agent-contract/` (new), `fleet/role.rs`, `fleet/worker_profile.rs`, `tools/subagent/mod.rs` | M | **Corrected:** the inherent `impl FleetRole` at `tools/subagent/mod.rs:639` becomes illegal after the move; convert to free functions first; resolve the two different `ChildAuthority` types | X7 | removes `tools -> fleet` (62 refs) |
+| **X9 sandbox pilot** | `crates/sandbox/` (new), `tui/src/sandbox/` | S then M | **Corrected:** do the two edge cuts first (`sandbox -> config` 1, `sandbox -> oauth` 1); `shell_dispatcher` cannot move yet (`tests/integration/main.rs` includes it by `#[path]`, `test_env_lock` is `cfg(test)`) | the cuts only | second feature leaf after `tools-web` |
+| **W0-S1 runtime residents** | `crates/runtime/` ← `features`, `logging`, `startup_trace`, `resource_telemetry`, `runtime_policy`, `lane_control`, `computer_meter` | S, 2.6k lines | **Held.** `python3 scripts/split/move-modules.py` dry run is read-only and safe | none | seven fewer tui modules; no `test_support` needed |
+| **W0-S2.. test-support and the rest of wave 0** | `crates/test/test-support/` (new) then `child_env`, `process_tree`, `external_credentials`, `runtime_log` | M each | **Corrected:** `wait-timeout` is a normal dependency, not dev; `remote_setup` needs `uuid`; resolve the `external_credentials` name clash with `crates/config` | W0-S1 | replaces RS-10 and RS-11 |
+| **B billing** | `crates/billing/` | L | **Not confirmed.** Five production callers remain, it must not depend on the runtime tier, and the engine files it touches are in flight | a host port for the usage store | deferred |
+| **S0 closure report** | `scripts/split/closure_report.py` | S (report), M (sandbox generator) | Held as a tool; deletes no edges | decide where sandbox third-party sources come from | the numbers the sandbox contract needs |
+
+Running them in parallel:
+
+- Claim units are disjoint across X1, X3, X5, X6, X7 and W0-S1, so those can be
+  owned by six agents at once.
+- Every new crate edits files only an integrator may touch: root `Cargo.toml`,
+  `Cargo.lock`, `crates/tui/Cargo.toml`, `scripts/release/crates.sh`,
+  `scripts/dev-test.sh`. Serialize those edits through one integrator; new
+  package names are a release-time human gate.
+- Each slice still needs one native build slot on a shared machine. Concurrency
+  comes from sandboxes with their own target directory, not from parallel
+  compiles in one checkout.
+- Each slice is verified by `cargo check` on both crates, the crate's own
+  tests, `python3 scripts/split/module_graph.py --check` with the counts it
+  should lower, and `python3 scripts/split/partition_report.py` before and after.
+
+Mapping of the open issues: RS-8 (#6935), RS-9 (#6936), RS-12 (#6939, partial) and
+RS-13 (#6940, first sub-slice) landed; X2 completes RS-13; W0-S1 and W0-S2 replace
+RS-10 (#6937) and the test-support half of RS-11 (#6938); RS-14 (#6941) is
+replaced by this table pending the founder's decision.
+
 ## Known limitations
 
 - **Parallel agents on one machine still share one Cargo lock.** The
