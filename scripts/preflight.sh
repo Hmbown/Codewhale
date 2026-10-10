@@ -14,6 +14,8 @@
 #   ln -s ../../scripts/preflight.sh "$(git rev-parse --git-path hooks)/pre-push"
 #
 # What it covers, and the command that fixes each one:
+#   - rustfmt (the Lint job's first    cargo fmt --all (written here)
+#     step, required on every PR)
 #   - crates/tui/CHANGELOG.md slice    scripts/sync-changelog.sh (written here)
 #   - README locale stamps and links    retranslate; check-readme-translations.py
 #                                       prints the new sha256 stamp to use
@@ -58,8 +60,10 @@ step() {
 }
 
 if [[ "${mode}" == "write" ]]; then
+  step "rustfmt" "cargo fmt --all" cargo fmt --all
   step "TUI changelog slice" "scripts/sync-changelog.sh" ./scripts/sync-changelog.sh
 else
+  step "rustfmt" "cargo fmt --all" cargo fmt --all -- --check
   step "TUI changelog slice" "scripts/sync-changelog.sh" ./scripts/sync-changelog.sh --check
 fi
 step "README translations in sync" \
