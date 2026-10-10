@@ -2559,7 +2559,10 @@ fn run() -> Result<()> {
             cloud::reject_inline_api_key(cli.api_key.as_deref())?;
             cloud::run(args, cli.profile.as_deref(), &mut store)
         }
-        Some(Commands::Dispatch(args)) => dispatch::run(args),
+        Some(Commands::Dispatch(args)) => {
+            cloud::reject_inline_api_key(cli.api_key.as_deref())?;
+            dispatch::run(args, cli.profile.as_deref(), &mut store)
+        }
         Some(Commands::McpServer) => {
             // Keep the CLI spelling, with the same tool and permission authority
             // as `serve --mcp`. The legacy child-server proxy is retired.

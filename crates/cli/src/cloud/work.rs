@@ -213,7 +213,7 @@ pub(super) fn assign<T: CloudTransport, W: Write>(
     objective: &str,
     message_id: &str,
     task_context: Option<&WorkTaskContext>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let message_id = validate_operation_key(message_id)?;
     let receipt = client
         .assign_agent_work(&agent.id, objective, message_id, task_context)
@@ -319,7 +319,7 @@ pub(super) fn assign<T: CloudTransport, W: Write>(
         _ => {}
     }
     writeln!(out, "Message ID: {message_id}")?;
-    Ok(())
+    Ok(items.iter().map(|item| item.id.clone()).collect())
 }
 
 /// `codewhale account agents work-cancel`.
@@ -991,7 +991,8 @@ pub(super) fn quote<T: CloudTransport, W: Write>(
     operation_key: &str,
     seconds: Option<u64>,
     recovery_from: Option<&str>,
-) -> Result<()> {
+    reveal: bool,
+) -> Result<QuotedLaunch> {
     let id = validate_work_uuid(id)?;
     let operation_key = validate_operation_key(operation_key)?;
     let mut target = load_launch_target(client, id)?;
@@ -1149,14 +1150,106 @@ pub(super) fn quote<T: CloudTransport, W: Write>(
     if let Some(expires) = text_at(&quote, &["confirmation", "expiresAt"]) {
         writeln!(out, "Confirmation expires: {expires}")?;
     }
-    writeln!(out, "Confirmation: {token}")?;
     writeln!(out, "Operation key: {operation_key}")?;
-    let recovery_args = recovery_from
-        .map(|previous| format!(" --recovery-from {previous}"))
-        .unwrap_or_default();
+    if reveal {
+        writeln!(out, "Confirmation: {token}")?;
+        let recovery_args = recovery_from
+            .map(|previous| format!(" --recovery-from {previous}"))
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "To start: codewhale account agents work-launch {id} --operation-key {operation_key} --confirmation {token} --confirm-eu-compute --seconds {seconds}{recovery_args}"
+        )?;
+    }
+    Ok(QuotedLaunch {
+        token: token.to_string(),
+        seconds,
+    })
+}
+
+pub(super) struct QuotedLaunch {
+    token: String,
+    seconds: u64,
+}
+
+pub(super) struct DispatchOptions<'a> {
+    pub seconds: Option<u64>,
+    pub operation_key: &'a str,
+    pub message_id: &'a str,
+    pub yes: bool,
+    pub confirm_eu_compute: bool,
+    pub interactive: bool,
+}
+
+/// `codewhale dispatch`: record Work, review its quote, then launch it once
+/// the member has consented to EU compute for this launch.
+pub(super) fn dispatch<T: CloudTransport, W: Write>(
+    client: &CloudClient<'_, T>,
+    out: &mut W,
+    agent: &AccountAgent,
+    objective: &str,
+    context: Option<&WorkTaskContext>,
+    options: DispatchOptions<'_>,
+    read_answer: &mut dyn FnMut() -> Result<String>,
+) -> Result<()> {
+    let mut recorded = Vec::new();
+    let ids = assign(
+        client,
+        &mut recorded,
+        agent,
+        objective,
+        options.message_id,
+        context,
+    )?;
+    let [id] = ids.as_slice() else {
+        out.write_all(&recorded)?;
+        bail!("This message did not create exactly one new Work, so nothing was quoted or started");
+    };
+    writeln!(out, "Work ID: {id}")?;
+    let quoted = quote(
+        client,
+        out,
+        id,
+        options.operation_key,
+        options.seconds,
+        None,
+        false,
+    )?;
+    let consented = if options.yes && options.confirm_eu_compute {
+        true
+    } else if options.interactive {
+        write!(
+            out,
+            "Start this on a new cloud computer in the EU? Your repository code and Work files run there. [y/N] "
+        )?;
+        out.flush()?;
+        matches!(
+            read_answer()?.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        )
+    } else {
+        false
+    };
+    if !consented {
+        bail!(
+            "Nothing started. Work {id} is recorded; to start it re-run with --yes --confirm-eu-compute --message-id {} --operation-key {}",
+            options.message_id,
+            options.operation_key
+        );
+    }
+    launch(
+        client,
+        out,
+        id,
+        options.operation_key,
+        &quoted.token,
+        true,
+        Some(quoted.seconds),
+        None,
+    )?;
     writeln!(
         out,
-        "To start: codewhale account agents work-launch {id} --operation-key {operation_key} --confirmation {token} --confirm-eu-compute --seconds {seconds}{recovery_args}"
+        "Status: codewhale dispatch --show {id}    Stop: codewhale dispatch --cancel {id}"
     )?;
     Ok(())
 }

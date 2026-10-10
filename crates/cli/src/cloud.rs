@@ -262,6 +262,37 @@ enum CloudAgentsCommand {
         )]
         file_refs: Vec<String>,
     },
+    /// Record Work, review its quote, and start it on a new cloud computer.
+    ///
+    /// Without --yes and --confirm-eu-compute, a terminal asks before launching
+    /// and a script refuses; nothing starts without that consent. Reuse
+    /// --operation-key and --message-id to retry after an uncertain response.
+    Dispatch {
+        objective: String,
+        /// Agent name or ID; omitted, the account's repository-free default Agent.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Task time in seconds; defaults to what the account's offer allows.
+        #[arg(long)]
+        seconds: Option<u64>,
+        #[arg(long, help = "UTF-8 source context file, at most 64000 UTF-16 units")]
+        context_file: Option<PathBuf>,
+        #[arg(
+            long = "file",
+            help = "Saved account file reference FILE_ID@VERSION; repeat for up to ten files"
+        )]
+        file_refs: Vec<String>,
+        #[arg(long)]
+        operation_key: Option<String>,
+        #[arg(long)]
+        message_id: Option<String>,
+        /// Do not ask before launching (also needs --confirm-eu-compute).
+        #[arg(long)]
+        yes: bool,
+        /// Agree that repository code and Work files run on EU compute.
+        #[arg(long)]
+        confirm_eu_compute: bool,
+    },
     /// Read the account-owned status of a Work request.
     WorkStatus { id: String },
     /// Cancel Work and stop its computer; safe to repeat.
@@ -1856,6 +1887,141 @@ fn assert_catalog_route<'a>(
     )
 }
 
+fn work_objective_and_context(
+    objective: &str,
+    context_file: Option<&Path>,
+    file_refs: &[String],
+) -> Result<(String, Option<WorkTaskContext>)> {
+    let objective = objective.trim();
+    if objective.is_empty() || objective.encode_utf16().count() > 32_000 {
+        bail!("Work objective must contain 1-32000 UTF-16 units");
+    }
+    let mut context = work::task_context(context_file, file_refs)?;
+    if objective.encode_utf16().count() > 12_000 {
+        let context = context.get_or_insert_with(|| WorkTaskContext {
+            text: String::new(),
+            file_refs: Vec::new(),
+        });
+        context.text = if context.text.is_empty() {
+            objective.to_string()
+        } else {
+            format!("{objective}\n\n{}", context.text)
+        };
+        if context.text.encode_utf16().count() > 64_000 {
+            bail!("Task source context exceeds 64000 UTF-16 units");
+        }
+    }
+    Ok((objective.to_string(), context))
+}
+
+fn prepare_work_agent<T: CloudTransport>(
+    client: &CloudClient<'_, T>,
+    selector: Option<&str>,
+) -> Result<AccountAgent> {
+    let selected = match selector {
+        Some(selector) => {
+            let listing: AgentListResponse = serde_json::from_value(client.agents()?)
+                .context("The Codewhale service returned an invalid Agent list")?;
+            let agent = resolve_account_agent(&listing.agents, selector)?;
+            if !agent.project_id.is_empty() {
+                return Ok(agent);
+            }
+            Some(agent)
+        }
+        None => None,
+    };
+    let response: AgentResponse = expect_json(
+        client.execute_authenticated(
+            HttpMethod::Post,
+            "/api/work-box",
+            Some(json_body(&serde_json::json!({}))?),
+        )?,
+        &[200],
+    )?;
+    match selected {
+        Some(selected)
+            if response.agent.id != selected.id || response.agent.project_id.is_empty() =>
+        {
+            bail!(
+                "This Agent cannot use the account's repository-free task context. Use Agent {}",
+                printable(&response.agent.name)
+            )
+        }
+        None if response.agent.project_id.is_empty() => {
+            bail!("The account has no default Agent for repository-free tasks")
+        }
+        _ => Ok(response.agent),
+    }
+}
+
+fn dispatch_stamp(objective: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let seed = format!("{nanos}:{}:{objective}", std::process::id());
+    crate::update::sha256_hex(seed.as_bytes())[..24].to_string()
+}
+
+pub(crate) enum AccountDispatch {
+    Run {
+        objective: String,
+        agent: Option<String>,
+        seconds: Option<u64>,
+        context_file: Option<PathBuf>,
+        file_refs: Vec<String>,
+        operation_key: Option<String>,
+        message_id: Option<String>,
+        yes: bool,
+        confirm_eu_compute: bool,
+    },
+    Status(String),
+    Cancel(String),
+}
+
+pub(crate) fn run_dispatch(
+    call: AccountDispatch,
+    profile: Option<&str>,
+    config: &mut ConfigStore,
+) -> Result<()> {
+    let command = match call {
+        AccountDispatch::Run {
+            objective,
+            agent,
+            seconds,
+            context_file,
+            file_refs,
+            operation_key,
+            message_id,
+            yes,
+            confirm_eu_compute,
+        } => CloudAgentsCommand::Dispatch {
+            objective,
+            agent,
+            seconds,
+            context_file,
+            file_refs,
+            operation_key,
+            message_id,
+            yes,
+            confirm_eu_compute,
+        },
+        AccountDispatch::Status(id) => CloudAgentsCommand::WorkStatus { id },
+        AccountDispatch::Cancel(id) => CloudAgentsCommand::WorkCancel {
+            id,
+            queue: None,
+            reason: None,
+        },
+    };
+    run(
+        CloudArgs {
+            api_base: None,
+            command: CloudCommand::Agents(CloudAgentsArgs { command }),
+        },
+        profile,
+        config,
+    )
+}
+
 fn resolve_account_agent(agents: &[AccountAgent], selector: &str) -> Result<AccountAgent> {
     let selector = selector.trim();
     if selector.is_empty() {
@@ -2376,53 +2542,61 @@ fn run_agents<T: CloudTransport, W: Write>(
             context_file,
             file_refs,
         } => {
-            let objective = objective.trim();
-            if objective.is_empty() || objective.encode_utf16().count() > 32_000 {
-                bail!("Work objective must contain 1-32000 UTF-16 units");
-            }
+            let (objective, context) =
+                work_objective_and_context(&objective, context_file.as_deref(), &file_refs)?;
             validate_operation_key(&message_id)?;
-            let mut context = work::task_context(context_file.as_deref(), &file_refs)?;
-            if objective.encode_utf16().count() > 12_000 {
-                let context = context.get_or_insert_with(|| WorkTaskContext {
-                    text: String::new(),
-                    file_refs: Vec::new(),
-                });
-                context.text = if context.text.is_empty() {
-                    objective.to_string()
-                } else {
-                    format!("{objective}\n\n{}", context.text)
-                };
-                if context.text.encode_utf16().count() > 64_000 {
-                    bail!("Task source context exceeds 64000 UTF-16 units");
-                }
-            }
-            let listing: AgentListResponse = serde_json::from_value(client.agents()?)
-                .context("The Codewhale service returned an invalid Agent list")?;
-            let mut selected = resolve_account_agent(&listing.agents, &agent)?.clone();
-            if selected.project_id.is_empty() {
-                let response: AgentResponse = expect_json(
-                    client.execute_authenticated(
-                        HttpMethod::Post,
-                        "/api/work-box",
-                        Some(json_body(&serde_json::json!({}))?),
-                    )?,
-                    &[200],
-                )?;
-                if response.agent.id != selected.id || response.agent.project_id.is_empty() {
-                    bail!(
-                        "This Agent cannot use the account's repository-free task context. Use Agent {}",
-                        printable(&response.agent.name)
-                    );
-                }
-                selected = response.agent;
-            }
+            let selected = prepare_work_agent(client, Some(&agent))?;
             work::assign(
                 client,
                 out,
                 &selected,
-                objective,
+                &objective,
                 &message_id,
                 context.as_ref(),
+            )
+            .map(|_| ())
+        }
+        CloudAgentsCommand::Dispatch {
+            objective,
+            agent,
+            seconds,
+            context_file,
+            file_refs,
+            operation_key,
+            message_id,
+            yes,
+            confirm_eu_compute,
+        } => {
+            let (objective, context) =
+                work_objective_and_context(&objective, context_file.as_deref(), &file_refs)?;
+            let stamp = dispatch_stamp(&objective);
+            let message_id = message_id.unwrap_or_else(|| format!("dispatch-m-{stamp}"));
+            let operation_key = operation_key.unwrap_or_else(|| format!("dispatch-o-{stamp}"));
+            validate_operation_key(&message_id)?;
+            validate_operation_key(&operation_key)?;
+            let selected = prepare_work_agent(client, agent.as_deref())?;
+            let interactive = io::stdin().is_terminal();
+            work::dispatch(
+                client,
+                out,
+                &selected,
+                &objective,
+                context.as_ref(),
+                work::DispatchOptions {
+                    seconds,
+                    operation_key: &operation_key,
+                    message_id: &message_id,
+                    yes,
+                    confirm_eu_compute,
+                    interactive,
+                },
+                &mut || {
+                    let mut line = String::new();
+                    io::stdin()
+                        .read_line(&mut line)
+                        .context("failed to read the answer from stdin")?;
+                    Ok(line)
+                },
             )
         }
         CloudAgentsCommand::WorkStatus { id } => {
@@ -2474,7 +2648,9 @@ fn run_agents<T: CloudTransport, W: Write>(
             &operation_key,
             seconds,
             recovery_from.as_deref(),
-        ),
+            true,
+        )
+        .map(|_| ()),
         CloudAgentsCommand::WorkLaunch {
             id,
             operation_key,

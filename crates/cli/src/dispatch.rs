@@ -1,10 +1,12 @@
-//! First-class Daytona cloud-agent offload: `codewhale dispatch`.
+//! `codewhale dispatch`: run an objective on a cloud computer through the
+//! signed-in Codewhale account, or on your own sandbox with `--own-sandbox`.
 
 use std::io::{self, Write};
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::{Args, ValueEnum};
+use codewhale_config::ConfigStore;
 use codewhale_tui::cloud_dispatch::{
     CloudJobStore, DispatchOutcome, Forge, LiveDaytonaLauncher, cancel_job, confirm_job,
     discover_credentials, discover_machine_token, discover_remotes, execute_dispatch, format_job,
@@ -58,9 +60,82 @@ pub(crate) struct DispatchArgs {
     /// Workspace whose git remotes are classified (default: current directory).
     #[arg(long)]
     cwd: Option<PathBuf>,
+    /// Use your own sandbox keys instead of your Codewhale account. This
+    /// bypasses the account quote, billing and EU consent.
+    #[arg(long)]
+    own_sandbox: bool,
+    /// Account dispatch: Agent name or ID (default: the repository-free default Agent).
+    #[arg(long)]
+    agent: Option<String>,
+    /// Account dispatch: task time in seconds (default: what your offer allows).
+    #[arg(long)]
+    seconds: Option<u64>,
+    /// Account dispatch: UTF-8 source context file.
+    #[arg(long, value_name = "PATH")]
+    context_file: Option<PathBuf>,
+    /// Account dispatch: saved account file FILE_ID@VERSION; repeatable.
+    #[arg(long = "file", value_name = "FILE_ID@VERSION")]
+    file_refs: Vec<String>,
+    /// Account dispatch: skip the question (needs --confirm-eu-compute).
+    #[arg(long)]
+    yes: bool,
+    /// Account dispatch: agree that repository code and Work files run on EU compute.
+    #[arg(long)]
+    confirm_eu_compute: bool,
+    /// Account dispatch: replay key for a retry after an uncertain response.
+    #[arg(long)]
+    operation_key: Option<String>,
+    /// Account dispatch: message ID for a retry after an uncertain response.
+    #[arg(long)]
+    message_id: Option<String>,
 }
 
-pub(crate) fn run(args: DispatchArgs) -> Result<()> {
+fn account_id(id: &str) -> bool {
+    !id.starts_with("cloud_")
+}
+
+pub(crate) fn run(
+    args: DispatchArgs,
+    profile: Option<&str>,
+    config: &mut ConfigStore,
+) -> Result<()> {
+    use crate::cloud::{AccountDispatch, run_dispatch};
+    if !args.own_sandbox {
+        if let Some(id) = args.show.as_deref().filter(|id| account_id(id)) {
+            return run_dispatch(AccountDispatch::Status(id.to_string()), profile, config);
+        }
+        if let Some(id) = args.cancel.as_deref().filter(|id| account_id(id)) {
+            return run_dispatch(AccountDispatch::Cancel(id.to_string()), profile, config);
+        }
+        let single_token_job = args.prompt.len() == 1 && args.prompt[0].starts_with("cloud_");
+        if !args.prompt.is_empty() && !single_token_job {
+            if args.confirm || args.remote.is_some() || args.branch.is_some() || args.cwd.is_some()
+            {
+                bail!(
+                    "--confirm, --remote, --branch and --cwd belong to your own sandbox; add --own-sandbox, or drop them to dispatch through your Codewhale account"
+                );
+            }
+            return run_dispatch(
+                AccountDispatch::Run {
+                    objective: args.prompt.join(" "),
+                    agent: args.agent,
+                    seconds: args.seconds,
+                    context_file: args.context_file,
+                    file_refs: args.file_refs,
+                    operation_key: args.operation_key,
+                    message_id: args.message_id,
+                    yes: args.yes,
+                    confirm_eu_compute: args.confirm_eu_compute,
+                },
+                profile,
+                config,
+            );
+        }
+    }
+    run_own_sandbox(args)
+}
+
+fn run_own_sandbox(args: DispatchArgs) -> Result<()> {
     let mut out = io::stdout().lock();
     run_with(args, &mut out)
 }
@@ -308,6 +383,15 @@ mod tests {
                 show: None,
                 cancel: None,
                 cwd: Some(temp.path().to_path_buf()),
+                own_sandbox: false,
+                agent: None,
+                seconds: None,
+                context_file: None,
+                file_refs: Vec::new(),
+                yes: false,
+                confirm_eu_compute: false,
+                operation_key: None,
+                message_id: None,
             },
             &mut output,
         )
