@@ -2628,6 +2628,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         )
         .route("/v1/threads/{id}/goal/complete", post(complete_thread_goal))
         .route("/v1/threads/{id}/goal/block", post(block_thread_goal))
+        .route("/v1/goals", get(list_goals))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{approval_id}", post(decide_approval))
         .route(
@@ -8631,6 +8632,72 @@ async fn compact_thread(
 // ---------------------------------------------------------------------------
 // Thread goal endpoints
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct GoalsQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GoalsPage {
+    goals: Vec<codewhale_protocol::ThreadGoal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+}
+
+/// `GET /v1/goals?limit=50&cursor=<opaque>&status=<status>` — read-only index
+/// of the per-thread goal records, newest update first. Pages are keyset
+/// cursors over `(updated_at, thread_id)`.
+async fn list_goals(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<GoalsQuery>,
+) -> Result<Json<GoalsPage>, ApiError> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let status = match query.status.as_deref() {
+        None => None,
+        Some(raw) => Some(
+            serde_json::from_value::<codewhale_protocol::ThreadGoalStatus>(
+                serde_json::Value::String(raw.to_string()),
+            )
+            .map_err(|_| ApiError::bad_request(format!("unknown goal status '{raw}'")))?,
+        ),
+    };
+    let after = match query.cursor.as_deref() {
+        None => None,
+        Some(raw) => {
+            let (updated_at, thread_id) = raw
+                .split_once(':')
+                .and_then(|(at, id)| Some((at.parse::<i64>().ok()?, id.to_string())))
+                .ok_or_else(|| ApiError::bad_request("invalid cursor"))?;
+            Some((updated_at, thread_id))
+        }
+    };
+    let mut goals = state
+        .runtime_threads
+        .list_goals()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    goals.retain(|goal| status.as_ref().is_none_or(|s| &goal.status == s));
+    goals.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.thread_id.cmp(&b.thread_id))
+    });
+    if let Some((updated_at, thread_id)) = after {
+        goals.retain(|goal| {
+            goal.updated_at < updated_at
+                || (goal.updated_at == updated_at && goal.thread_id > thread_id)
+        });
+    }
+    let next_cursor = (goals.len() > limit).then(|| {
+        let last = &goals[limit - 1];
+        format!("{}:{}", last.updated_at, last.thread_id)
+    });
+    goals.truncate(limit);
+    Ok(Json(GoalsPage { goals, next_cursor }))
+}
 
 /// `GET /v1/threads/{id}/goal` — return the persistent goal for a thread, or
 /// 404 if the thread has no goal.
