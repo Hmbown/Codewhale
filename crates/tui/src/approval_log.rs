@@ -174,7 +174,10 @@ fn safe_path(token: &str, workspace: &Path) -> String {
         }
     }
     if token.starts_with('/') || token.starts_with('~') {
-        let base = token.rsplit('/').find(|part| !part.is_empty()).unwrap_or("");
+        let base = token
+            .rsplit('/')
+            .find(|part| !part.is_empty())
+            .unwrap_or("");
         return format!(".../{base}");
     }
     token.to_string()
@@ -255,7 +258,9 @@ fn redact_ask_text(text: &str, workspace: &Path, command: bool) -> Option<String
         words
             .iter()
             .map(|w| {
-                if plain_word(w) || w.chars().all(|c| c.is_alphanumeric() || ".,:;()".contains(c))
+                if plain_word(w)
+                    || w.chars()
+                        .all(|c| c.is_alphanumeric() || ".,:;()".contains(c))
                 {
                     safe_path(w, workspace)
                 } else {
