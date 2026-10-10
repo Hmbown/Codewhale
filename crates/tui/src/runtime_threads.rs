@@ -2978,6 +2978,12 @@ impl RuntimeThreadStore {
         Ok(Some(goal))
     }
 
+    pub fn thread_exists(&self, thread_id: &str) -> bool {
+        self.thread_path(thread_id)
+            .map(|path| path.is_file())
+            .unwrap_or(false)
+    }
+
     pub fn list_goal_thread_ids(&self) -> Result<Vec<String>> {
         let mut ids = Vec::new();
         for entry in fs::read_dir(&self.goals_dir)
@@ -8828,6 +8834,14 @@ impl RuntimeThreadManager {
             }
         }
         Ok(goals)
+    }
+
+    pub async fn thread_exists(&self, thread_id: &str) -> bool {
+        let thread_id = thread_id.to_string();
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || store.thread_exists(&thread_id))
+            .await
+            .unwrap_or(false)
     }
 
     /// Persist (create or replace) the goal for a thread.
