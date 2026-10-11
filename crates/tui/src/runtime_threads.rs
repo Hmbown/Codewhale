@@ -11688,11 +11688,22 @@ impl RuntimeThreadManager {
     ) -> Result<()> {
         let thread = self.get_thread(thread_id).await?;
         let engine = self.ensure_engine_loaded(&thread).await?;
+        let system_prompt = thread.system_prompt.clone().map(SystemPrompt::Text);
+        let expected = {
+            let checkpoint = crate::core::engine::compaction_checkpoint_for_restore(
+                &session.messages,
+                system_prompt.clone(),
+            );
+            crate::core::engine::project_history_for_restore(
+                session.messages.clone(),
+                checkpoint.as_ref(),
+            )
+        };
         engine
             .send(Op::SyncSession {
                 session_id: Some(thread.id.clone()),
                 messages: session.messages.clone(),
-                system_prompt: thread.system_prompt.clone().map(SystemPrompt::Text),
+                system_prompt,
                 system_prompt_override: thread.system_prompt.is_some(),
                 model: thread.model.clone(),
                 workspace: thread.workspace.clone(),
@@ -11707,7 +11718,7 @@ impl RuntimeThreadManager {
         let observed = engine.get_session_snapshot().await?;
         anyhow::ensure!(
             observed.session_id == thread.id
-                && observed.messages == session.messages
+                && observed.messages == expected
                 && observed.workspace == thread.workspace,
             "canonical history mailbox acknowledgement changed"
         );

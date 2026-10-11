@@ -879,6 +879,41 @@ enum EngineHostSetup {
     Rlm(rlm_host::RlmHostSetup),
 }
 
+pub(crate) fn compaction_checkpoint_for_restore(
+    messages: &[codewhale_models::Message],
+    system_prompt: Option<codewhale_models::SystemPrompt>,
+) -> Option<codewhale_models::SystemPrompt> {
+    extract_compaction_summary_prompt(system_prompt).or_else(|| {
+        // Current Engine projections carry the checkpoint in history,
+        // with a stripped system prompt. Only the existing structural
+        // validator can authorize a history block as that checkpoint.
+        messages.iter().rev().find_map(|message| {
+            if !crate::compaction::is_wire_compaction_checkpoint_message(message) {
+                return None;
+            }
+            match &message.content[0] {
+                codewhale_models::ContentBlock::Text { text, .. } => {
+                    Some(codewhale_models::SystemPrompt::Text(text.clone()))
+                }
+                _ => None,
+            }
+        })
+    })
+}
+
+/// The history a restore installs: sub-agent handoffs become restored
+/// checkpoints and the compaction checkpoint replaces its summary in place.
+/// Resume acknowledgement compares against this same projection.
+pub(crate) fn project_history_for_restore(
+    messages: Vec<codewhale_models::Message>,
+    compaction_checkpoint: Option<&codewhale_models::SystemPrompt>,
+) -> Vec<codewhale_models::Message> {
+    crate::compaction::restore_compaction_checkpoint(
+        crate::runtime_handoff::project_owned_messages_for_restore(messages),
+        compaction_checkpoint,
+    )
+}
+
 pub struct Engine {
     rlm_host: Option<rlm_host::RlmHostState>,
     host_profile: EngineHostProfile,
@@ -2935,34 +2970,10 @@ impl Engine {
         system_prompt_override: bool,
     ) {
         self.session.tool_activation_cache.clear();
-        let compaction_checkpoint = extract_compaction_summary_prompt(system_prompt.clone())
-            .or_else(|| {
-                // Current Engine projections carry the checkpoint in history,
-                // with a stripped system prompt. Only the existing structural
-                // validator can authorize a history block as that checkpoint.
-                messages.iter().rev().find_map(|message| {
-                    if !crate::compaction::is_wire_compaction_checkpoint_message(message) {
-                        return None;
-                    }
-                    match &message.content[0] {
-                        codewhale_models::ContentBlock::Text { text, .. } => {
-                            Some(codewhale_models::SystemPrompt::Text(text.clone()))
-                        }
-                        _ => None,
-                    }
-                })
-            });
-        // The op owns the synced history: move each message
-        // through the projection instead of cloning the whole
-        // conversation and dropping the original (M3).
+        let compaction_checkpoint =
+            compaction_checkpoint_for_restore(&messages, system_prompt.clone());
         let restored_messages =
-            crate::runtime_handoff::project_owned_messages_for_restore(messages);
-        // Replace the checkpoint in place so turns after the
-        // compaction boundary keep their chronology.
-        let restored_messages = crate::compaction::restore_compaction_checkpoint(
-            restored_messages,
-            compaction_checkpoint.as_ref(),
-        );
+            project_history_for_restore(messages, compaction_checkpoint.as_ref());
         self.session.messages = restored_messages.into();
         // Direct field assignment bypasses `add_message` /
         // `replace_messages`, which own the messages-revision
