@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 - 2026-10-11
 
 - Simplify the native showcase: concise conversation, sparse ambient life,
   muted metrics and optional workflow progress, with the original workbar
