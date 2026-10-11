@@ -2765,6 +2765,9 @@ pub enum MessageId {
     PlanHandoffWorkAutoDetail,
     PlanHandoffKeepPlanning,
     PlanHandoffKeepPlanningDetail,
+    PluginOAuthBrowser,
+    PluginOAuthReady,
+    PluginOAuthLocalLogout,
     PlanHandoffProceed,
 }
 
@@ -5297,6 +5300,9 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::PlanHandoffWorkAutoDetail,
     MessageId::PlanHandoffKeepPlanning,
     MessageId::PlanHandoffKeepPlanningDetail,
+    MessageId::PluginOAuthBrowser,
+    MessageId::PluginOAuthReady,
+    MessageId::PluginOAuthLocalLogout,
     MessageId::PlanHandoffProceed,
 ];
 
